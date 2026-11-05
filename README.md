@@ -26,7 +26,7 @@ bash /root/argox.sh
 - root 权限，Ubuntu / Debian 系
 - ARM64 或 AMD64（自动识别）
 - 域名已托管 Cloudflare，并已创建隧道，见 [docs/cloudflare-setup.md](docs/cloudflare-setup.md)
-- 8001 / 8002 端口空闲；不开放任何公网端口，不占用 443
+- 8001 / 8002 / 8099 端口空闲；仅监听本机，不开放任何公网端口，不占用 443
 
 ## 菜单
 
@@ -37,15 +37,27 @@ bash /root/argox.sh
  4) 重启                  12) 卸载
  5) 查看状态              13) 隧道设置
  6) 查看日志              14) 优选 IP 源（链接 / 运营商）
- 7) 更新到最新版          15) 显示节点
+ 7) 更新到最新版          15) 订阅地址
  8) 更换 UUID
 ```
+
+## 订阅
+
+安装后菜单 15 输出订阅地址：
+
+```
+https://<隧道域名>/<订阅令牌>
+```
+
+客户端「添加配置 → 导入配置链接」粘贴即可，含 10 个节点（H3×4、H2×4、WS×2）。
 
 ## 命令行
 
 ```bash
 bash argox.sh status
-bash argox.sh nodes
+bash argox.sh nodes      # 订阅地址 + 二维码
+bash argox.sh links      # 单节点链接
+bash argox.sh sub        # Base64 订阅内容
 bash argox.sh ips
 bash argox.sh restart
 bash argox.sh uninstall

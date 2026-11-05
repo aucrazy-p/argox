@@ -49,39 +49,21 @@ sudo cloudflared service install eyJhIjoiXXXXXXXXXXXXXXXX...
 
 同一个隧道页面 → **Public Hostname** 标签 → **Add a public hostname**。
 
-### 必配：XHTTP 主入口
+一共三条规则，**都填同一个 Subdomain + Domain，靠 Path 区分**：
 
-| 字段 | 值 |
-|---|---|
-| Subdomain | `argo`（或你想要的） |
-| Domain | 你的域名 |
-| Path | 留空 |
-| Type | `HTTP` |
-| URL | `127.0.0.1:8001` |
+| # | Path | Type | URL | 用途 |
+|---|---|---|---|---|
+| 1 | 留空 | HTTP | `127.0.0.1:8001` | 主入口，H3 / H2 节点 |
+| 2 | `/ws*` | HTTP | `127.0.0.1:8002` | WS 兜底节点（可选） |
+| 3 | `/<订阅令牌>` | HTTP | `127.0.0.1:8099` | 订阅地址 |
+
+第 3 条的「订阅令牌」是安装后脚本打印的 32 位随机串，在 `/opt/argox/node.json` 的 `sub_token` 里，或菜单 15 直接看。
+
+Cloudflare 按 Path 最长匹配，`/<令牌>` 和 `/ws*` 都比「留空」更具体，不会互相抢。
 
 保存后得到 `https://argo.你的域名.com`。**这个域名就是脚本里要填的「隧道域名」。**
 
-### 选配：WS 兜底入口
-
-只有当你或朋友的客户端不支持 XHTTP 时才需要。
-
-再 Add 一条：
-
-| 字段 | 值 |
-|---|---|
-| Subdomain | `argo-ws`（或同域名不同 path） |
-| Type | `HTTP` |
-| URL | `127.0.0.1:8002` |
-
-如果想让同一个域名同时服务两种协议，用 Path 区分：
-
-| Subdomain | Path | URL |
-|---|---|---|
-| `argo` | 留空 | `127.0.0.1:8001` |
-| `argo` | `/ws*` | `127.0.0.1:8002` |
-
-> WS 节点的 path 在脚本里是随机的 `/xxxxxxxx`，**不以 `/ws` 开头**，所以这种方式要改脚本里的 `path_ws`。
-> **建议直接用两个子域名**，省事且不会冲突。
+> 只想要节点、不需要订阅链接的话，第 3 条可以不配，脚本会给出 Base64 订阅文件。
 
 ---
 

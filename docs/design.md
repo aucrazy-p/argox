@@ -235,41 +235,38 @@ Argo 隧道的路由靠 **SNI 精确匹配**到绑定的 hostname。用别人的
 
 ---
 
-## 8. 客户端与订阅
+## 8. 订阅
 
-**客户端：karing（支持 Xray 内核 → 原生支持 XHTTP）**。因此输出的是通用 VLESS 分享链接，而不是 sing-box 专用 JSON，这样 karing / v2rayN / Clash Meta 都能直接导入。
+**只输出一个订阅，不逐条给节点。**
 
-每个节点一条链接：
+订阅服务 `argox-sub.service` 用 Python 标准库起一个只读 HTTP 服务：
 
 ```
-vless://<UUID>@<优选IP>:443
-  ?encryption=none&security=tls&sni=<隧道域名>&fp=chrome
-  &type=xhttp&path=<编码后的路径>&host=<隧道域名>&mode=auto
-  #argox-XHTTP-H2
+/opt/argox/pub/<sub_token>   ← 文件名即 URL 路径
 ```
 
-### 十个节点
+- 监听 `127.0.0.1:8099`，不开放公网
+- 不列目录，未知路径一律 404
+- `Content-Type: text/plain`，内容是 Base64 编码的 10 条 vless 链接
+- `<sub_token>` 是 32 位随机串，存 `node.json`，重装沿用
+
+外部通过隧道的 Path 规则暴露：
+
+```
+https://<隧道域名>/<sub_token>
+```
+
+十条节点：
 
 | 节点 | 数量 | alpn | 用途 |
 |---|---|---|---|
 | `argox-H3-01` … `-04` | 4 | `h3` | **主力**。QUIC 系，丢包下吞吐不崩 |
 | `argox-H2-01` … `-04` | 4 | `h2,http/1.1` | 对照。同一批 IP 走 TCP，用于 A/B |
-| `argox-WS-01` … `-02` | 2 | 默认 | 兼容兜底，任何客户端都能跑 |
+| `argox-WS-01` … `-02` | 2 | 默认 | 兼容兜底，走 `/ws*` → 8002 |
 
-节点名末尾带运营商标签（`argox-H3-01-移动`），换网络时一眼能认出该切哪条。
+节点名末尾带运营商标签（`argox-H3-01-移动`）。H2 与 H3 用同一批 IP，`H3-01` 和 `H2-01` 只差协议、不差入口。
 
-**H2 与 H3 用同一批 IP**（前 4 个），这样 `H3-01` 和 `H2-01` 只差协议、不差入口，
-对比结果才干净——能直接回答「H3 到底有没有抗住丢包」，而不是被 IP 差异干扰。
-
-**为什么保留 H2**：移动对 UDP 的 QoS 可能比 TCP 更狠。H3 若实测不如 H2，直接切，不用改服务端。
-
-### 导入方式
-
-- 二维码：`/opt/argox/qr/*.png`，karing 扫码
-- 文本：`/opt/argox/sub/argox.txt`（原始链接）/ `argox.b64`（Base64 订阅）
-- 菜单 17 直接在终端打印链接 + ANSI 二维码
-
----
+备用输出：`sub/argox.b64`、`sub/argox.txt`，订阅服务异常时可直接导入文件。
 
 ## 9. 文件布局
 
@@ -280,7 +277,9 @@ vless://<UUID>@<优选IP>:443
 ├── ips.txt                  # 优选 IP
 ├── sub/argox.txt            # 节点链接
 ├── sub/argox.b64            # Base64 订阅
-├── qr/*.png                 # 节点二维码
+├── pub/<sub_token>          # 订阅服务实际读取的文件（= 上面的 b64）
+├── sub_server.py            # 订阅服务（Python 标准库，只读）
+├── qr/*.png                 # 订阅二维码
 ├── logs/access.log,error.log
 └── backup/argox-*.tar.gz    # 菜单 13 备份
 
@@ -289,6 +288,7 @@ vless://<UUID>@<优选IP>:443
 /usr/local/bin/cloudflared
 /etc/systemd/system/argox-xray.service
 /etc/systemd/system/argox-tunnel.service
+/etc/systemd/system/argox-sub.service
 /etc/sysctl.d/99-argox.conf
 /etc/logrotate.d/argox
 ```
@@ -309,33 +309,33 @@ vless://<UUID>@<优选IP>:443
 ```
 bash argox.sh            → 进入菜单 → 选 1
   ├─ 预检：root / 架构(arm64|amd64) / 内存 / 磁盘 / 依赖
-  ├─ 端口检测：8001、8002 必须空闲（仅监听本地回环）
-  ├─ 交互 1：隧道域名（可留空，菜单 15 后补）
+  ├─ 端口检测：8001、8002、8099 必须空闲（仅监听本地回环）
+  ├─ 交互 1：隧道域名（可留空，菜单 13 后补）
   ├─ 交互 2：现在粘贴 Tunnel Token？（y/N，可跳过）
-  ├─ 生成：UUID / 两个随机 path / 自签证书
+  ├─ 生成：UUID / 两个随机 path / 订阅令牌
   ├─ 下载 Xray + cloudflared（多镜像回退）
   ├─ 写 Xray 配置 → xray -test 校验 → 失败即中止
-  ├─ 写 systemd（argox-xray / argox-tunnel）
+  ├─ 写 systemd（argox-xray / argox-tunnel / argox-sub）
   ├─ 系统优化（BBR + fq + 文件句柄 + 端口范围）
-  ├─ 启动 + 健康检查（含隧道注册状态）
-  ├─ 优选 IP 测速（可跳过，用内置列表）
-  └─ 打印 UUID / 路径 / 全部节点链接 / 二维码
+  ├─ 启动 + 健康检查（含隧道注册状态、订阅服务）
+  ├─ 导入优选 IP（可跳过，用内置列表）
+  └─ 打印订阅地址 / 二维码
 ```
 
-### 菜单（17 项）
+### 菜单（15 项）
 
 ```
- 1) 安装 / 重新部署           9) 更换 UUID（用户名/密码）
- 2) 启动                     9) 系统优化（BBR / 重启 / 日志 / 防火墙）
- 3) 停止                    10) 清理缓存
- 4) 重启                    11) 备份配置
- 5) 查看状态                12) 卸载
- 6) 查看日志                13) 隧道设置（Token / 域名 / 测试）
- 7) 更新到最新版            14) 优选 IP 源（链接 / 运营商 / 导入）
- 8) 更换 UUID               15) 显示节点 / 二维码
+ 1) 安装 / 重新部署           9) 系统优化（BBR / 重启 / 日志）
+ 2) 启动                    10) 清理缓存
+ 3) 停止                    11) 备份配置
+ 4) 重启                    12) 卸载
+ 5) 查看状态                13) 隧道设置（Token / 域名 / 测试）
+ 6) 查看日志                14) 优选 IP 源
+ 7) 更新到最新版            15) 订阅地址 / 二维码
+ 8) 更换 UUID
 ```
 
-也支持非交互调用：`argox.sh install|start|stop|restart|status|logs|update|ips|nodes|sub|uninstall`。
+非交互调用：`argox.sh install|start|stop|restart|status|logs|update|ips|nodes|links|sub|uninstall`。
 
 ---
 

@@ -28,6 +28,8 @@ IPSF="${BASE}/ips.txt"
 IPMETA="${BASE}/ips.meta"
 IPSRCF="${BASE}/ipsrc.txt"
 BACKD="${BASE}/backup"
+SUBPUB="${BASE}/pub"            # 订阅服务根目录（仅本机 8099）
+PYSRV="${BASE}/sub_server.py"
 TOKEN_FILE="/etc/argox/token.env"
 TOKEN_DIR="/etc/argox"
 
@@ -36,10 +38,12 @@ CFD_BIN="/usr/local/bin/cloudflared"
 
 SVC_XRAY="argox-xray"
 SVC_TUN="argox-tunnel"
+SVC_SUB="argox-sub"
 
 # ---- 默认端口（全部仅本机，不开放任何公网端口）-------------------------------
 DEF_PORT_XHTTP=8001     # 仅本机，给 Argo 隧道回源
 DEF_PORT_WS=8002        # 仅本机，给 Argo 隧道回源（WS 兜底）
+DEF_PORT_SUB=8099       # 仅本机，订阅服务
 
 # ==============================================================================
 #  基础输出
@@ -380,6 +384,67 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable "$SVC_TUN" >/dev/null 2>&1
+}
+
+write_sub_server() {
+  mkdir -p "$SUBPUB"
+  cat > "$PYSRV" <<'PYEOF'
+#!/usr/bin/env python3
+"""argox 订阅服务：只读、只认白名单文件、不列目录。"""
+import http.server
+import os
+import sys
+
+PORT = int(sys.argv[1])
+ROOT = os.path.abspath(sys.argv[2])
+
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=ROOT, **kwargs)
+
+    def guess_type(self, path):
+        return "text/plain; charset=utf-8"
+
+    def list_directory(self, path):
+        self.send_error(404)
+        return None
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+if __name__ == "__main__":
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv.serve_forever()
+PYEOF
+  chmod 755 "$PYSRV"
+}
+
+write_sub_service() {
+  [[ -f "$PYSRV" ]] || return 1
+  cat > "/etc/systemd/system/${SVC_SUB}.service" <<EOF
+[Unit]
+Description=argox subscription server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 ${PYSRV} ${DEF_PORT_SUB} ${SUBPUB}
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=${SUBPUB}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "$SVC_SUB" >/dev/null 2>&1
 }
 
 save_token() { # $1=token
@@ -798,6 +863,14 @@ gen_sub() {
   printf '%s\n' "$links" | base64 -w0 > "${SUBD}/argox.b64" 2>/dev/null \
     || printf '%s\n' "$links" | base64 | tr -d '\n' > "${SUBD}/argox.b64"
 
+  # 发布到订阅服务目录：文件名即 URL 路径，随机不可猜
+  local stoken; stoken="$(node_get sub_token 2>/dev/null || true)"
+  if [[ -n "$stoken" ]]; then
+    mkdir -p "$SUBPUB"
+    cp "${SUBD}/argox.b64" "${SUBPUB}/${stoken}"
+    chmod 644 "${SUBPUB}/${stoken}"
+  fi
+
   # 每个节点单独一个二维码文件
   local i=0 line name
   while IFS= read -r line; do
@@ -816,18 +889,83 @@ gen_sub() {
   NODE_LINKS=("${QRLINES[@]}")
 }
 
+# 打印 Cloudflare 侧需要的 Path 规则（订阅 + WS 兜底）
+cf_paths() {
+  local host="$1" token pw sub dom
+  token="$(node_get sub_token 2>/dev/null || true)"
+  pw="$(node_get path_ws 2>/dev/null || true)"
+  sub="$(printf '%s' "$host" | cut -d. -f1)"
+  dom="$(printf '%s' "$host" | cut -d. -f2-)"
+  printf '\n  Cloudflare → 该隧道 → Public Hostname，需要这几条：\n\n'
+  printf '    主入口（H3/H2）   Path 留空        → 127.0.0.1:%s\n' "$DEF_PORT_XHTTP"
+  printf '    WS 兜底（可选）   Path /ws*        → 127.0.0.1:%s\n' "$DEF_PORT_WS"
+  if [[ -n "$token" ]]; then
+    printf '    订阅地址          Path /%s\n' "$token"
+    printf '                      → 127.0.0.1:%s\n' "$DEF_PORT_SUB"
+  fi
+  printf '\n  Subdomain 填 %s，Domain 填 %s，Type 都选 HTTP。\n\n' "$sub" "$dom"
+}
+
 show_nodes() {
+  require_root
+  local host token
+  host="$(node_get tunnel_host 2>/dev/null || true)"
+  token="$(node_get sub_token 2>/dev/null || true)"
+
   local links; links="$(build_links)"
   if [[ -z "$links" ]]; then
     warn "还没有可用的节点信息，请先完成安装并填写隧道域名与 Token"
     return 1
   fi
-  step "节点连接"
-  if [[ -s "$IPMETA" ]]; then
-    info "序号对照："
-    awk -F'\t' '{printf "    -%02d  %-16s %s\n", NR, $1, $2}' "$IPMETA"
-    printf '\n'
+  if [[ -z "$token" ]]; then
+    warn "缺少订阅令牌，请重新执行菜单 1"
+    return 1
   fi
+
+  local n; n="$(printf '%s\n' "$links" | wc -l | tr -d ' ')"
+  step "订阅"
+  printf '  节点数    : %s\n' "$n"
+  printf '  隧道域名  : %s\n' "$host"
+
+  local url="https://${host}/${token}"
+  printf '  订阅地址  : %s%s%s\n\n' "$C_B" "$url" "$C_R"
+
+  info "包含节点："
+  printf '%s\n' "$links" | sed 's/.*#//' | awk '{printf "    %02d  %s\n", NR, $0}'
+  printf '\n'
+
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$url" 2>/dev/null || true)"
+  if [[ "$code" == "200" ]]; then
+    ok "订阅地址已可访问"
+  else
+    warn "订阅地址暂不可访问（HTTP ${code:-超时}）"
+    cf_paths "$host"
+    printf '\n  保存后等 1-2 分钟，本机可验证：\n'
+    printf '    curl -s -o /dev/null -w "%%{http_code}\\n" %s\n' "$url"
+  fi
+
+  if has qrencode; then
+    printf '\n%s── 扫码导入订阅 ──%s\n' "$C_DIM" "$C_R"
+    qrencode -t ANSIUTF8 -m 1 <<< "$url" 2>/dev/null || true
+    mkdir -p "$QDIR"
+    qrencode -o "${QDIR}/subscribe.png" -s 8 -m 2 <<< "$url" 2>/dev/null || true
+    printf '\n'
+    info "二维码 PNG：${QDIR}/subscribe.png"
+  fi
+
+  printf '\n'
+  hr
+  info "karing：添加配置 → 导入配置链接 → 粘贴上面的订阅地址"
+  info "文件备用：${SUBD}/argox.b64（Base64 订阅）"
+  info "查看单节点链接：bash $0 links"
+}
+
+show_links() {
+  require_root
+  local links; links="$(build_links)"
+  [[ -z "$links" ]] && { warn "没有可用节点"; return 1; }
+  step "单节点链接"
   local line name i=0
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -836,30 +974,6 @@ show_nodes() {
     printf '\n%s[%d] %s%s\n' "$C_MAG" "$i" "$name" "$C_R"
     printf '%s\n' "$line" | fold -w 100 | sed 's/^/    /'
   done <<< "$links"
-
-  # 二维码：只打前 3 个，避免刷屏
-  if has qrencode; then
-    printf '\n'
-    local k=0
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      k=$((k+1))
-      (( k > 3 )) && break
-      name="$(printf '%s' "$line" | sed 's/.*#//')"
-      printf '%s── %s ──%s\n' "$C_DIM" "$name" "$C_R"
-      qrencode -t ANSIUTF8 -m 1 <<< "$line" 2>/dev/null || true
-      printf '\n'
-    done <<< "$links"
-    info "全部二维码 PNG 已保存到 ${QDIR}/"
-  else
-    warn "未安装 qrencode，跳过二维码。可执行：apt install -y qrencode"
-  fi
-
-  printf '\n'
-  hr
-  info "订阅文件：${SUBD}/argox.txt （原始链接）"
-  info "          ${SUBD}/argox.b64 （Base64 订阅，karing/v2rayN 可直接导入）"
-  info "导入方式：karing → 添加配置 → 从剪贴板导入 / 手动输入 vless 链接"
 }
 
 # ==============================================================================
@@ -877,9 +991,12 @@ do_start() {
   else
     warn "未配置 Tunnel Token，隧道未启动（菜单 13 可填写）"
   fi
+  [[ -f "$PYSRV" ]] && systemctl start "$SVC_SUB" 2>/dev/null
+  ok "已启动"
 }
 
 do_stop() {
+  systemctl stop "$SVC_SUB" 2>/dev/null
   systemctl stop "$SVC_TUN" 2>/dev/null
   systemctl stop "$SVC_XRAY" 2>/dev/null
   ok "已停止"
@@ -888,6 +1005,7 @@ do_stop() {
 do_restart() {
   systemctl restart "$SVC_XRAY" 2>/dev/null
   [[ -s "$TOKEN_FILE" ]] && systemctl restart "$SVC_TUN" 2>/dev/null
+  [[ -f "$PYSRV" ]] && systemctl restart "$SVC_SUB" 2>/dev/null
   sleep 1
   ok "已重启"
 }
@@ -898,12 +1016,14 @@ do_status() {
   printf '%sargox 状态%s\n' "$C_B" "$C_R"
   hr
 
-  local st_x st_t
+  local st_x st_t st_s
   if svc_active "$SVC_XRAY"; then st_x="${C_GRN}● 运行中${C_R}"; else st_x="${C_RED}○ 已停止${C_R}"; fi
   if svc_active "$SVC_TUN";  then st_t="${C_GRN}● 运行中${C_R}"; else st_t="${C_RED}○ 已停止${C_R}"; fi
+  if svc_active "$SVC_SUB";  then st_s="${C_GRN}● 运行中${C_R}"; else st_s="${C_RED}○ 已停止${C_R}"; fi
 
   printf '  Xray       : %s\n' "$st_x"
   printf '  Tunnel     : %s\n' "$st_t"
+  printf '  订阅服务   : %s\n' "$st_s"
   printf '  版本       : %s\n' "$VERSION"
 
   if installed; then
@@ -913,6 +1033,8 @@ do_status() {
     printf '  XHTTP 路径 : %s  (127.0.0.1:%s)\n' "$(node_get path_xhttp)" "$DEF_PORT_XHTTP"
     printf '  WS 路径    : %s  (127.0.0.1:%s)\n' "$(node_get path_ws)" "$DEF_PORT_WS"
     printf '  优选 IP    : %s 个（%s）\n' "$(wc -l < "$IPSF" 2>/dev/null || echo 0)" "$IPSF"
+    local st; st="$(node_get sub_token 2>/dev/null || true)"
+    [[ -n "$st" ]] && printf '  订阅地址   : https://%s/%s\n' "$(node_get tunnel_host)" "$st"
   else
     warn "尚未安装"
   fi
@@ -932,13 +1054,14 @@ do_status() {
 }
 
 do_logs() {
-  printf '\n  1) Xray 日志\n  2) 隧道日志\n  3) 实时跟踪 Xray\n  4) 实时跟踪隧道\n  0) 返回\n'
+  printf '\n  1) Xray 日志\n  2) 隧道日志\n  3) 订阅服务日志\n  4) 实时跟踪 Xray\n  5) 实时跟踪隧道\n  0) 返回\n'
   read -rp "  选择: " c
   case "$c" in
     1) journalctl -u "$SVC_XRAY" -n 80 --no-pager ;;
     2) journalctl -u "$SVC_TUN"  -n 80 --no-pager ;;
-    3) journalctl -u "$SVC_XRAY" -f ;;
-    4) journalctl -u "$SVC_TUN"  -f ;;
+    3) journalctl -u "$SVC_SUB"  -n 80 --no-pager ;;
+    4) journalctl -u "$SVC_XRAY" -f ;;
+    5) journalctl -u "$SVC_TUN"  -f ;;
     *) return 0 ;;
   esac
 }
@@ -1028,13 +1151,18 @@ do_install() {
   fi
   [[ -z "${uuid:-}" ]] && uuid="$(gen_uuid)"
   [[ -z "${px:-}"   ]] && px="/$(rand_hex 8)"
-  [[ -z "${pw:-}"   ]] && pw="/$(rand_hex 8)"
+  # WS 路径固定 /ws 前缀，便于在 Cloudflare 用 /ws* 一条规则转发到 8002
+  [[ -z "${pw:-}"   ]] && pw="/ws$(rand_hex 6)"
 
   # 新旧路径不能相同
   [[ "$px" == "$pw" ]] && pw="/$(rand_hex 8)"
 
   local isp_prev; isp_prev="$(node_get isp_pref 2>/dev/null || true)"
   [[ -z "$isp_prev" ]] && isp_prev="$ISP_PREF_DEFAULT"
+
+  # 订阅令牌：重装时沿用，避免客户端已填的订阅链接失效
+  local sub_token; sub_token="$(node_get sub_token 2>/dev/null || true)"
+  [[ -z "$sub_token" ]] && sub_token="$(rand_hex 16)"
 
   cat > "$NODEF" <<EOF
 {
@@ -1043,6 +1171,7 @@ do_install() {
   "path_xhttp": "${px}",
   "path_ws": "${pw}",
   "isp_pref": "${isp_prev}",
+  "sub_token": "${sub_token}",
   "installed_at": "$(date -Iseconds)",
   "version": "${VERSION}"
 }
@@ -1073,6 +1202,11 @@ EOF
   write_xray_service
   ok "Xray 服务已注册：${SVC_XRAY}.service"
 
+  # 订阅服务（仅监听 127.0.0.1）
+  write_sub_server
+  write_sub_service
+  ok "订阅服务已注册：${SVC_SUB}.service（127.0.0.1:${DEF_PORT_SUB}）"
+
   # ---------- 系统优化 ----------
   step "系统优化"
   apply_sysctl
@@ -1088,6 +1222,10 @@ EOF
     journalctl -u "$SVC_XRAY" -n 25 --no-pager
     return 1
   fi
+
+  systemctl restart "$SVC_SUB" 2>/dev/null
+  sleep 1
+  if svc_active "$SVC_SUB"; then ok "订阅服务运行中"; else warn "订阅服务启动失败：journalctl -u ${SVC_SUB} -n 30"; fi
 
   if [[ -s "$TOKEN_FILE" ]]; then
     systemctl restart "$SVC_TUN"
@@ -1307,7 +1445,7 @@ do_uninstall() {
   require_root
   installed || { warn "看起来没有安装"; }
   printf '\n  %s将会删除：%s\n' "$C_RED" "$C_R"
-  printf '  · systemd 服务 argox-xray / argox-tunnel\n'
+  printf '  · systemd 服务 argox-xray / argox-tunnel / argox-sub\n'
   printf '  · 二进制 /usr/local/bin/argox-xray\n'
   printf '  · 配置目录 /opt/argox（含 UUID/Token/日志/订阅）\n'
   printf '  · /etc/argox/token.env\n'
@@ -1317,11 +1455,14 @@ do_uninstall() {
   [[ "$yn" != "yes" ]] && { info "已取消"; return 0; }
 
   step "卸载"
+  systemctl stop "$SVC_SUB" 2>/dev/null
   systemctl stop "$SVC_TUN" 2>/dev/null
   systemctl stop "$SVC_XRAY" 2>/dev/null
+  systemctl disable "$SVC_SUB" 2>/dev/null
   systemctl disable "$SVC_TUN" 2>/dev/null
   systemctl disable "$SVC_XRAY" 2>/dev/null
-  rm -f "/etc/systemd/system/${SVC_XRAY}.service" "/etc/systemd/system/${SVC_TUN}.service"
+  rm -f "/etc/systemd/system/${SVC_XRAY}.service" "/etc/systemd/system/${SVC_TUN}.service" \
+        "/etc/systemd/system/${SVC_SUB}.service"
   systemctl daemon-reload
 
   rm -f "$XRAY_BIN"
@@ -1425,7 +1566,7 @@ menu_main() {
    4) 重启                     12) 卸载
    5) 查看状态                 13) 隧道设置（Token / 域名 / 测试）
    6) 查看日志                 14) 优选 IP 源
-   7) 更新到最新版             15) 显示节点 / 二维码
+   7) 更新到最新版             15) 订阅地址 / 二维码
    8) 更换 UUID（用户名/密码）
     0) 退出
 EOF
@@ -1469,7 +1610,8 @@ main() {
     update)    do_update ;;
     ips)       update_ips ;;
     nodes|show) show_nodes ;;
-    sub)       gen_sub && cat "${SUBD}/argox.txt" ;;
+    links)     show_links ;;
+    sub)       gen_sub && cat "${SUBD}/argox.b64" ;;
     uninstall) do_uninstall ;;
     ""|menu)   require_root; menu_main ;;
     -h|--help|help)
@@ -1480,7 +1622,9 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0              进入交互菜单（推荐）
   bash $0 install      直接部署
   bash $0 status       查看状态
-  bash $0 nodes        打印节点链接 + 二维码
+  bash $0 nodes        打印订阅地址 + 二维码
+  bash $0 links        打印单节点链接
+  bash $0 sub          输出 Base64 订阅内容
   bash $0 ips          从 IP 源拉取并校验（菜单 14）
   bash $0 uninstall    卸载
 
