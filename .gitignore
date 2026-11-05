@@ -1,0 +1,13 @@
+# 本地项目数据
+.workbuddy/
+
+# 临时测试文件
+.tmp_*
+_t.json
+*.tmp
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
