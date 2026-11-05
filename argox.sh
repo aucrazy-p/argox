@@ -25,13 +25,14 @@ LOGD="${BASE}/logs"
 SUBD="${BASE}/sub"
 QDIR="${BASE}/qr"
 IPSF="${BASE}/ips.txt"
+IPMETA="${BASE}/ips.meta"
+IPSRCF="${BASE}/ipsrc.txt"
 BACKD="${BASE}/backup"
 TOKEN_FILE="/etc/argox/token.env"
 TOKEN_DIR="/etc/argox"
 
 XRAY_BIN="/usr/local/bin/argox-xray"
 CFD_BIN="/usr/local/bin/cloudflared"
-CFST_BIN="/usr/local/bin/cfst"
 
 SVC_XRAY="argox-xray"
 SVC_TUN="argox-tunnel"
@@ -390,8 +391,11 @@ save_token() { # $1=token
 }
 
 # ==============================================================================
-#  优选 IP
+#  优选 IP（远端列表导入 + 校验）
 # ==============================================================================
+DEFAULT_IPSRC="https://bestcf.pages.dev/uouin/all.txt
+https://bestcf.pages.dev/cfyes/ipv4.txt"
+
 DEFAULT_IPS="104.16.132.229
 104.16.133.229
 104.17.152.130
@@ -409,55 +413,209 @@ DEFAULT_IPS="104.16.132.229
 172.64.80.1
 172.67.64.1"
 
-install_cfst() {
-  if [[ -x "$CFST_BIN" ]]; then return 0; fi
-  local arch; arch="$(detect_arch)"
-  local url="https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/cfst_linux_${arch}.tar.gz"
-  local tmp; tmp="$(mktemp -d)"
-  fetch "${tmp}/cfst.tar.gz" "$url" || { rm -rf "$tmp"; return 1; }
-  tar -xzf "${tmp}/cfst.tar.gz" -C "$tmp" >/dev/null 2>&1
-  [[ -f "${tmp}/cfst" ]] || { rm -rf "$tmp"; return 1; }
-  install -m 0755 "${tmp}/cfst" "$CFST_BIN"
-  rm -rf "$tmp"
-  ok "CloudflareSpeedTest 已安装"
+MAX_IPS=12          # 校验通过后最多保留多少个
+MAX_H2_NODES=8      # H2 节点上限（每个 IP 一条）
+MAX_H3_NODES=2      # H3 节点上限（UDP，作对照）
+
+ensure_ipsrc() {
+  mkdir -p "$BASE"
+  [[ -s "$IPSRCF" ]] || printf '%s\n' "$DEFAULT_IPSRC" > "$IPSRCF"
+}
+
+# 检测单个 IP：输出探测结果（HTTP 状态码 / tcp 表示仅连通 / 失败返回 1）
+ip_alive() {
+  local ip="$1" host="$2" code
+  if [[ -n "$host" ]]; then
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 \
+      --resolve "${host}:443:${ip}" "https://${host}/" 2>/dev/null)"
+    if [[ -n "$code" && "$code" != "000" ]]; then
+      # 1033 = 该 IP 到不了这条隧道，直接淘汰
+      [[ "$code" == "1033" ]] && return 1
+      printf '%s' "$code"
+      return 0
+    fi
+    # 拿不到状态码时退化到 TCP 连通性判断
+  fi
+  timeout 5 bash -c "exec 3<>/dev/tcp/${ip}/443" >/dev/null 2>&1 || return 1
+  printf 'tcp'
+}
+
+# 判断是否为 Cloudflare anycast 段（粗粒度，用于剔除反代/中转 IP）
+is_cf_ip() {
+  local ip="$1" o1 o2
+  IFS=. read -r o1 o2 _ <<< "$ip"
+  [[ "$o1" =~ ^[0-9]+$ && "$o2" =~ ^[0-9]+$ ]] || return 1
+  case "$o1" in
+    104) (( o2 >= 16  && o2 <= 31  )) && return 0 ;;
+    172) (( o2 >= 64  && o2 <= 71  )) && return 0 ;;
+    162) (( o2 >= 158 && o2 <= 159 )) && return 0 ;;
+    198) (( o2 >= 41               )) && return 0 ;;
+    188) (( o2 == 114              )) && return 0 ;;
+    190) (( o2 == 93               )) && return 0 ;;
+    197) (( o2 == 234              )) && return 0 ;;
+    141) (( o2 == 101              )) && return 0 ;;
+    108) (( o2 == 162              )) && return 0 ;;
+    103) (( o2 == 21 || o2 == 22 || o2 == 31 )) && return 0 ;;
+    173) (( o2 == 245              )) && return 0 ;;
+    131) (( o2 == 0                )) && return 0 ;;
+  esac
+  return 1
+}
+
+# 解析任意格式列表：IP / IP:PORT#备注 / CSV，输出 "ip<TAB>备注"
+parse_ipfile() {
+  local line raw port ip note
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" == \#* ]] && continue
+    note=""
+    [[ "$line" == *"#"* ]] && note="${line#*#}"
+    raw="${line%%#*}"
+    raw="${raw//[[:space:]]/}"
+    if [[ "$raw" == *,* ]]; then raw="${raw%%,*}"; fi
+    port=443
+    if [[ "$raw" == *:* ]]; then
+      port="${raw##*:}"
+      raw="${raw%%:*}"
+    fi
+    [[ "$port" != "443" ]] && continue
+    ip="$raw"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+    printf '%s\t%s\n' "$ip" "$note"
+  done
+}
+
+import_ips() {
+  require_root
+  ensure_ipsrc
+  local host; host="$(node_get tunnel_host 2>/dev/null || true)"
+  local tmpd; tmpd="$(mktemp -d)"
+  local raw="${tmpd}/raw" cand="${tmpd}/cand" okf="${tmpd}/ok"
+  : > "$raw"; : > "$okf"
+
+  local url n=0
+  while IFS= read -r url; do
+    url="${url%$'\r'}"
+    [[ -z "${url//[[:space:]]/}" ]] && continue
+    [[ "$url" == \#* ]] && continue
+    n=$((n+1))
+    info "拉取源 ${n}：${url}"
+    curl -fsSL --max-time 30 -A "Mozilla/5.0" "$url" >> "$raw" 2>/dev/null \
+      || warn "源 ${n} 拉取失败，跳过"
+    printf '\n' >> "$raw"
+  done < "$IPSRCF"
+
+  parse_ipfile < "$raw" | awk -F'\t' '!seen[$1]++' > "${tmpd}/parsed"
+  local dropped=0 ip0 note0
+  : > "$cand"
+  while IFS=$'\t' read -r ip0 note0; do
+    if is_cf_ip "$ip0"; then
+      printf '%s\t%s\n' "$ip0" "$note0" >> "$cand"
+    else
+      dropped=$((dropped+1))
+    fi
+  done < "${tmpd}/parsed"
+  [[ "$dropped" -gt 0 ]] && info "已剔除 ${dropped} 个非 Cloudflare 段 IP（反代/中转机，本方案用不了）"
+
+  local total; total="$(wc -l < "$cand" | tr -d ' ')"
+  if [[ "${total:-0}" -eq 0 ]]; then
+    warn "未解析到任何候选 IP，保留现有列表"
+    rm -rf "$tmpd"
+    return 1
+  fi
+
+  info "候选 ${total} 个，开始校验（443 端口 + 能否路由到隧道）…"
+  [[ -z "$host" ]] && warn "尚未配置隧道域名，本次只测 TCP 连通性，结果仅供参考"
+
+  local i=0 ip note code kept=0
+  while IFS=$'\t' read -r ip note; do
+    i=$((i+1))
+    printf '\r  校验 %d/%d  %-16s' "$i" "$total" "$ip"
+    if code="$(ip_alive "$ip" "$host")"; then
+      printf '%s\t%s\t%s\n' "$ip" "$code" "$note" >> "$okf"
+      kept=$((kept+1))
+    fi
+  done < <(cat "$cand" 2>/dev/null || true)
+  printf '\r%*s\r' 56 ''
+
+  if [[ "$kept" -eq 0 ]]; then
+    warn "全部未通过校验，保留现有列表"
+    info "常见原因：隧道未运行（cloudflared 未注册）或域名填错"
+    rm -rf "$tmpd"
+    return 1
+  fi
+
+  head -n "$MAX_IPS" "$okf" > "${tmpd}/final"
+  cut -f1 "${tmpd}/final" > "$IPSF"
+  cut -f1,3 "${tmpd}/final" > "$IPMETA"
+  rm -rf "$tmpd"
+
+  ok "校验通过 ${kept} 个，保留前 $(wc -l < "$IPSF" | tr -d ' ') 个"
+  awk -F'\t' '{printf "    %-16s %s\n", $1, $2}' "$IPMETA"
+}
+
+manual_ips() {
+  require_root
+  printf '\n  粘贴 IP（一行一个，可带 :443 和 # 备注），空行结束：\n'
+  local tmpd; tmpd="$(mktemp -d)"
+  local line
+  : > "${tmpd}/in"
+  while IFS= read -r line; do
+    [[ -z "${line//[[:space:]]/}" ]] && break
+    printf '%s\n' "$line" >> "${tmpd}/in"
+  done
+  parse_ipfile < "${tmpd}/in" | awk -F'\t' '!seen[$1]++' | cut -f1 > "$IPSF"
+  rm -rf "$tmpd"
+  local n; n="$(wc -l < "$IPSF" | tr -d ' ')"
+  [[ "${n:-0}" -eq 0 ]] && { warn "没有解析到有效 IP，保留原有列表"; return 1; }
+  : > "$IPMETA"
+  ok "已保存 ${n} 个 IP（未校验）"
 }
 
 update_ips() {
-  step "更新优选 IP"
-  mkdir -p "$BASE"
-
-  if ! install_cfst; then
-    warn "测速工具下载失败，使用内置默认 IP 列表"
-    printf '%s\n' "$DEFAULT_IPS" > "$IPSF"
-    ok "已写入 ${#DEFAULT_IPS} 个默认 IP 到 ${IPSF}"
-    return 0
-  fi
-
-  info "开始测速（TCP 443，延迟 + 丢包，取前 10）…"
-  cd "$BASE" || return 1
-  "$CFST_BIN" -tp 443 -tl 250 -tll 0.2 -dn 10 -p 10 -o "${IPSF}.tmp" >/dev/null 2>&1
-  local rc=$?
-  cd - >/dev/null || true
-
-  if [[ $rc -eq 0 && -s "${IPSF}.tmp" ]]; then
-    awk 'NR>1 && $1 ~ /^[0-9.]+$/ {print $1}' "${IPSF}.tmp" | head -10 > "$IPSF"
-    rm -f "${IPSF}.tmp"
-    local n; n="$(wc -l < "$IPSF")"
-    if [[ "$n" -ge 1 ]]; then
-      ok "优选完成，共 ${n} 个 IP："
-      sed 's/^/    /' "$IPSF"
-      warn "注意：这是 TCP/ICMP 测速结果。H3 走 UDP，晚高峰请以客户端实际吞吐为准。"
-      return 0
-    fi
-  fi
-
-  warn "测速无有效结果，回退默认列表"
-  printf '%s\n' "$DEFAULT_IPS" > "$IPSF"
+  require_root
+  import_ips || true
+  gen_sub >/dev/null 2>&1 || true
 }
 
 list_ips() {
   [[ -s "$IPSF" ]] || { printf '%s\n' "$DEFAULT_IPS" > "$IPSF"; }
   cat "$IPSF"
+}
+
+menu_ips() {
+  require_root
+  ensure_ipsrc
+  while true; do
+    printf '\n  %s优选 IP%s\n' "$C_B" "$C_R"
+    printf '  源链接：\n'
+    sed 's/^/    /' "$IPSRCF"
+    printf '  当前 IP：%s 个\n\n' "$(wc -l < "$IPSF" 2>/dev/null || echo 0)"
+    cat <<'EOF'
+  1) 查看当前 IP 列表
+  2) 编辑 IP 源链接
+  3) 立即拉取并校验
+  4) 手动粘贴 IP
+  0) 返回
+EOF
+    read -rp "  选择: " c
+    case "${c:-}" in
+      1) if [[ -s "$IPSF" ]]; then
+           if [[ -s "$IPMETA" ]]; then awk -F'\t' '{printf "    %-16s %s\n",$1,$2}' "$IPMETA"
+           else sed 's/^/    /' "$IPSF"; fi
+         else warn "还没有 IP 列表"; fi ;;
+      2) printf '\n  一行一个链接，空行结束（留空=保持不变）：\n'
+         local tmpd; tmpd="$(mktemp -d)"; : > "${tmpd}/u"
+         while IFS= read -r ln; do [[ -z "${ln//[[:space:]]/}" ]] && break; printf '%s\n' "$ln" >> "${tmpd}/u"; done
+         if [[ -s "${tmpd}/u" ]]; then cp "${tmpd}/u" "$IPSRCF"; ok "源链接已更新"; else info "未修改"; fi
+         rm -rf "$tmpd" ;;
+      3) import_ips && gen_sub >/dev/null 2>&1 || true ;;
+      4) manual_ips && gen_sub >/dev/null 2>&1 || true ;;
+      0|"") return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
 }
 
 # ==============================================================================
@@ -481,27 +639,34 @@ build_links() {
   host="$(node_get tunnel_host)"
   px="$(node_get path_xhttp)"
   pw="$(node_get path_ws)"
-  [[ -z "$uuid" ]] && return 1
+  [[ -z "$uuid" || -z "$host" ]] && return 1
 
-  local ex enc_pw ip1 ip2
+  local ex enc_pw
   ex="$(urlenc "$px")"
   enc_pw="$(urlenc "$pw")"
-  ip1="$(list_ips | head -1)"
-  ip2="$(list_ips | sed -n '2p')"
-  [[ -z "$ip2" ]] && ip2="$ip1"
-  [[ -z "$ip1" ]] && ip1="104.16.132.229"
 
-  if [[ -n "$host" ]]; then
-    # 1) Argo + XHTTP over H2（主力，兼容性最好）
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#argox-XHTTP-H2\n' \
-      "$uuid" "$ip1" "$host" "$ex" "$host"
-    # 2) Argo + XHTTP over H3（QUIC，抗丢包；客户端不支持时忽略此节点）
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#argox-XHTTP-H3\n' \
-      "$uuid" "$ip2" "$host" "$ex" "$host"
-    # 3) Argo + WS（兼容性兜底，任何客户端都能跑）
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#argox-WS\n' \
-      "$uuid" "$ip1" "$host" "$enc_pw" "$host"
-  fi
+  local -a ips=()
+  local l
+  while IFS= read -r l; do
+    l="${l//[[:space:]]/}"
+    [[ -n "$l" ]] && ips+=("$l")
+  done < <(list_ips)
+  [[ ${#ips[@]} -eq 0 ]] && ips=("104.16.132.229")
+
+  local i
+  # H2（TCP 443，主力，每个 IP 一条）
+  for (( i=0; i<${#ips[@]} && i<MAX_H2_NODES; i++ )); do
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#argox-H2-%02d\n' \
+      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$((i+1))"
+  done
+  # H3（QUIC/UDP，对照用）
+  for (( i=0; i<${#ips[@]} && i<MAX_H3_NODES; i++ )); do
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#argox-H3-%02d\n' \
+      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$((i+1))"
+  done
+  # WS 兜底
+  printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#argox-WS\n' \
+    "$uuid" "${ips[0]}" "$host" "$enc_pw" "$host"
 }
 
 gen_sub() {
@@ -538,6 +703,11 @@ show_nodes() {
     return 1
   fi
   step "节点连接"
+  if [[ -s "$IPMETA" ]]; then
+    info "序号对照："
+    awk -F'\t' '{printf "    -%02d  %-16s %s\n", NR, $1, $2}' "$IPMETA"
+    printf '\n'
+  fi
   local line name i=0
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -547,17 +717,20 @@ show_nodes() {
     printf '%s\n' "$line" | fold -w 100 | sed 's/^/    /'
   done <<< "$links"
 
-  # 二维码
+  # 二维码：只打前 3 个，避免刷屏
   if has qrencode; then
     printf '\n'
+    local k=0
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
+      k=$((k+1))
+      (( k > 3 )) && break
       name="$(printf '%s' "$line" | sed 's/.*#//')"
       printf '%s── %s ──%s\n' "$C_DIM" "$name" "$C_R"
       qrencode -t ANSIUTF8 -m 1 <<< "$line" 2>/dev/null || true
       printf '\n'
     done <<< "$links"
-    info "二维码 PNG 已保存到 ${QDIR}/"
+    info "全部二维码 PNG 已保存到 ${QDIR}/"
   else
     warn "未安装 qrencode，跳过二维码。可执行：apt install -y qrencode"
   fi
@@ -822,14 +995,14 @@ EOF
   # ---------- 优选 IP ----------
   step "优选 IP"
   if [[ -s "$IPSF" ]]; then
-    info "已有 $(wc -l < "$IPSF") 个 IP，跳过（菜单 14 可重测）"
+    info "已有 $(wc -l < "$IPSF") 个 IP，跳过（菜单 14 可更新）"
   else
-    read -rp "  现在测速优选 IP？约需 1-3 分钟（Y/n）: " yn2
+    read -rp "  现在导入优选 IP 并校验？约需 1-3 分钟（Y/n）: " yn2
     if [[ "${yn2,,}" != "n" ]]; then
-      update_ips
+      import_ips || printf '%s\n' "$DEFAULT_IPS" > "$IPSF"
     else
       printf '%s\n' "$DEFAULT_IPS" > "$IPSF"
-      info "已写入默认 IP 列表"
+      info "已写入默认 IP 列表（菜单 14 可重新导入）"
     fi
   fi
 
@@ -1148,7 +1321,7 @@ EOF
       11) do_backup ;;
       12) do_uninstall ;;
       13) do_tunnel_setup ;;
-      14) update_ips; gen_sub >/dev/null 2>&1 || true; info "订阅已刷新（菜单 15 查看）" ;;
+      14) menu_ips ;;
       15) show_nodes ;;
       0|q|Q) printf '\n  再见\n\n'; exit 0 ;;
       *) warn "无效选项：${choice:-<空>}" ;;
@@ -1184,7 +1357,7 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 install      直接部署
   bash $0 status       查看状态
   bash $0 nodes        打印节点链接 + 二维码
-  bash $0 ips          重新测速优选 IP
+  bash $0 ips          从 IP 源拉取并校验（菜单 14）
   bash $0 uninstall    卸载
 
   curl -fsSL <地址> | bash     ← 不推荐，请先 curl -o 下来看一眼
