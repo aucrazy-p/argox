@@ -28,7 +28,7 @@
 | 系统 | Ubuntu 22.04 / 24.04（Debian 兼容） |
 | 域名 | 已托管 Cloudflare，隧道需自行创建 |
 | 客户端 | karing（Xray 内核），兼容 v2rayN / Clash Meta |
-| 现有部署 | 已有 1panel 占用 443，另有橙云回源服务占用 8443 |
+| 现有部署 | 已有 1panel 占用 443 |
 | 预算 | 0（不买中转、不买 Argo Smart Routing） |
 
 ---
@@ -78,9 +78,8 @@ Xray (VLESS + XHTTP, security: none)
 |---|---|---|---|---|
 | `argo-xhttp` | **主力**，走 Argo 隧道 | 127.0.0.1:8001 | none | 仅本地监听，TLS 由 CF 终止；XHTTP `mode:auto` |
 | `argo-ws` | **兼容兜底**，走 Argo 隧道 | 127.0.0.1:8002 | none | 客户端不支持 XHTTP 时切这个，任何客户端都能跑 |
-| `direct-wss` | 备用，直连绕 CF | 0.0.0.0:8443 | tls 自签 | Argo / CF 异常时直连；可在菜单里关闭（仅本机） |
 
-与初版设计的差异：**REALITY 删除**（占 443，与 1panel 冲突），改用 WS+TLS 自签做直连兜底，兼容性更好且不占 443。原方案的 H3 直连（8443/udp）也一并简化——它解决不了绕路问题，价值不如 WS。
+**两个入站都只监听 `127.0.0.1`，服务端不开放任何公网端口。** REALITY（占 443，与 1panel 冲突）与直连备用（8443/WS+TLS、8443/udp H3）均已移除：前者冲突，后者解决不了绕路问题，且白白暴露一个公网入口。
 
 ### argo-xhttp（核心）
 
@@ -123,31 +122,6 @@ Xray (VLESS + XHTTP, security: none)
   }
 }
 ```
-
-### direct-wss（直连备用，可关闭）
-
-```json
-{
-  "tag": "direct-wss",
-  "listen": "0.0.0.0",
-  "port": 8443,
-  "protocol": "vless",
-  "settings": { "clients": [{ "id": "<UUID>" }], "decryption": "none" },
-  "streamSettings": {
-    "network": "ws",
-    "security": "tls",
-    "wsSettings": { "path": "/<RANDOM2>" },
-    "tlsSettings": {
-      "alpn": ["http/1.1"],
-      "certificates": [
-        { "certificateFile": "/opt/argox/ssl/cert.pem", "keyFile": "/opt/argox/ssl/key.pem" }
-      ]
-    }
-  }
-}
-```
-
-自签证书 CN = `www.bing.com`，客户端侧 `allowInsecure=1` + SNI 固定为该值。
 
 ---
 
@@ -268,7 +242,6 @@ vless://<UUID>@<优选IP>:443
 | `argox-XHTTP-H2` | `h2,http/1.1` | **主力**。TCP 系，兼容性最好 |
 | `argox-XHTTP-H3` | `h3` | QUIC 系，抗丢包。客户端不支持则忽略 |
 | `argox-WS` | 默认 | 兼容兜底，任何客户端都能跑 |
-| `argox-DIRECT` | — | 直连 VPS:8443，CF 挂了才用 |
 
 **为什么必须同时给 H2 和 H3**：移动对 UDP 的 QoS 可能比 TCP 更狠。如果 H3 反而更慢，直接切 H2，不用改服务端。这是整套方案唯一的「不确定性保险」。
 
@@ -290,7 +263,6 @@ vless://<UUID>@<优选IP>:443
 ├── sub/argox.txt            # 节点链接
 ├── sub/argox.b64            # Base64 订阅
 ├── qr/*.png                 # 节点二维码
-├── ssl/cert.pem,key.pem     # 直连备用自签证书
 ├── logs/access.log,error.log
 └── backup/argox-*.tar.gz    # 菜单 13 备份
 
@@ -310,7 +282,7 @@ vless://<UUID>@<优选IP>:443
 |---|---|
 | 1panel 占用的 443 | **完全不动**，本方案不用 443 |
 | 已有的 `xray.service` / `/etc/xray` | **不碰**。服务名 `argox-xray`，配置在 `/opt/argox` |
-| cdnx（橙云回源 8443） | 只需让出 8443；被占用时自动顺延到 8543 |
+| cdnx（橙云回源） | 互不冲突；本方案不占用任何公网端口 |
 | cloudflared 二进制 | 放 `/usr/local/bin/cloudflared`，卸载时保留（可能被他人复用） |
 
 ---
@@ -320,7 +292,7 @@ vless://<UUID>@<优选IP>:443
 ```
 bash argox.sh            → 进入菜单 → 选 1
   ├─ 预检：root / 架构(arm64|amd64) / 内存 / 磁盘 / 依赖
-  ├─ 端口检测：8001、8002 必须空闲；8443 被占则顺延
+  ├─ 端口检测：8001、8002 必须空闲（仅监听本地回环）
   ├─ 交互 1：隧道域名（可留空，菜单 15 后补）
   ├─ 交互 2：现在粘贴 Tunnel Token？（y/N，可跳过）
   ├─ 生成：UUID / 两个随机 path / 自签证书
@@ -328,7 +300,6 @@ bash argox.sh            → 进入菜单 → 选 1
   ├─ 写 Xray 配置 → xray -test 校验 → 失败即中止
   ├─ 写 systemd（argox-xray / argox-tunnel）
   ├─ 系统优化（BBR + fq + 文件句柄 + 端口范围）
-  ├─ 防火墙放行（仅直连端口；ufw / firewalld 自动识别）
   ├─ 启动 + 健康检查（含隧道注册状态）
   ├─ 优选 IP 测速（可跳过，用内置列表）
   └─ 打印 UUID / 路径 / 全部节点链接 / 二维码
@@ -395,7 +366,7 @@ bash argox.sh            → 进入菜单 → 选 1
 1. **CF ToS 禁止代理类流量**，隧道跑代理同样违规，账号可能被限制。
 2. **移动 UDP QoS**：H3 的理论优势在丢包，但运营商若直接限 UDP 带宽，H3 会输给 H2/TCP。因此 H2/H3 双节点对照。
 3. **CF 免费版带宽共享**：晚高峰 HKG 节点也会拥塞，收益不保证。
-4. **单点依赖 CF**：CF 抽风则全挂，故保留 direct-wss 兜底。
+4. **单点依赖 CF**：CF 抽风则全挂，无直连兜底（已按需求移除公网入站）。
 5. **不占 443 的代价**：放弃 REALITY，抗主动探测能力弱于 REALITY，但本方案本来就不靠 VPS 入站 IP 暴露。
 
 ---

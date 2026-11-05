@@ -24,7 +24,6 @@ NODEF="${BASE}/node.json"
 LOGD="${BASE}/logs"
 SUBD="${BASE}/sub"
 QDIR="${BASE}/qr"
-SSLD="${BASE}/ssl"
 IPSF="${BASE}/ips.txt"
 BACKD="${BASE}/backup"
 TOKEN_FILE="/etc/argox/token.env"
@@ -37,13 +36,9 @@ CFST_BIN="/usr/local/bin/cfst"
 SVC_XRAY="argox-xray"
 SVC_TUN="argox-tunnel"
 
-# ---- 默认端口（不占用 443）---------------------------------------------------
+# ---- 默认端口（全部仅本机，不开放任何公网端口）-------------------------------
 DEF_PORT_XHTTP=8001     # 仅本机，给 Argo 隧道回源
 DEF_PORT_WS=8002        # 仅本机，给 Argo 隧道回源（WS 兜底）
-DEF_PORT_DIRECT=8443    # 公网可访问的直连备用（WS + TLS 自签）
-
-# 自签证书的 CN，同时也是直连节点客户端侧的 SNI
-DIRECT_SNI="www.bing.com"
 
 # ==============================================================================
 #  基础输出
@@ -133,16 +128,6 @@ port_in_use() { # $1=port  $2=proto(tcp/udp)
   else
     return 1
   fi
-}
-
-pick_free_port() { # $1=起始端口  $2=结束端口
-  local p
-  for (( p=$1; p<=$2; p++ )); do
-    if ! port_in_use "$p" tcp && ! port_in_use "$p" udp; then
-      echo "$p"; return 0
-    fi
-  done
-  return 1
 }
 
 # 多源下载：GitHub 直连 + 两个常用镜像
@@ -289,50 +274,11 @@ install_cloudflared() {
   ok "cloudflared 已安装：$("$CFD_BIN" --version 2>/dev/null | head -1)"
 }
 
-gen_selfsigned() {
-  [[ -f "${SSLD}/cert.pem" && -f "${SSLD}/key.pem" ]] && return 0
-  mkdir -p "$SSLD"
-  openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-    -keyout "${SSLD}/key.pem" -out "${SSLD}/cert.pem" \
-    -days 3650 -subj "/CN=${DIRECT_SNI}" >/dev/null 2>&1 \
-    || openssl req -x509 -nodes -newkey rsa:2048 \
-         -keyout "${SSLD}/key.pem" -out "${SSLD}/cert.pem" \
-         -days 3650 -subj "/CN=${DIRECT_SNI}" >/dev/null 2>&1 \
-    || die "生成自签证书失败"
-  chmod 600 "${SSLD}/key.pem"
-}
-
 # ==============================================================================
 #  配置生成
 # ==============================================================================
 write_xray_config() {
-  local uuid="$1" px="$2" pw="$3" pdir="$4" direct_on="$5"
-
-  local direct_block=""
-  if [[ "$direct_on" == "1" ]]; then
-  direct_block=$(cat <<EOF
-    ,{
-      "tag": "direct-wss",
-      "listen": "0.0.0.0",
-      "port": ${pdir},
-      "protocol": "vless",
-      "settings": { "clients": [{ "id": "${uuid}" }], "decryption": "none" },
-      "streamSettings": {
-        "network": "ws",
-        "security": "tls",
-        "wsSettings": { "path": "${pw}" },
-        "tlsSettings": {
-          "alpn": ["http/1.1"],
-          "certificates": [
-            { "certificateFile": "${SSLD}/cert.pem", "keyFile": "${SSLD}/key.pem" }
-          ]
-        }
-      },
-      "sniffing": { "enabled": true, "destOverride": ["http","tls"], "routeOnly": true }
-    }
-EOF
-)
-  fi
+  local uuid="$1" px="$2" pw="$3"
 
   cat > "$CONF" <<EOF
 {
@@ -367,7 +313,7 @@ EOF
         "wsSettings": { "path": "${pw}" }
       },
       "sniffing": { "enabled": true, "destOverride": ["http","tls"], "routeOnly": true }
-    }${direct_block}
+    }
   ],
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" }
@@ -530,13 +476,11 @@ urlenc() { # 简单 URL 编码（path 里的 / 需编码）
 }
 
 build_links() {
-  local uuid host px pw pdir direct_on
+  local uuid host px pw
   uuid="$(node_get uuid)"
   host="$(node_get tunnel_host)"
   px="$(node_get path_xhttp)"
   pw="$(node_get path_ws)"
-  pdir="$(node_get port_direct)"
-  direct_on="$(node_get direct_on)"
   [[ -z "$uuid" ]] && return 1
 
   local ex enc_pw ip1 ip2
@@ -557,18 +501,6 @@ build_links() {
     # 3) Argo + WS（兼容性兜底，任何客户端都能跑）
     printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#argox-WS\n' \
       "$uuid" "$ip1" "$host" "$enc_pw" "$host"
-  fi
-
-  # 4) 直连备用（WS + TLS 自签，绕过 CF；仅 direct_on=1 时输出）
-  if [[ "$direct_on" == "1" && -n "$pdir" ]]; then
-    local pub
-    pub="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)"
-    if [[ -z "$pub" ]]; then
-      pub="$(curl -4 -fsS --max-time 8 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
-    fi
-    [[ -z "$pub" ]] && pub="YOUR_VPS_IP"
-    printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&allowInsecure=1&type=ws&path=%s&host=%s#argox-DIRECT\n' \
-      "$uuid" "$pub" "$pdir" "$DIRECT_SNI" "$enc_pw" "$pub"
   fi
 }
 
@@ -650,7 +582,7 @@ do_start() {
     sleep 1
     if svc_active "$SVC_TUN"; then ok "隧道已启动"; else warn "隧道启动失败，查看日志：journalctl -u ${SVC_TUN} -n 50"; fi
   else
-    warn "未配置 Tunnel Token，隧道未启动（菜单 15 可填写）"
+    warn "未配置 Tunnel Token，隧道未启动（菜单 13 可填写）"
   fi
 }
 
@@ -687,11 +619,6 @@ do_status() {
     printf '  Token      : %s\n' "$([[ -s "$TOKEN_FILE" ]] && echo '已配置' || echo '未配置')"
     printf '  XHTTP 路径 : %s  (127.0.0.1:%s)\n' "$(node_get path_xhttp)" "$DEF_PORT_XHTTP"
     printf '  WS 路径    : %s  (127.0.0.1:%s)\n' "$(node_get path_ws)" "$DEF_PORT_WS"
-    if [[ "$(node_get direct_on)" == "1" ]]; then
-      printf '  直连备用   : 0.0.0.0:%s (WS+TLS 自签)\n' "$(node_get port_direct)"
-    else
-      printf '  直连备用   : 关闭\n'
-    fi
     printf '  优选 IP    : %s 个（%s）\n' "$(wc -l < "$IPSF" 2>/dev/null || echo 0)" "$IPSF"
   else
     warn "尚未安装"
@@ -764,20 +691,10 @@ do_install() {
   done
   ok "Argo 回源端口 ${DEF_PORT_XHTTP}/${DEF_PORT_WS} 空闲"
 
-  local direct_on="1" pdir
-  pdir="$(pick_free_port "$DEF_PORT_DIRECT" 8543 || echo "")"
-  if [[ -z "$pdir" ]]; then
-    warn "8443-8543 均被占用，直连备用关闭"
-    direct_on="0"; pdir="$DEF_PORT_DIRECT"
-  else
-    [[ "$pdir" != "$DEF_PORT_DIRECT" ]] && warn "8443 被占用，直连备用改用 ${pdir}"
-    info "直连备用端口：${pdir}（443 保留给 1panel，不动）"
-  fi
-
   # ---------- 交互参数 ----------
   step "隧道参数"
   printf '  说明：隧道需在 CF Dashboard 建（Zero Trust → Networks → Tunnels）。\n'
-  printf '        现在没有可以先跳过，装完用菜单 15 补填。\n\n'
+  printf '        现在没有可以先跳过，装完用菜单 13 补填。\n\n'
 
   local host token cur_host
   host=""
@@ -808,7 +725,7 @@ do_install() {
 
   # ---------- 目录与密钥 ----------
   step "生成配置"
-  mkdir -p "$BASE" "$LOGD" "$SUBD" "$QDIR" "$SSLD" "$BACKD"
+  mkdir -p "$BASE" "$LOGD" "$SUBD" "$QDIR" "$BACKD"
 
   local uuid px pw
   if [[ -f "$NODEF" ]]; then
@@ -829,15 +746,12 @@ do_install() {
   "tunnel_host": "${host}",
   "path_xhttp": "${px}",
   "path_ws": "${pw}",
-  "port_direct": "${pdir}",
-  "direct_on": "${direct_on}",
   "installed_at": "$(date -Iseconds)",
   "version": "${VERSION}"
 }
 EOF
   chmod 600 "$NODEF"
 
-  gen_selfsigned
   ok "UUID: ${uuid}"
   ok "XHTTP 路径: ${px}"
   ok "WS 路径: ${pw}"
@@ -848,7 +762,7 @@ EOF
 
   # ---------- 写配置 ----------
   step "写入配置"
-  write_xray_config "$uuid" "$px" "$pw" "$pdir" "$direct_on" || die "配置生成失败"
+  write_xray_config "$uuid" "$px" "$pw" || die "配置生成失败"
   ok "Xray 配置校验通过：${CONF}"
 
   if [[ -n "$token" ]]; then
@@ -865,19 +779,6 @@ EOF
   # ---------- 系统优化 ----------
   step "系统优化"
   apply_sysctl
-
-  # ---------- 防火墙 ----------
-  if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-    if [[ "$direct_on" == "1" ]]; then
-      ufw allow "${pdir}/tcp" >/dev/null 2>&1 && ok "ufw 已放行 ${pdir}/tcp"
-    fi
-  fi
-  if has firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
-    if [[ "$direct_on" == "1" ]]; then
-      firewall-cmd --permanent --add-port="${pdir}/tcp" >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1
-      ok "firewalld 已放行 ${pdir}/tcp"
-    fi
-  fi
 
   # ---------- 启动 ----------
   step "启动服务"
@@ -921,7 +822,7 @@ EOF
   # ---------- 优选 IP ----------
   step "优选 IP"
   if [[ -s "$IPSF" ]]; then
-    info "已有 $(wc -l < "$IPSF") 个 IP，跳过（菜单 16 可重测）"
+    info "已有 $(wc -l < "$IPSF") 个 IP，跳过（菜单 14 可重测）"
   else
     read -rp "  现在测速优选 IP？约需 1-3 分钟（Y/n）: " yn2
     if [[ "${yn2,,}" != "n" ]]; then
@@ -944,13 +845,12 @@ EOF
   printf '  Token       : %s\n' "$([[ -s "$TOKEN_FILE" ]] && echo 已配置 || echo 未配置)"
   printf '  XHTTP 路径  : %s\n' "$px"
   printf '  WS 路径     : %s\n' "$pw"
-  printf '  直连备用    : %s\n' "$([[ "$direct_on" == "1" ]] && echo "开启 (${pdir}/tcp, 自签 TLS)" || echo 关闭)"
   printf '  配置目录    : %s\n' "$BASE"
   printf '  Token 文件  : %s（600）\n' "$TOKEN_FILE"
   hr
 
   if [[ -z "$host" ]]; then
-    warn "还需在 CF Dashboard 配置 Public Hostname，然后回到菜单 15 填域名"
+    warn "还需在 CF Dashboard 配置 Public Hostname，然后回到菜单 13 填域名"
   fi
 
   printf '\n'
@@ -995,34 +895,6 @@ do_update() {
   ok "服务已按新版本重启"
 }
 
-do_change_port() {
-  require_root
-  installed || { err "尚未安装"; return 1; }
-  local cur; cur="$(node_get port_direct)"
-  printf '\n  当前直连备用端口：%s\n' "${cur:-未设置}"
-  printf '  （Argo 回源端口 8001/8002 固定本机，不需要改）\n\n'
-  local np
-  read -rp "  新的直连端口 [8443-8543，留空取消]: " np
-  [[ -z "$np" ]] && return 0
-  [[ "$np" =~ ^[0-9]+$ ]] || { err "端口必须是数字"; return 1; }
-  ((np < 1024 || np > 65535)) && { err "端口范围 1024-65535"; return 1; }
-  port_in_use "$np" tcp && { err "端口 $np 已被占用"; return 1; }
-
-  node_set port_direct "$np"
-  local uuid px pw
-  uuid="$(node_get uuid)"; px="$(node_get path_xhttp)"; pw="$(node_get path_ws)"
-  write_xray_config "$uuid" "$px" "$pw" "$np" "1" || { err "配置生成失败，已回滚"; return 1; }
-  systemctl restart "$SVC_XRAY"
-  sleep 1
-  ok "直连端口已改为 ${np}"
-  if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-    ufw allow "${np}/tcp" >/dev/null 2>&1 && info "ufw 已放行 ${np}/tcp"
-  fi
-  systemctl restart "$SVC_TUN" 2>/dev/null || true
-  gen_sub >/dev/null 2>&1 || true
-  info "节点链接已重新生成，菜单 17 查看"
-}
-
 do_change_uuid() {
   require_root
   installed || { err "尚未安装"; return 1; }
@@ -1033,43 +905,13 @@ do_change_uuid() {
 
   local uuid; uuid="$(gen_uuid)"
   node_set uuid "$uuid"
-  local px pw pdir don
+  local px pw
   px="$(node_get path_xhttp)"; pw="$(node_get path_ws)"
-  pdir="$(node_get port_direct)"; don="$(node_get direct_on)"
-  write_xray_config "$uuid" "$px" "$pw" "$pdir" "$don" || { err "配置生成失败"; return 1; }
+  write_xray_config "$uuid" "$px" "$pw" || { err "配置生成失败"; return 1; }
   systemctl restart "$SVC_XRAY"; sleep 1
   gen_sub >/dev/null 2>&1 || true
   ok "UUID 已更换：${uuid}"
   show_nodes
-}
-
-do_change_access() {
-  require_root
-  installed || { err "尚未安装"; return 1; }
-  local cur; cur="$(node_get direct_on)"
-  printf '\n  当前：%s\n' "$([[ "$cur" == "1" ]] && echo '对外（直连备用已开放公网端口）' || echo '仅本机（只有 Argo 隧道入口）')"
-  printf '\n  1) 对外（开放直连端口，CF 抽风时可直连兜底）\n'
-  printf '  2) 仅本机（关闭直连端口，只走 Argo，更隐蔽）\n'
-  printf '  0) 返回\n'
-  local c; read -rp "  选择: " c
-  local new pdir
-  case "$c" in
-    1) new="1"; pdir="$(node_get port_direct)"; [[ -z "$pdir" ]] && pdir="$DEF_PORT_DIRECT" ;;
-    2) new="0"; pdir="$(node_get port_direct)"; [[ -z "$pdir" ]] && pdir="$DEF_PORT_DIRECT" ;;
-    *) return 0 ;;
-  esac
-
-  node_set direct_on "$new"
-  local uuid px pw
-  uuid="$(node_get uuid)"; px="$(node_get path_xhttp)"; pw="$(node_get path_ws)"
-  write_xray_config "$uuid" "$px" "$pw" "$pdir" "$new" || { err "配置失败"; return 1; }
-  systemctl restart "$SVC_XRAY"; sleep 1
-  gen_sub >/dev/null 2>&1 || true
-  if [[ "$new" == "1" ]]; then
-    ok "已改为对外，直连端口 ${pdir}"
-  else
-    ok "已改为仅本机，公网只剩 CF 入口"
-  fi
 }
 
 do_sysopt() {
@@ -1280,15 +1122,14 @@ menu_main() {
   while true; do
     menu_header
     cat <<'EOF'
-   1) 安装 / 重新部署           9) 更换 UUID（用户名/密码）
-   2) 启动                     10) 更换访问方式（对外 / 仅本机）
-   3) 停止                     11) 系统优化（BBR / 重启 / 日志 / 防火墙）
-   4) 重启                     12) 清理缓存
-   5) 查看状态                 13) 备份配置
-   6) 查看日志                 14) 卸载
-   7) 更新到最新版             15) 隧道设置（Token / 域名 / 测试）
-   8) 更换端口                 16) 更新优选 IP
-                               17) 显示节点 / 二维码
+   1) 安装 / 重新部署           9) 系统优化（BBR / 重启 / 日志）
+   2) 启动                     10) 清理缓存
+   3) 停止                     11) 备份配置
+   4) 重启                     12) 卸载
+   5) 查看状态                 13) 隧道设置（Token / 域名 / 测试）
+   6) 查看日志                 14) 更新优选 IP
+   7) 更新到最新版             15) 显示节点 / 二维码
+   8) 更换 UUID（用户名/密码）
     0) 退出
 EOF
     printf '%s\n' "──────────────────────────────────────────────────"
@@ -1301,16 +1142,14 @@ EOF
       5)  do_status ;;
       6)  do_logs ;;
       7)  do_update ;;
-      8)  do_change_port ;;
-      9)  do_change_uuid ;;
-      10) do_change_access ;;
-      11) do_sysopt ;;
-      12) do_clean ;;
-      13) do_backup ;;
-      14) do_uninstall ;;
-      15) do_tunnel_setup ;;
-      16) update_ips; gen_sub >/dev/null 2>&1 || true; info "订阅已刷新（菜单 17 查看）" ;;
-      17) show_nodes ;;
+      8)  do_change_uuid ;;
+      9)  do_sysopt ;;
+      10) do_clean ;;
+      11) do_backup ;;
+      12) do_uninstall ;;
+      13) do_tunnel_setup ;;
+      14) update_ips; gen_sub >/dev/null 2>&1 || true; info "订阅已刷新（菜单 15 查看）" ;;
+      15) show_nodes ;;
       0|q|Q) printf '\n  再见\n\n'; exit 0 ;;
       *) warn "无效选项：${choice:-<空>}" ;;
     esac
