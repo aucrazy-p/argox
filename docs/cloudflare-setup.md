@@ -47,23 +47,94 @@ sudo cloudflared service install eyJhIjoiXXXXXXXXXXXXXXXX...
 
 ## 3. 配 Public Hostname（决定流量往哪走）
 
-同一个隧道页面 → **Public Hostname** 标签 → **Add a public hostname**。
+**三条路由，三个不同子域，Path 全部留空。**
 
-一共三条规则，**都填同一个 Subdomain + Domain，靠 Path 区分**：
+> ⚠️ 不要用「同一个域名 + Path 分流」。cloudflared 的路由是**按顺序命中第一条**，不是最长匹配；Path 留空那条排在最前面会把所有请求吃掉，表现为订阅 404、WS 连不通。这是实测踩过的坑。
 
-| # | Path | Type | URL | 用途 |
-|---|---|---|---|---|
-| 1 | 留空 | HTTP | `127.0.0.1:8001` | 主入口，H3 / H2 节点 |
-| 2 | `/ws*` | HTTP | `127.0.0.1:8002` | WS 兜底节点（可选） |
-| 3 | `/<订阅令牌>` | HTTP | `127.0.0.1:8099` | 订阅地址 |
+### 3.1 加三条
 
-第 3 条的「订阅令牌」是安装后脚本打印的 32 位随机串，在 `/opt/argox/node.json` 的 `sub_token` 里，或菜单 15 直接看。
+路径：该隧道页面 → **Public Hostname** 标签（新版叫 **Published application routes** / **Routes**）→ **Add a public hostname**，重复三次。
 
-Cloudflare 按 Path 最长匹配，`/<令牌>` 和 `/ws*` 都比「留空」更具体，不会互相抢。
+| # | Subdomain | Path | Service → Type | Service → URL | 用途 |
+|---|---|---|---|---|---|
+| 1 | `argo` | **留空** | `HTTP` | `127.0.0.1:8001` | H3 / H2 主入口 |
+| 2 | `ws` | **留空** | `HTTP` | `127.0.0.1:8002` | WS 兜底 |
+| 3 | `sub` | **留空** | `HTTP` | `127.0.0.1:8099` | 订阅 |
 
-保存后得到 `https://argo.你的域名.com`。**这个域名就是脚本里要填的「隧道域名」。**
+三次的 **Domain 填同一个**（如 `example.com`），Subdomain 各不相同。
 
-> 只想要节点、不需要订阅链接的话，第 3 条可以不配，脚本会给出 Base64 订阅文件。
+单条的填写模板：
+
+| 表单字段 | 填什么 |
+|---|---|
+| Subdomain | `argo` / `ws` / `sub`（按上表） |
+| Domain | 你的域名，三次相同 |
+| Path | **什么都不填** |
+| Service → Type | `HTTP` |
+| Service → URL | 按上表，只填 `host:port` |
+
+保存后，**DNS 页面**应自动出现三条「隧道」类型记录（橙色云，目标指向你的隧道）。
+
+保存后得到三个域名：
+
+```
+argo.example.com     ← 主入口，脚本里填这个
+ws.example.com       ← WS 兜底
+sub.example.com      ← 订阅
+```
+
+**`argo.example.com` 就是脚本里要填的「隧道域名」。**
+
+### 3.2 订阅地址与令牌
+
+订阅令牌是安装时随机生成的 32 位十六进制，装完才有：
+
+```bash
+grep -o '"sub_token": *"[^"]*"' /opt/argox/node.json
+```
+
+订阅地址固定为：
+
+```
+https://sub.example.com/<你的32位令牌>
+```
+
+令牌**每人每台机都不一样**，复制命令输出，不要照抄文档里的任何示例串（照抄必 404）。
+
+脚本默认把主域名第一段换成 `sub` 来推导订阅子域。如果 CF 里 `sub` 被占用（换成 `subx` 之类），在 VPS 上改一次即可：
+
+```bash
+bash /root/argox.sh      # 菜单 13 → 5) 订阅子域
+```
+
+WS 子域同理（菜单 13 → 4）。
+
+### 3.3 某个子域解析不到（NXDOMAIN）
+
+**面板里有记录 ≠ 权威服务器上有记录。** 用命令行验证，别信页面：
+
+```bash
+# VPS 或本机都行，把 hal.ns.cloudflare.com 换成你的 NS 也行
+dig +short argo.example.com @8.8.8.8
+```
+
+返回 `104.x` / `172.6x` 才算真的生效。返回空则是记录没写进去，表现是客户端全连不上（530）。
+
+修法：把该条 Public Hostname 删掉重加（CF 会连带重建 DNS），或者去 **DNS 页面**手动加：
+
+| 类型 | 名称 | 内容 | 代理 |
+|---|---|---|---|
+| CNAME | `argo` | `<隧道UUID>.cfargotunnel.com` | 已代理（橙色云） |
+
+隧道 UUID 在隧道详情页顶部或地址栏 `.../networks/tunnels/<UUID>`，**不是副本 ID**。
+
+### 3.4 三个必须注意的点
+
+1. **Path 三条全部留空**。填了具体 Path 也不会更安全，只会引入匹配歧义。
+2. **Subdomain 三条不能重复**。重复就是回到「Path 抢占」的老问题。
+3. **URL 只填 `host:port`**，不要带 `http://`；协议由 Type 下拉框决定。选 `HTTP`（源站是明文监听），选 HTTPS 会握手失败。
+
+> 只用节点、不要订阅的话，第 3 条（`sub`）可以不配，脚本仍会生成 Base64 订阅文件（菜单 15 里有本地路径）。
 
 ---
 
@@ -112,14 +183,17 @@ Cloudflare 官方明确：`This setting is for connection between the user and C
 
 **② 开了不代表一定更快**
 
-有些运营商对 UDP 的 QoS 比 TCP 更狠，开了 H3 反而更慢，甚至出现 `ERR_QUIC_PROTOCOL_ERROR`。所以脚本给了两个节点：
+有些运营商对 UDP 的 QoS 比 TCP 更狠，或者客户端内核不支持 XHTTP over QUIC，这时 H3 会连不上。所以订阅默认给三条：
 
-- `argox-XHTTP-H2`（TCP）— 默认用这个
-- `argox-XHTTP-H3`（UDP）— 晚高峰掉速时切过去对比
+- `argox-H3`（UDP/QUIC）— 实测通常最快，抗丢包
+- `argox-H2`（TCP）— UDP 被限速时切过去
+- `argox-WS`（TCP，走 `ws` 子域）— 最后的兜底
 
-**不要只留一个**，用数据决定。
+用数据决定主用哪条，别只看名字。
 
-不开 HTTP/3 也不影响主流程：H2 和 WS 节点照常工作，只是 H3 节点会握手失败。
+不开 HTTP/3 也不影响主流程：H2 和 WS 照常工作，只是 H3 节点会握手失败。
+
+> 实测提醒：客户端内核要支持 XHTTP over QUIC 才能用 H3。**v2rayN（Xray 内核）可以，karing（sing-box 内核）不行**——后者表现是 H3 全部 ×，且服务端 `access.log` 里一条请求都收不到。
 
 ---
 
@@ -152,6 +226,12 @@ curl -sI http://127.0.0.1:8001/<path_xhttp>
 
 # 从外部访问隧道域名，应该不是 1033 / 502
 curl -sI https://argo.你的域名.com
+
+# 订阅地址（应返回一屏 Base64 文本）
+curl -s https://sub.你的域名.com/<订阅令牌> | head -c 120
+
+# 三条子域都解析到了 CF 才算配齐
+for h in argo ws sub; do printf '%s -> ' "$h.你的域名.com"; dig +short "$h.你的域名.com" @8.8.8.8 | head -2 | tr '\n' ' '; echo; done
 ```
 
 或者直接用菜单 `15 → 3` 测试，脚本会翻译错误码。

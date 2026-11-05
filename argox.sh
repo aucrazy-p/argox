@@ -180,8 +180,21 @@ node_set() { # $1=key $2=value  (字符串)
   if has jq; then
     local tmp; tmp="$(mktemp)"
     jq --arg k "$1" --arg v "$2" '.[$k] = $v' "$NODEF" > "$tmp" && mv "$tmp" "$NODEF"
+  elif has python3; then
+    python3 - "$NODEF" "$1" "$2" <<'PY'
+import json, sys
+p, k, v = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(p) as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+d[k] = v
+with open(p, 'w') as f:
+    json.dump(d, f, indent=2, ensure_ascii=False)
+PY
   else
-    # 无 jq 时的极简替换（仅支持已有 key）
+    # 无 jq / python3 时的极简替换（仅支持已有 key）
     sed -i "s|\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"$1\": \"$2\"|" "$NODEF"
   fi
 }
@@ -194,6 +207,45 @@ node_set_raw() { # $1=key $2=原始 JSON 值
 }
 
 installed() { [[ -x "$XRAY_BIN" ]] && [[ -f "$CONF" ]]; }
+
+# 由主域名推导同级子域：argo.aucrazy.dpdns.org + ws -> ws.aucrazy.dpdns.org
+sub_of() { # $1=host $2=prefix
+  local host="$1" pre="$2" rest
+  [[ -z "$host" || -z "$pre" ]] && return 0
+  case "$host" in
+    *.*) rest="${host#*.}" ;;
+    *)   return 0 ;;   # 单段域名无从推导
+  esac
+  case "$rest" in
+    *.*) : ;;
+    *)   return 0 ;;   # 根域（example.com）不推导，避免得到 ws.com
+  esac
+  printf '%s.%s' "$pre" "$rest"
+}
+
+# WS 兜底子域（配置优先，缺省由主域名推导）
+node_ws_host() {
+  local h
+  h="$(node_get ws_host 2>/dev/null || true)"
+  [[ -z "$h" ]] && h="$(sub_of "$(node_get tunnel_host 2>/dev/null || true)" "$DEF_WS_SUB")"
+  printf '%s' "$h"
+}
+
+# 订阅子域（配置优先，缺省由主域名推导）
+node_sub_host() {
+  local h
+  h="$(node_get sub_host 2>/dev/null || true)"
+  [[ -z "$h" ]] && h="$(sub_of "$(node_get tunnel_host 2>/dev/null || true)" "$DEF_SUB_SUB")"
+  printf '%s' "$h"
+}
+
+# 节点地址模式：domain（域名直连）| ip（展开优选 IP）
+node_mode() {
+  local m
+  m="$(node_get node_mode 2>/dev/null || true)"
+  [[ -z "$m" ]] && m="$NODE_MODE_DEFAULT"
+  printf '%s' "$m"
+}
 
 # ==============================================================================
 #  系统优化
@@ -483,6 +535,12 @@ MAX_H3_NODES=4      # H3 主力（UDP/QUIC，抗丢包）
 MAX_H2_NODES=4      # H2 对照（TCP，H3 被 QoS 时用）
 MAX_WS_NODES=2      # WS 兼容兜底
 ISP_PREF_DEFAULT="mobile"   # mobile | unicom | telecom | multi | auto
+
+# 节点地址模式：domain = 直接用隧道域名（客户端自己解析，走得最近）
+#               ip     = 展开优选 IP（手动筛过才用）
+NODE_MODE_DEFAULT="domain"
+DEF_WS_SUB="ws"     # WS 兜底子域前缀，实际域名 = ws.<主域名>
+DEF_SUB_SUB="sub"   # 订阅子域前缀，实际域名 = sub.<主域名>
 
 ensure_ipsrc() {
   mkdir -p "$BASE"
@@ -810,10 +868,25 @@ build_links() {
   pw="$(node_get path_ws)"
   [[ -z "$uuid" || -z "$host" ]] && return 1
 
-  local ex enc_pw
+  local ex enc_pw ws_host mode
   ex="$(urlenc "$px")"
   enc_pw="$(urlenc "$pw")"
+  ws_host="$(node_ws_host)"
+  [[ -z "$ws_host" ]] && ws_host="$host"
+  mode="$(node_mode)"
 
+  # ---------- 域名模式：3 条，地址写域名，由客户端解析到最近的 CF 节点 ----------
+  if [[ "$mode" != "ip" ]]; then
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#argox-H3\n' \
+      "$uuid" "$host" "$host" "$ex" "$host"
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#argox-H2\n' \
+      "$uuid" "$host" "$host" "$ex" "$host"
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#argox-WS\n' \
+      "$uuid" "$ws_host" "$ws_host" "$enc_pw" "$ws_host"
+    return 0
+  fi
+
+  # ---------- IP 模式：展开优选 IP ----------
   local -a ips=() tags=()
   local l t
   while IFS= read -r l; do
@@ -846,11 +919,11 @@ build_links() {
     printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#argox-H2-%02d-%s\n' \
       "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$n" "${tags[$i]}"
   done
-  # WS 兼容兜底
+  # WS 兜底：必须走 ws 子域（ws 子域在 CF 侧指向 8002）
   for (( i=0; i<${#ips[@]} && i<MAX_WS_NODES; i++ )); do
     n=$((i+1))
     printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#argox-WS-%02d-%s\n' \
-      "$uuid" "${ips[$i]}" "$host" "$enc_pw" "$host" "$n" "${tags[$i]}"
+      "$uuid" "${ips[$i]}" "$ws_host" "$enc_pw" "$ws_host" "$n" "${tags[$i]}"
   done
 }
 
@@ -889,26 +962,26 @@ gen_sub() {
   NODE_LINKS=("${QRLINES[@]}")
 }
 
-# 打印 Cloudflare 侧需要的 Path 规则（订阅 + WS 兜底）
+# 打印 Cloudflare 侧需要的三条路由（三条独立子域，Path 全留空）
 cf_paths() {
-  local host="$1" token pw sub dom
+  local host="$1" token ws_host sub_host
   token="$(node_get sub_token 2>/dev/null || true)"
-  pw="$(node_get path_ws 2>/dev/null || true)"
-  sub="$(printf '%s' "$host" | cut -d. -f1)"
-  dom="$(printf '%s' "$host" | cut -d. -f2-)"
-  printf '\n  Cloudflare → 该隧道 → Public Hostname，需要这几条：\n\n'
-  printf '    主入口（H3/H2）   Path 留空        → 127.0.0.1:%s\n' "$DEF_PORT_XHTTP"
-  printf '    WS 兜底（可选）   Path /ws*        → 127.0.0.1:%s\n' "$DEF_PORT_WS"
-  if [[ -n "$token" ]]; then
-    printf '    订阅地址          Path /%s\n' "$token"
-    printf '                      → 127.0.0.1:%s\n' "$DEF_PORT_SUB"
+  ws_host="$(node_ws_host)"
+  sub_host="$(node_sub_host)"
+  printf '\n  Cloudflare → 该隧道 → Public Hostname，需要三条（Path 全部留空）：\n\n'
+  printf '    %-30s → 127.0.0.1:%s   H3/H2 主入口\n' "${host:-argo.<主域名>}" "$DEF_PORT_XHTTP"
+  printf '    %-30s → 127.0.0.1:%s   WS 兜底\n'    "${ws_host:-ws.<主域名>}"  "$DEF_PORT_WS"
+  printf '    %-30s → 127.0.0.1:%s   订阅\n'       "${sub_host:-sub.<主域名>}" "$DEF_PORT_SUB"
+  printf '\n  Service 全选 HTTP；三条必须是不同子域，Path 留空，否则会互相抢占。\n'
+  if [[ -n "$token" && -n "$sub_host" ]]; then
+    printf '  订阅地址：https://%s/%s\n' "$sub_host" "$token"
   fi
-  printf '\n  Subdomain 填 %s，Domain 填 %s，Type 都选 HTTP。\n\n' "$sub" "$dom"
+  printf '\n'
 }
 
 show_nodes() {
   require_root
-  local host token
+  local host token sub_host
   host="$(node_get tunnel_host 2>/dev/null || true)"
   token="$(node_get sub_token 2>/dev/null || true)"
 
@@ -922,12 +995,16 @@ show_nodes() {
     return 1
   fi
 
+  sub_host="$(node_sub_host)"
+  [[ -z "$sub_host" ]] && sub_host="$host"
+
   local n; n="$(printf '%s\n' "$links" | wc -l | tr -d ' ')"
   step "订阅"
   printf '  节点数    : %s\n' "$n"
+  printf '  地址模式  : %s\n' "$(node_mode)"
   printf '  隧道域名  : %s\n' "$host"
 
-  local url="https://${host}/${token}"
+  local url="https://${sub_host}/${token}"
   printf '  订阅地址  : %s%s%s\n\n' "$C_B" "$url" "$C_R"
 
   info "包含节点："
@@ -1151,7 +1228,7 @@ do_install() {
   fi
   [[ -z "${uuid:-}" ]] && uuid="$(gen_uuid)"
   [[ -z "${px:-}"   ]] && px="/$(rand_hex 8)"
-  # WS 路径固定 /ws 前缀，便于在 Cloudflare 用 /ws* 一条规则转发到 8002
+  # WS 路径固定 /ws 前缀，便于识别；CF 侧靠 ws 子域转发到 8002
   [[ -z "${pw:-}"   ]] && pw="/ws$(rand_hex 6)"
 
   # 新旧路径不能相同
@@ -1164,10 +1241,22 @@ do_install() {
   local sub_token; sub_token="$(node_get sub_token 2>/dev/null || true)"
   [[ -z "$sub_token" ]] && sub_token="$(rand_hex 16)"
 
+  # 子域与地址模式：重装时沿用已有设置
+  local ws_prev sub_prev mode_prev
+  ws_prev="$(node_get ws_host 2>/dev/null || true)"
+  sub_prev="$(node_get sub_host 2>/dev/null || true)"
+  mode_prev="$(node_get node_mode 2>/dev/null || true)"
+  [[ -z "$ws_prev"   ]] && ws_prev="$(sub_of "$host" "$DEF_WS_SUB")"
+  [[ -z "$sub_prev"  ]] && sub_prev="$(sub_of "$host" "$DEF_SUB_SUB")"
+  [[ -z "$mode_prev" ]] && mode_prev="$NODE_MODE_DEFAULT"
+
   cat > "$NODEF" <<EOF
 {
   "uuid": "${uuid}",
   "tunnel_host": "${host}",
+  "ws_host": "${ws_prev}",
+  "sub_host": "${sub_prev}",
+  "node_mode": "${mode_prev}",
   "path_xhttp": "${px}",
   "path_ws": "${pw}",
   "isp_pref": "${isp_prev}",
@@ -1181,6 +1270,7 @@ EOF
   ok "UUID: ${uuid}"
   ok "XHTTP 路径: ${px}"
   ok "WS 路径: ${pw}"
+  ok "节点地址模式: ${mode_prev}（domain=域名直连 / ip=优选IP）"
 
   # ---------- 安装二进制 ----------
   install_xray || die "Xray 安装失败"
@@ -1255,17 +1345,23 @@ EOF
   fi
 
   # ---------- 优选 IP ----------
-  step "优选 IP"
-  if [[ -s "$IPSF" ]]; then
-    info "已有 $(wc -l < "$IPSF") 个 IP，跳过（菜单 14 可更新）"
-  else
-    read -rp "  现在导入优选 IP 并校验？约需 1-3 分钟（Y/n）: " yn2
-    if [[ "${yn2,,}" != "n" ]]; then
-      import_ips || printf '%s\n' "$DEFAULT_IPS" > "$IPSF"
+  if [[ "$mode_prev" == "ip" ]]; then
+    step "优选 IP"
+    if [[ -s "$IPSF" ]]; then
+      info "已有 $(wc -l < "$IPSF") 个 IP，跳过（菜单 14 可更新）"
     else
-      printf '%s\n' "$DEFAULT_IPS" > "$IPSF"
-      info "已写入默认 IP 列表（菜单 14 可重新导入）"
+      read -rp "  现在导入优选 IP 并校验？约需 1-3 分钟（Y/n）: " yn2
+      if [[ "${yn2,,}" != "n" ]]; then
+        import_ips || printf '%s\n' "$DEFAULT_IPS" > "$IPSF"
+      else
+        printf '%s\n' "$DEFAULT_IPS" > "$IPSF"
+        info "已写入默认 IP 列表（菜单 14 可重新导入）"
+      fi
     fi
+  else
+    step "节点地址"
+    ok "使用域名直连（$host），跳过优选 IP"
+    info "如需改用优选 IP：菜单 13 → 6) 切换地址模式"
   fi
 
   # ---------- 收尾 ----------
@@ -1277,6 +1373,9 @@ EOF
   hr
   printf '  UUID        : %s\n' "$uuid"
   printf '  隧道域名    : %s\n' "${host:-（未填写）}"
+  printf '  WS 子域     : %s\n' "${ws_prev:-（未设置）}"
+  printf '  订阅子域    : %s\n' "${sub_prev:-（未设置）}"
+  printf '  地址模式    : %s\n' "$mode_prev"
   printf '  Token       : %s\n' "$([[ -s "$TOKEN_FILE" ]] && echo 已配置 || echo 未配置)"
   printf '  XHTTP 路径  : %s\n' "$px"
   printf '  WS 路径     : %s\n' "$pw"
@@ -1479,10 +1578,15 @@ do_uninstall() {
 
 do_tunnel_setup() {
   require_root
+  local ws_h sub_h mode_v
+  ws_h="$(node_ws_host)"; sub_h="$(node_sub_host)"; mode_v="$(node_mode)"
   printf '\n  隧道配置\n'
   printf '  1) 填写 / 更换 Tunnel Token\n'
-  printf '  2) 设置 / 更换隧道域名（用于生成订阅）\n'
-  printf '  3) 测试隧道连通性\n'
+  printf '  2) 设置 / 更换隧道域名（主入口，用于生成节点）\n'
+  printf '  3) 测试三条子域连通性\n'
+  printf '  4) WS 兜底子域（当前：%s）\n' "${ws_h:-未设置}"
+  printf '  5) 订阅子域（当前：%s）\n' "${sub_h:-未设置}"
+  printf '  6) 节点地址模式（当前：%s）\n' "$mode_v"
   printf '  0) 返回\n'
   local c; read -rp "  选择: " c
   case "$c" in
@@ -1522,15 +1626,71 @@ do_tunnel_setup() {
     3)
       local h; h="$(node_get tunnel_host)"
       [[ -z "$h" ]] && { err "先设置隧道域名"; return 1; }
-      step "测试 https://${h}"
-      local code
-      code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "https://${h}/" 2>/dev/null || echo 000)"
-      case "$code" in
-        000) err "连接失败（DNS / 证书 / 隧道离线）" ;;
-        1033|530) err "HTTP ${code}：隧道不匹配（Public Hostname 未指向本隧道，或隧道没起）" ;;
-        502|503) err "HTTP ${code}：CF 到了但回源失败（检查 127.0.0.1:8001 是否在听）" ;;
-        *) ok "HTTP ${code}（能连通，非 1033/502 即正常）" ;;
+      local w s t r1 r2 r3
+      w="$(node_ws_host)"; s="$(node_sub_host)"; t="$(node_get sub_token 2>/dev/null || true)"
+      step "测试三条子域"
+      r1="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${h}/" 2>/dev/null || echo 000)"
+      [[ -n "$w" ]] && r2="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${w}/" 2>/dev/null || echo 000)"
+      [[ -n "$s" && -n "$t" ]] && r3="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${s}/${t}" 2>/dev/null || echo 000)"
+      printf '  主入口  %-34s HTTP %s\n' "$h" "${r1:-—}"
+      printf '  WS      %-34s HTTP %s\n' "${w:-未设置}" "${r2:-—}"
+      printf '  订阅    %-34s HTTP %s\n\n' "${s:-未设置}" "${r3:-—}"
+
+      case "${r1:-000}" in
+        000)     err "主入口不通：DNS 未解析 / 证书异常 / 隧道离线" ;;
+        530|1033) err "主入口 HTTP ${r1}：CF 找不到该子域的路由（DNS 记录或 Public Hostname 缺失）" ;;
+        502|503) err "主入口 HTTP ${r1}：CF 到了但回源失败（确认 127.0.0.1:${DEF_PORT_XHTTP} 在监听）" ;;
+        *)       ok "主入口 HTTP ${r1}" ;;
       esac
+      if [[ -n "$r2" ]]; then
+        case "$r2" in
+          000|530|1033|502|503) err "WS 子域异常：HTTP ${r2}（应指向 127.0.0.1:${DEF_PORT_WS}）" ;;
+          *) ok "WS 子域 HTTP ${r2}" ;;
+        esac
+      fi
+      if [[ -n "$r3" ]]; then
+        [[ "$r3" == "200" ]] && ok "订阅可访问（HTTP 200）" \
+          || err "订阅 HTTP ${r3}（应指向 127.0.0.1:${DEF_PORT_SUB}，正常只有 200）"
+      fi
+      ;;
+    4)
+      local w; w="$(node_ws_host)"
+      read -rp "  WS 子域（当前：${w:-未设置}，如 ws.example.com）: " w
+      [[ -z "$w" ]] && return 0
+      if [[ ! "$w" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+        err "域名格式不合法"; return 1
+      fi
+      node_set ws_host "$w"
+      ok "WS 子域已设为 ${w}"
+      info "CF 侧需有同名路由 → 127.0.0.1:${DEF_PORT_WS}"
+      gen_sub >/dev/null 2>&1 || true
+      show_nodes
+      ;;
+    5)
+      local s; s="$(node_sub_host)"
+      read -rp "  订阅子域（当前：${s:-未设置}，如 sub.example.com）: " s
+      [[ -z "$s" ]] && return 0
+      if [[ ! "$s" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
+        err "域名格式不合法"; return 1
+      fi
+      node_set sub_host "$s"
+      ok "订阅子域已设为 ${s}"
+      info "CF 侧需有同名路由 → 127.0.0.1:${DEF_PORT_SUB}"
+      show_nodes
+      ;;
+    6)
+      printf '\n  当前：%s\n' "$(node_mode)"
+      printf '  1) domain  域名直连（推荐：客户端自行解析到最近的 CF 节点）\n'
+      printf '  2) ip      展开优选 IP（需自己测速筛选，否则多半更慢）\n'
+      local m; read -rp "  选择（回车不改）: " m
+      case "$m" in
+        1) node_set node_mode domain ;;
+        2) node_set node_mode ip ;;
+        *) return 0 ;;
+      esac
+      ok "地址模式已设为 $(node_mode)"
+      gen_sub >/dev/null 2>&1 || true
+      show_nodes
       ;;
     *) return 0 ;;
   esac
