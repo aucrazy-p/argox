@@ -414,8 +414,10 @@ DEFAULT_IPS="104.16.132.229
 172.67.64.1"
 
 MAX_IPS=12          # 校验通过后最多保留多少个
-MAX_H2_NODES=8      # H2 节点上限（每个 IP 一条）
-MAX_H3_NODES=2      # H3 节点上限（UDP，作对照）
+MAX_H3_NODES=4      # H3 主力（UDP/QUIC，抗丢包）
+MAX_H2_NODES=4      # H2 对照（TCP，H3 被 QoS 时用）
+MAX_WS_NODES=2      # WS 兼容兜底
+ISP_PREF_DEFAULT="mobile"   # mobile | unicom | telecom | multi | auto
 
 ensure_ipsrc() {
   mkdir -p "$BASE"
@@ -546,13 +548,75 @@ import_ips() {
     return 1
   fi
 
-  head -n "$MAX_IPS" "$okf" > "${tmpd}/final"
+  # 排序：运营商匹配优先 → 下载速度降序 → 延迟升序，再截取前 MAX_IPS 个
+  local isp_want; isp_want="$(node_get isp_pref 2>/dev/null || true)"
+  [[ -z "$isp_want" ]] && isp_want="$ISP_PREF_DEFAULT"
+
+  awk -F'\t' '{ if (NF >= 3) print $1"\t"$3; else print $1"\t" }' "$okf" \
+    | sort_cand "$isp_want" | head -n "$MAX_IPS" > "${tmpd}/final"
+
+  if [[ ! -s "${tmpd}/final" ]]; then
+    warn "排序后无有效条目，保留现有列表"
+    rm -rf "$tmpd"
+    return 1
+  fi
+
   cut -f1 "${tmpd}/final" > "$IPSF"
-  cut -f1,3 "${tmpd}/final" > "$IPMETA"
+  local ip1 isp1
+  : > "$IPMETA"
+  while IFS=$'\t' read -r ip1 isp1; do
+    printf '%s\t%s\n' "$ip1" "$(isp_label "$isp1")" >> "$IPMETA"
+  done < "${tmpd}/final"
   rm -rf "$tmpd"
 
-  ok "校验通过 ${kept} 个，保留前 $(wc -l < "$IPSF" | tr -d ' ') 个"
+  ok "校验通过 ${kept} 个，按「$([[ "$isp_want" == "auto" ]] && echo "速度" || echo "$(isp_label "$isp_want")优先 + 速度")」排序后保留 $(wc -l < "$IPSF" | tr -d ' ') 个"
   awk -F'\t' '{printf "    %-16s %s\n", $1, $2}' "$IPMETA"
+}
+
+# 运营商标识 → 中文标签
+isp_label() {
+  case "$1" in
+    mobile)  printf '移动' ;;
+    unicom)  printf '联通' ;;
+    telecom) printf '电信' ;;
+    multi)   printf '多线' ;;
+    auto)    printf '不指定' ;;
+    *)       printf '其他' ;;
+  esac
+}
+
+# 排序候选：运营商匹配优先，组内按下载速度降序，速度相同按延迟升序
+# 输入 stdin: "ip<TAB>note"   输出: "ip<TAB>isp"（已排序）
+sort_cand() {
+  local want="${1:-mobile}"
+  awk -F'\t' -v want="$want" '
+  function ispof(n,  t) {
+    t = n
+    if (t ~ /移动/) return "mobile"
+    if (t ~ /联通/) return "unicom"
+    if (t ~ /电信/) return "telecom"
+    if (t ~ /多线/) return "multi"
+    return "unknown"
+  }
+  function grab(re, s,  m) {
+    if (match(s, re)) { m = substr(s, RSTART, RLENGTH); gsub(/[^0-9.]/, "", m); return m + 0 }
+    return -1
+  }
+  {
+    ip = $1; note = $2
+    ms = grab("[0-9.]+ms", note)
+    sp = grab("[0-9.]+mb/s", note)
+    isp = ispof(note)
+    # 有备注却不含运营商分组 → 列表页眉/页脚夹带的地址，丢弃
+    if (isp == "unknown" && note != "") next
+    if (want == "auto" || isp == want)      pri = 0
+    else if (isp == "multi")                pri = 1
+    else if (isp == "unknown")              pri = 3
+    else                                    pri = 2
+    if (sp < 0) sp = 0
+    if (ms < 0) ms = 9999
+    printf "%d\t%.2f\t%.2f\t%s\t%s\n", pri, sp, ms, ip, isp
+  }' | sort -t$'\t' -k1,1n -k2,2nr -k3,3n | awk -F'\t' '{ printf "%s\t%s\n", $4, $5 }'
 }
 
 manual_ips() {
@@ -588,15 +652,19 @@ menu_ips() {
   require_root
   ensure_ipsrc
   while true; do
+    local cur_isp; cur_isp="$(node_get isp_pref 2>/dev/null || true)"
+    [[ -z "$cur_isp" ]] && cur_isp="$ISP_PREF_DEFAULT"
     printf '\n  %s优选 IP%s\n' "$C_B" "$C_R"
     printf '  源链接：\n'
     sed 's/^/    /' "$IPSRCF"
-    printf '  当前 IP：%s 个\n\n' "$(wc -l < "$IPSF" 2>/dev/null || echo 0)"
+    printf '  当前 IP：%s 个    运营商偏好：%s\n\n' \
+      "$(wc -l < "$IPSF" 2>/dev/null || echo 0)" "$(isp_label "$cur_isp")"
     cat <<'EOF'
   1) 查看当前 IP 列表
   2) 编辑 IP 源链接
   3) 立即拉取并校验
   4) 手动粘贴 IP
+  5) 运营商偏好（换网络时改这里）
   0) 返回
 EOF
     read -rp "  选择: " c
@@ -612,10 +680,46 @@ EOF
          rm -rf "$tmpd" ;;
       3) import_ips && gen_sub >/dev/null 2>&1 || true ;;
       4) manual_ips && gen_sub >/dev/null 2>&1 || true ;;
+      5) do_set_isp ;;
       0|"") return 0 ;;
       *) warn "无效选项" ;;
     esac
   done
+}
+
+do_set_isp() {
+  local cur; cur="$(node_get isp_pref 2>/dev/null || true)"
+  [[ -z "$cur" ]] && cur="$ISP_PREF_DEFAULT"
+  printf '\n  当前运营商偏好：%s\n' "$(isp_label "$cur")"
+  printf '  影响排序：匹配的组排最前，组内按下载速度降序\n\n'
+  cat <<'EOF'
+  1) 移动
+  2) 联通
+  3) 电信
+  4) 多线
+  5) 不指定（全部按速度排序）
+  0) 返回
+EOF
+  local c; read -rp "  选择: " c
+  local v=""
+  case "${c:-}" in
+    1) v="mobile" ;;
+    2) v="unicom" ;;
+    3) v="telecom" ;;
+    4) v="multi" ;;
+    5) v="auto" ;;
+    0|"") return 0 ;;
+    *) warn "无效选项"; return 1 ;;
+  esac
+  node_set isp_pref "$v"
+  ok "已设为「$(isp_label "$v")」"
+  printf '\n'
+  read -rp "  立即重新拉取并按新偏好排序？（Y/n）: " yn
+  if [[ "${yn,,}" != "n" ]]; then
+    import_ips && gen_sub >/dev/null 2>&1 || true
+  else
+    info "已保存，下次拉取时生效"
+  fi
 }
 
 # ==============================================================================
@@ -645,28 +749,44 @@ build_links() {
   ex="$(urlenc "$px")"
   enc_pw="$(urlenc "$pw")"
 
-  local -a ips=()
-  local l
+  local -a ips=() tags=()
+  local l t
   while IFS= read -r l; do
     l="${l//[[:space:]]/}"
     [[ -n "$l" ]] && ips+=("$l")
   done < <(list_ips)
   [[ ${#ips[@]} -eq 0 ]] && ips=("104.16.132.229")
 
-  local i
-  # H2（TCP 443，主力，每个 IP 一条）
-  for (( i=0; i<${#ips[@]} && i<MAX_H2_NODES; i++ )); do
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#argox-H2-%02d\n' \
-      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$((i+1))"
+  # 与 IPSF 对齐读取运营商标签
+  local idx=0
+  while IFS=$'\t' read -r l t; do
+    (( idx >= ${#ips[@]} )) && break
+    tags[$idx]="${t:-其他}"
+    idx=$((idx+1))
+  done < "$IPMETA" 2>/dev/null
+  for (( idx=0; idx<${#ips[@]}; idx++ )); do
+    [[ -z "${tags[$idx]}" ]] && tags[$idx]="其他"
   done
-  # H3（QUIC/UDP，对照用）
+
+  local i n
+  # H3 主力：UDP/QUIC，抗丢包
   for (( i=0; i<${#ips[@]} && i<MAX_H3_NODES; i++ )); do
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#argox-H3-%02d\n' \
-      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$((i+1))"
+    n=$((i+1))
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#argox-H3-%02d-%s\n' \
+      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$n" "${tags[$i]}"
   done
-  # WS 兜底
-  printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#argox-WS\n' \
-    "$uuid" "${ips[0]}" "$host" "$enc_pw" "$host"
+  # H2 对照：同一批 IP 走 TCP，用于 A/B 判断 H3 是否真的更抗丢包
+  for (( i=0; i<${#ips[@]} && i<MAX_H2_NODES; i++ )); do
+    n=$((i+1))
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#argox-H2-%02d-%s\n' \
+      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$n" "${tags[$i]}"
+  done
+  # WS 兼容兜底
+  for (( i=0; i<${#ips[@]} && i<MAX_WS_NODES; i++ )); do
+    n=$((i+1))
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#argox-WS-%02d-%s\n' \
+      "$uuid" "${ips[$i]}" "$host" "$enc_pw" "$host" "$n" "${tags[$i]}"
+  done
 }
 
 gen_sub() {
@@ -913,12 +1033,16 @@ do_install() {
   # 新旧路径不能相同
   [[ "$px" == "$pw" ]] && pw="/$(rand_hex 8)"
 
+  local isp_prev; isp_prev="$(node_get isp_pref 2>/dev/null || true)"
+  [[ -z "$isp_prev" ]] && isp_prev="$ISP_PREF_DEFAULT"
+
   cat > "$NODEF" <<EOF
 {
   "uuid": "${uuid}",
   "tunnel_host": "${host}",
   "path_xhttp": "${px}",
   "path_ws": "${pw}",
+  "isp_pref": "${isp_prev}",
   "installed_at": "$(date -Iseconds)",
   "version": "${VERSION}"
 }
@@ -1300,7 +1424,7 @@ menu_main() {
    3) 停止                     11) 备份配置
    4) 重启                     12) 卸载
    5) 查看状态                 13) 隧道设置（Token / 域名 / 测试）
-   6) 查看日志                 14) 更新优选 IP
+   6) 查看日志                 14) 优选 IP 源
    7) 更新到最新版             15) 显示节点 / 二维码
    8) 更换 UUID（用户名/密码）
     0) 退出
