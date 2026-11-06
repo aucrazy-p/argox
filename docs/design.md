@@ -268,6 +268,26 @@ https://<隧道域名>/<sub_token>
 
 备用输出：`sub/argox.b64`、`sub/argox.txt`，订阅服务异常时可直接导入文件。
 
+## 8.1 出口跳板（可选）
+
+把 Xray 的出站挂到 VPS 本机的代理端口上（住宅 IP / 商业 VPN 客户端提供的本地 SOCKS5 或 HTTP）：
+
+| `hop_mode` | 出站 | 目标站看到 |
+|---|---|---|
+| `off`（默认） | `freedom` | VPS 原生 IP |
+| `all` | `socks` / `http` → `hop_addr:hop_port` | 代理的出口 IP |
+
+实现要点：
+
+- `write_xray_config()` 在 `all` 时把 `hop` 放进 `outbounds[0]`（即默认出口），并追加一条 `"network": "tcp,udp"` 兜底路由
+- 私网段（`127.0.0.0/8` 等）仍走 `direct`，回环流量不会被绕进代理
+- 只连 `127.0.0.1`，不新增任何公网端口；cloudflared 不经过 Xray，隧道不受代理影响
+- 切换前先 `curl -x` 探测代理可用性，不通就直接拒绝切换
+- 切换后 Xray 起不来自动回滚到切换前的 `hop_mode`
+- `domainStrategy: AsIs`，域名原样交给代理服务端解析，落地出口更干净
+
+配置键：`hop_mode` / `hop_proto` / `hop_addr` / `hop_port`，重装时沿用。
+
 ## 9. 文件布局
 
 ```

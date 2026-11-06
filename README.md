@@ -38,7 +38,7 @@ bash /root/argox.sh
  5) 查看状态              13) 隧道设置
  6) 查看日志              14) 优选 IP 源（链接 / 运营商）
  7) 更新到最新版          15) 订阅地址
- 8) 更换 UUID
+ 8) 更换 UUID             16) 出口跳板
 ```
 
 ## 订阅
@@ -53,6 +53,20 @@ https://<订阅子域>/<订阅令牌>
 
 需要按 IP 展开时，菜单 13 → `6) 节点地址模式` 切成 `ip`，再菜单 14 导入优选 IP。
 
+## 出口跳板
+
+VPS 上另装了住宅 IP / 商业 VPN 客户端，并提供了本地 SOCKS5 或 HTTP 代理端口时，可让目标站看到代理的出口 IP：
+
+```bash
+bash argox.sh hop          # 状态 + 开关菜单
+bash argox.sh hop on       # 全部流量走跳板（自动识别 socks / http）
+bash argox.sh hop on http  # 强制用 HTTP CONNECT
+bash argox.sh hop off      # 关闭，回到 VPS 原生出口
+```
+
+默认关闭。只需在 VPS 本机监听（如 `127.0.0.1:7928`），不用开放任何公网端口。
+代理挂了会自动拒绝切换；切换后 Xray 起不来会自动回滚到原状态。
+
 ## 命令行
 
 ```bash
@@ -61,6 +75,7 @@ bash argox.sh nodes      # 订阅地址 + 二维码
 bash argox.sh links      # 单节点链接
 bash argox.sh sub        # Base64 订阅内容
 bash argox.sh ips
+bash argox.sh hop on     # 出口跳板（off / on [socks|http]）
 bash argox.sh restart
 bash argox.sh uninstall
 ```

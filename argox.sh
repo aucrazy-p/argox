@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -247,6 +247,49 @@ node_mode() {
   printf '%s' "$m"
 }
 
+# 出口跳板：off（走 VPS 本机出口）| all（全部流量交给本地代理）
+node_hop_mode() {
+  local m
+  m="$(node_get hop_mode 2>/dev/null || true)"
+  [[ -z "$m" ]] && m="$HOP_MODE_DEFAULT"
+  printf '%s' "$m"
+}
+
+# 跳板协议：socks（SOCKS5，首选）| http（HTTP CONNECT）
+node_hop_proto() {
+  local p
+  p="$(node_get hop_proto 2>/dev/null || true)"
+  case "$p" in socks|http) : ;; *) p="$HOP_PROTO_DEFAULT" ;; esac
+  printf '%s' "$p"
+}
+
+node_hop_addr() {
+  local a
+  a="$(node_get hop_addr 2>/dev/null || true)"
+  [[ -z "$a" ]] && a="$HOP_ADDR_DEFAULT"
+  printf '%s' "$a"
+}
+
+node_hop_port() {
+  local p
+  p="$(node_get hop_port 2>/dev/null || true)"
+  [[ "$p" =~ ^[0-9]+$ ]] || p="$HOP_PORT_DEFAULT"
+  printf '%s' "$p"
+}
+
+# 探测本地代理：先 socks5h，再 http；成功输出「协议 出口IP」
+hop_probe() {
+  local ha hp out
+  ha="$(node_hop_addr)"; hp="$(node_hop_port)"
+  out="$(curl -s --max-time 8 -x "socks5h://${ha}:${hp}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+        | sed -n 's/^ip=//p' | head -1)"
+  [[ -n "$out" ]] && { printf 'socks %s' "$out"; return 0; }
+  out="$(curl -s --max-time 8 -x "http://${ha}:${hp}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+        | sed -n 's/^ip=//p' | head -1)"
+  [[ -n "$out" ]] && { printf 'http %s' "$out"; return 0; }
+  return 1
+}
+
 # ==============================================================================
 #  系统优化
 # ==============================================================================
@@ -337,6 +380,20 @@ install_cloudflared() {
 write_xray_config() {
   local uuid="$1" px="$2" pw="$3"
 
+  # 出站与路由：跳板开启时把 hop 放在第一位（成为默认出口）
+  local ob_json rt_json
+  if [[ "$(node_hop_mode)" == "all" ]]; then
+    local hp ha hport
+    hp="$(node_hop_proto)"; ha="$(node_hop_addr)"; hport="$(node_hop_port)"
+    ob_json="    { \"protocol\": \"${hp}\", \"tag\": \"hop\", \"settings\": { \"servers\": [{ \"address\": \"${ha}\", \"port\": ${hport} }] } },
+    { \"protocol\": \"freedom\", \"tag\": \"direct\" }"
+    rt_json='      { "type": "field", "ip": ["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","::1/128","fc00::/7"], "outboundTag": "direct" },
+      { "type": "field", "network": "tcp,udp", "outboundTag": "hop" }'
+  else
+    ob_json='    { "protocol": "freedom", "tag": "direct" }'
+    rt_json='      { "type": "field", "ip": ["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","::1/128","fc00::/7"], "outboundTag": "direct" }'
+  fi
+
   cat > "$CONF" <<EOF
 {
   "log": {
@@ -373,12 +430,12 @@ write_xray_config() {
     }
   ],
   "outbounds": [
-    { "protocol": "freedom", "tag": "direct" }
+${ob_json}
   ],
   "routing": {
     "domainStrategy": "AsIs",
     "rules": [
-      { "type": "field", "ip": ["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","::1/128","fc00::/7"], "outboundTag": "direct" }
+${rt_json}
     ]
   }
 }
@@ -541,6 +598,14 @@ ISP_PREF_DEFAULT="mobile"   # mobile | unicom | telecom | multi | auto
 NODE_MODE_DEFAULT="domain"
 DEF_WS_SUB="ws"     # WS 兜底子域前缀，实际域名 = ws.<主域名>
 DEF_SUB_SUB="sub"   # 订阅子域前缀，实际域名 = sub.<主域名>
+
+# 出口跳板：把 VPS 的出站交给本机代理（如住宅 IP 客户端）
+#   off = 关闭，流量从 VPS 原生 IP 出去
+#   all = 全部流量走跳板（目标站只看到代理的出口 IP）
+HOP_MODE_DEFAULT="off"
+HOP_PROTO_DEFAULT="socks"    # socks（SOCKS5）| http（HTTP CONNECT）
+HOP_ADDR_DEFAULT="127.0.0.1"
+HOP_PORT_DEFAULT=7928
 
 ensure_ipsrc() {
   mkdir -p "$BASE"
@@ -1110,8 +1175,13 @@ do_status() {
     printf '  XHTTP 路径 : %s  (127.0.0.1:%s)\n' "$(node_get path_xhttp)" "$DEF_PORT_XHTTP"
     printf '  WS 路径    : %s  (127.0.0.1:%s)\n' "$(node_get path_ws)" "$DEF_PORT_WS"
     printf '  优选 IP    : %s 个（%s）\n' "$(wc -l < "$IPSF" 2>/dev/null || echo 0)" "$IPSF"
-    local st; st="$(node_get sub_token 2>/dev/null || true)"
-    [[ -n "$st" ]] && printf '  订阅地址   : https://%s/%s\n' "$(node_get tunnel_host)" "$st"
+    local st sh; st="$(node_get sub_token 2>/dev/null || true)"; sh="$(node_sub_host)"
+    [[ -n "$st" ]] && printf '  订阅地址   : https://%s/%s\n' "${sh:-$(node_get tunnel_host)}" "$st"
+    if [[ "$(node_hop_mode)" == "all" ]]; then
+      printf '  出口跳板   : 全部走 %s:%s (%s)\n' "$(node_hop_addr)" "$(node_hop_port)" "$(node_hop_proto)"
+    else
+      printf '  出口跳板   : 关闭（VPS 原生出口）\n'
+    fi
   else
     warn "尚未安装"
   fi
@@ -1250,6 +1320,11 @@ do_install() {
   [[ -z "$sub_prev"  ]] && sub_prev="$(sub_of "$host" "$DEF_SUB_SUB")"
   [[ -z "$mode_prev" ]] && mode_prev="$NODE_MODE_DEFAULT"
 
+  # 出口跳板：重装时沿用
+  local hop_prev hop_proto_prev hop_addr_prev hop_port_prev
+  hop_prev="$(node_hop_mode)"; hop_proto_prev="$(node_hop_proto)"
+  hop_addr_prev="$(node_hop_addr)"; hop_port_prev="$(node_hop_port)"
+
   cat > "$NODEF" <<EOF
 {
   "uuid": "${uuid}",
@@ -1257,6 +1332,10 @@ do_install() {
   "ws_host": "${ws_prev}",
   "sub_host": "${sub_prev}",
   "node_mode": "${mode_prev}",
+  "hop_mode": "${hop_prev}",
+  "hop_proto": "${hop_proto_prev}",
+  "hop_addr": "${hop_addr_prev}",
+  "hop_port": "${hop_port_prev}",
   "path_xhttp": "${px}",
   "path_ws": "${pw}",
   "isp_pref": "${isp_prev}",
@@ -1576,6 +1655,111 @@ do_uninstall() {
   warn "记得去 CF Dashboard 删除对应 Tunnel，否则会留下孤儿隧道"
 }
 
+# ==============================================================================
+#  出口跳板
+# ==============================================================================
+hop_show() {
+  local mode proto addr port p mode_txt
+  mode="$(node_hop_mode)"; proto="$(node_hop_proto)"
+  addr="$(node_hop_addr)"; port="$(node_hop_port)"
+  if [[ "$mode" == "all" ]]; then mode_txt="${C_YEL}全部走跳板${C_R}"; else mode_txt="关闭（VPS 原生出口）"; fi
+  printf '  模式    : %s\n' "$mode_txt"
+  printf '  代理    : %s  %s:%s\n' "$proto" "$addr" "$port"
+  p="$(hop_probe || true)"
+  if [[ -n "$p" ]]; then
+    printf '  探测    : 可用（%s），出口 IP %s\n' "${p%% *}" "${p#* }"
+  else
+    printf '  探测    : %s不可达%s（代理未启动 / 端口不对）\n' "$C_YEL" "$C_R"
+  fi
+}
+
+hop_edit_addr() {
+  local a p
+  a="$(node_hop_addr)"; p="$(node_hop_port)"
+  read -rp "  代理地址（当前 ${a}）: " a
+  [[ -n "$a" ]] && node_set hop_addr "$a"
+  read -rp "  代理端口（当前 ${p}）: " p
+  if [[ "$p" =~ ^[0-9]+$ ]]; then node_set hop_port "$p"; fi
+  ok "代理已设为 $(node_hop_addr):$(node_hop_port)"
+}
+
+hop_set() { # $1=all|off  $2=可选协议 socks|http
+  local mode="$1" proto="${2:-}" prev uuid px pw pr
+  prev="$(node_hop_mode)"
+  uuid="$(node_get uuid)"; px="$(node_get path_xhttp)"; pw="$(node_get path_ws)"
+  if [[ -z "$uuid" || -z "$px" || -z "$pw" ]]; then
+    err "缺少 uuid / 路径，先跑菜单 1 完成安装"
+    return 1
+  fi
+
+  if [[ "$mode" == "all" ]]; then
+    pr="$(hop_probe || true)"
+    if [[ -z "$pr" ]]; then
+      err "本地代理 $(node_hop_addr):$(node_hop_port) 不通，未切换"
+      info "确认代理已启动；地址/端口不对就用菜单 3 改"
+      return 1
+    fi
+    [[ -z "$proto" ]] && proto="${pr%% *}"
+    node_set hop_proto "$proto"
+    ok "代理可用（${pr%% *}），出口 IP ${pr#* }"
+  fi
+
+  node_set hop_mode "$mode"
+  if ! write_xray_config "$uuid" "$px" "$pw"; then
+    node_set hop_mode "$prev"
+    err "配置生成失败，已保持原状"
+    return 1
+  fi
+
+  systemctl restart "$SVC_XRAY" 2>/dev/null
+  sleep 2
+  if svc_active "$SVC_XRAY"; then
+    if [[ "$mode" == "all" ]]; then ok "已开启：全部流量经 $(node_hop_addr):$(node_hop_port) 出去"
+    else ok "已关闭：流量从 VPS 本机出口出去"; fi
+    info "客户端重新连一次节点生效（旧连接仍走原来的出口）"
+  else
+    err "Xray 启动失败，自动回滚"
+    node_set hop_mode "$prev"
+    write_xray_config "$uuid" "$px" "$pw" >/dev/null 2>&1 || true
+    systemctl restart "$SVC_XRAY" 2>/dev/null
+    journalctl -u "$SVC_XRAY" -n 20 --no-pager
+    return 1
+  fi
+}
+
+do_hop() {
+  require_root
+  installed || { err "尚未安装，先执行菜单 1"; return 1; }
+  local act="${1:-}"
+
+  case "$act" in
+    on|all)   hop_set all "${2:-}"; return ;;
+    off|none) hop_set off ; return ;;
+    ""|status|menu) : ;;
+    *) err "用法：hop [on|off] [socks|http]"; return 1 ;;
+  esac
+
+  while true; do
+    printf '\n  出口跳板\n'
+    hop_show
+    printf '\n'
+    printf '  1) 关闭（默认，流量从 VPS 原生 IP 出去）\n'
+    printf '  2) 全部走跳板（目标站只看到代理的出口 IP）\n'
+    printf '  3) 改代理地址 / 端口\n'
+    printf '  0) 返回\n'
+    local c; read -rp "  选择: " c
+    case "$c" in
+      1) hop_set off ;;
+      2) hop_set all ;;
+      3) hop_edit_addr ;;
+      0|"") return 0 ;;
+      *) warn "无效选项：${c:-<空>}" ;;
+    esac
+    printf '\n'
+    read -rp "  按回车继续…" _ || true
+  done
+}
+
 do_tunnel_setup() {
   require_root
   local ws_h sub_h mode_v
@@ -1717,7 +1901,9 @@ menu_header() {
 }
 
 menu_main() {
+  local hop_label
   while true; do
+    if [[ "$(node_hop_mode)" == "all" ]]; then hop_label="${C_YEL}全部${C_R}"; else hop_label="关闭"; fi
     menu_header
     cat <<'EOF'
    1) 安装 / 重新部署           9) 系统优化（BBR / 重启 / 日志）
@@ -1727,9 +1913,9 @@ menu_main() {
    5) 查看状态                 13) 隧道设置（Token / 域名 / 测试）
    6) 查看日志                 14) 优选 IP 源
    7) 更新到最新版             15) 订阅地址 / 二维码
-   8) 更换 UUID（用户名/密码）
-    0) 退出
 EOF
+    printf '   8) 更换 UUID（用户名/密码）    16) 出口跳板（%s）\n' "$hop_label"
+    printf '\n    0) 退出\n'
     printf '%s\n' "──────────────────────────────────────────────────"
     read -rp "  请选择: " choice
     case "${choice:-}" in
@@ -1748,6 +1934,7 @@ EOF
       13) do_tunnel_setup ;;
       14) menu_ips ;;
       15) show_nodes ;;
+      16) do_hop ;;
       0|q|Q) printf '\n  再见\n\n'; exit 0 ;;
       *) warn "无效选项：${choice:-<空>}" ;;
     esac
@@ -1771,6 +1958,7 @@ main() {
     ips)       update_ips ;;
     nodes|show) show_nodes ;;
     links)     show_links ;;
+    hop)       do_hop "${2:-}" "${3:-}" ;;
     sub)       gen_sub && cat "${SUBD}/argox.b64" ;;
     uninstall) do_uninstall ;;
     ""|menu)   require_root; menu_main ;;
@@ -1786,6 +1974,9 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 links        打印单节点链接
   bash $0 sub          输出 Base64 订阅内容
   bash $0 ips          从 IP 源拉取并校验（菜单 14）
+  bash $0 hop          出口跳板状态（菜单 16）
+  bash $0 hop on       全部流量走本地代理（自动探测 socks/http）
+  bash $0 hop off      关闭跳板，流量从 VPS 本机出口出去
   bash $0 uninstall    卸载
 
   curl -fsSL <地址> | bash     ← 不推荐，请先 curl -o 下来看一眼
