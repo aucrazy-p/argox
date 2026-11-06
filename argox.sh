@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -277,6 +277,14 @@ node_hop_port() {
   printf '%s' "$p"
 }
 
+# 隧道传输协议：auto（默认，quic 失败自动退 http2）| quic | http2
+node_tunnel_proto() {
+  local p
+  p="$(node_get tunnel_proto 2>/dev/null || true)"
+  case "$p" in auto|quic|http2) : ;; *) p="$TUNNEL_PROTO_DEFAULT" ;; esac
+  printf '%s' "$p"
+}
+
 # 探测本地代理：先 socks5h，再 http；成功输出「协议 出口IP」
 hop_probe() {
   local ha hp out
@@ -474,6 +482,7 @@ EOF
 
 write_tunnel_service() {
   [[ -s "$TOKEN_FILE" ]] || return 1
+  local proto; proto="$(node_tunnel_proto)"
   cat > "/etc/systemd/system/${SVC_TUN}.service" <<EOF
 [Unit]
 Description=argox Cloudflare Tunnel
@@ -483,7 +492,7 @@ Wants=network-online.target
 [Service]
 Type=notify
 EnvironmentFile=${TOKEN_FILE}
-ExecStart=${CFD_BIN} tunnel --no-autoupdate --protocol quic --loglevel info run
+ExecStart=${CFD_BIN} tunnel --no-autoupdate --protocol ${proto} --loglevel info run
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -493,6 +502,66 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable "$SVC_TUN" >/dev/null 2>&1
+}
+
+# ==============================================================================
+#  cloudflared 出站诊断
+#
+#  出站走 7844：QUIC 用 UDP，http2 用 TCP。VPS 出站被限制时进程照样 active，
+#  只是永远注册不上，日志里只有 dial 失败——这一步专门把这种情况单独指出来。
+# ==============================================================================
+
+# 边缘域名能否解析（输出可解析的域名，空=全失败）
+edge_dns() {
+  local h got=""
+  for h in region1.v2.argotunnel.com region2.v2.argotunnel.com; do
+    if has python3; then
+      python3 -c 'import socket,sys; socket.setdefaulttimeout(4); socket.gethostbyname(sys.argv[1])' "$h" >/dev/null 2>&1 \
+        && got="${got}${got:+ }${h}"
+    elif has getent; then
+      getent ahosts "$h" >/dev/null 2>&1 && got="${got}${got:+ }${h}"
+    fi
+  done
+  printf '%s' "$got"
+}
+
+# 出站 TCP 7844（http2 回退路径）：0=通 1=不通 2=无法测试
+edge_tcp7844() {
+  local h
+  has timeout || return 2
+  for h in region1.v2.argotunnel.com region2.v2.argotunnel.com; do
+    timeout 6 bash -c "exec 3<>/dev/tcp/${h}/7844" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+# 已注册的连接条数
+tunnel_registered() {
+  local n
+  n="$(journalctl -u "$SVC_TUN" -n 200 --no-pager 2>/dev/null | grep -c 'Registered tunnel connection' || true)"
+  printf '%s' "${n:-0}"
+}
+
+# cloudflared 实际使用的协议（quic / http2）
+tunnel_live_proto() {
+  journalctl -u "$SVC_TUN" -n 200 --no-pager 2>/dev/null \
+    | grep 'Registered tunnel connection' | tail -1 \
+    | sed -n 's/.*protocol=\([a-zA-Z0-9]*\).*/\1/p'
+}
+
+# 未注册时的排查提示（安装和诊断共用）
+tunnel_hints() {
+  local tcp; edge_tcp7844; tcp=$?
+  if [[ "$tcp" -eq 1 ]]; then
+    err "出站 TCP 7844 也不通 → 云厂商安全组 / 出站防火墙拦了 cloudflared"
+    info "Cloudflare 要求 VPS 能出站访问 7844（UDP 与 TCP）"
+    info "Oracle 云检查安全列表出站规则，或 iptables -L OUTPUT"
+  else
+    info "TCP 7844 通但没注册成功，两种可能："
+    info "  a) UDP 7844 被拦（QUIC 出不去）→ bash ${0##*/} diag http2"
+    info "  b) Token 不对 / 隧道已在面板删除 → 菜单 13 → 1) 重新粘贴 Token"
+  fi
+  info "看日志：journalctl -u ${SVC_TUN} -n 60"
 }
 
 write_sub_server() {
@@ -606,6 +675,9 @@ HOP_MODE_DEFAULT="off"
 HOP_PROTO_DEFAULT="socks"    # socks（SOCKS5）| http（HTTP CONNECT）
 HOP_ADDR_DEFAULT="127.0.0.1"
 HOP_PORT_DEFAULT=7928
+
+# cloudflared 传输协议：auto 让它先试 QUIC(UDP 7844)，不通自动退 http2(TCP 7844)
+TUNNEL_PROTO_DEFAULT="auto"
 
 ensure_ipsrc() {
   mkdir -p "$BASE"
@@ -1190,11 +1262,13 @@ do_status() {
   hr
   # 隧道在线状态（CF 侧健康检查）
   if svc_active "$SVC_TUN"; then
-    local q; q="$(journalctl -u "$SVC_TUN" -n 40 --no-pager 2>/dev/null | grep -c 'Registered tunnel connection' || true)"
+    local q live
+    q="$(tunnel_registered)"; live="$(tunnel_live_proto)"
     if [[ "${q:-0}" -gt 0 ]]; then
-      ok "隧道已向 CF 注册连接"
+      ok "隧道已向 CF 注册 ${q} 条连接（实际协议 ${live:-未知}，配置 $(node_tunnel_proto)）"
+      [[ "$live" == "http2" ]] && info "走了 TCP/http2：UDP 7844 出不去，QUIC 未生效"
     else
-      info "隧道进程在跑，但日志中尚未看到注册成功的记录"
+      info "隧道进程在跑，但日志中尚未看到注册成功的记录（bash $0 diag 可查）"
     fi
   fi
   hr
@@ -1325,6 +1399,9 @@ do_install() {
   hop_prev="$(node_hop_mode)"; hop_proto_prev="$(node_hop_proto)"
   hop_addr_prev="$(node_hop_addr)"; hop_port_prev="$(node_hop_port)"
 
+  # 隧道传输协议：重装时沿用
+  local tproto_prev; tproto_prev="$(node_tunnel_proto)"
+
   cat > "$NODEF" <<EOF
 {
   "uuid": "${uuid}",
@@ -1336,6 +1413,7 @@ do_install() {
   "hop_proto": "${hop_proto_prev}",
   "hop_addr": "${hop_addr_prev}",
   "hop_port": "${hop_port_prev}",
+  "tunnel_proto": "${tproto_prev}",
   "path_xhttp": "${px}",
   "path_ws": "${pw}",
   "isp_pref": "${isp_prev}",
@@ -1363,7 +1441,7 @@ EOF
   if [[ -n "$token" ]]; then
     save_token "$token"
     write_tunnel_service
-    ok "隧道服务已注册：${SVC_TUN}.service"
+    ok "隧道服务已注册：${SVC_TUN}.service（协议 ${tproto_prev}）"
   else
     warn "未提供 Token，隧道服务暂不创建"
   fi
@@ -1397,16 +1475,32 @@ EOF
   if svc_active "$SVC_SUB"; then ok "订阅服务运行中"; else warn "订阅服务启动失败：journalctl -u ${SVC_SUB} -n 30"; fi
 
   if [[ -s "$TOKEN_FILE" ]]; then
+    # ---------- 出站预检（cloudflared 需要能出站访问 7844） ----------
+    step "出站预检"
+    if [[ -n "$(edge_dns)" ]]; then
+      ok "边缘域名可解析"
+    else
+      warn "解析不了 region1/region2.v2.argotunnel.com，本机 DNS 可能有问题"
+    fi
+    local tcp_st; edge_tcp7844; tcp_st=$?
+    case "$tcp_st" in
+      0) ok "出站 TCP 7844 可达" ;;
+      1) warn "出站 TCP 7844 不可达 —— http2 回退路径被封，隧道很可能起不来" ;;
+      *) : ;;
+    esac
+
     systemctl restart "$SVC_TUN"
-    sleep 3
+    sleep 4
     if svc_active "$SVC_TUN"; then
       ok "隧道进程运行中"
-      local think
-      think="$(journalctl -u "$SVC_TUN" -n 30 --no-pager 2>/dev/null | grep -c 'Registered tunnel connection' || true)"
-      if [[ "${think:-0}" -gt 0 ]]; then
-        ok "隧道已成功注册到 Cloudflare"
+      local nlive nreg
+      nreg="$(tunnel_registered)"; nlive="$(tunnel_live_proto)"
+      if [[ "${nreg:-0}" -gt 0 ]]; then
+        ok "隧道已注册 ${nreg} 条到 Cloudflare（实际协议 ${nlive:-未知}）"
+        [[ "$nlive" == "http2" ]] && warn "实际走 TCP/http2：UDP 7844 出不去，QUIC 用不上（功能正常，抗丢包差一档）"
       else
-        warn "隧道尚未注册成功（DNS/防火墙/Token 不匹配都可能）"
+        warn "隧道尚未注册成功"
+        tunnel_hints
       fi
     else
       warn "隧道启动失败，检查 Token：journalctl -u ${SVC_TUN} -n 30"
@@ -1656,6 +1750,69 @@ do_uninstall() {
 }
 
 # ==============================================================================
+#  cloudflared 出站诊断（用户可见入口）
+# ==============================================================================
+do_diag() {
+  require_root
+  local act="${1:-}"
+
+  # 指定协议：改配置 + 重建单元 + 重启
+  case "$act" in
+    auto|quic|http2)
+      node_set tunnel_proto "$act"
+      write_tunnel_service || { err "还没有 Token，无法创建隧道服务"; return 1; }
+      systemctl daemon-reload
+      systemctl restart "$SVC_TUN" 2>/dev/null
+      sleep 5
+      ok "隧道协议已设为 ${act}"
+      printf '  注册连接 : %s 条\n' "$(tunnel_registered)"
+      printf '  实际协议 : %s\n' "$(tunnel_live_proto)"
+      [[ "$(tunnel_registered)" -eq 0 ]] && tunnel_hints
+      return 0
+      ;;
+    ""|check|status) : ;;
+    *) err "用法：diag [auto|quic|http2]"; return 1 ;;
+  esac
+
+  step "cloudflared 出站诊断"
+
+  # 1) DNS
+  local dns; dns="$(edge_dns)"
+  if [[ -n "$dns" ]]; then ok "边缘域名可解析：${dns}"
+  else err "解析不了 region1/region2.v2.argotunnel.com（本机 DNS 异常）"; fi
+
+  # 2) 出站 TCP 7844
+  local tcp; edge_tcp7844; tcp=$?
+  case "$tcp" in
+    0) ok "出站 TCP 7844 可达" ;;
+    1) err "出站 TCP 7844 不可达（安全组 / 出站防火墙拦了）" ;;
+    *) warn "缺 timeout 命令，跳过 TCP 探测（apt install coreutils）" ;;
+  esac
+
+  # 3) UDP 7844：只能间接判断
+  local live; live="$(tunnel_live_proto)"
+  if [[ "$live" == "quic" ]]; then
+    ok "QUIC 正常（实际协议 quic，说明 UDP 7844 通）"
+  elif [[ "$live" == "http2" ]]; then
+    warn "实际协议 http2 → UDP 7844 出不去，已回退 TCP（能用，但抗丢包差一档）"
+  fi
+
+  # 4) 服务与注册
+  if [[ ! -s "$TOKEN_FILE" ]]; then warn "还没有 Token，隧道未创建"; return 0; fi
+  if svc_active "$SVC_TUN"; then ok "隧道进程运行中"; else err "隧道进程未运行：systemctl status ${SVC_TUN}"; fi
+
+  local n cfg; n="$(tunnel_registered)"; cfg="$(node_tunnel_proto)"
+  if [[ "${n:-0}" -gt 0 ]]; then
+    ok "已注册 ${n} 条连接（实际 ${live:-未知}，配置 ${cfg}）"
+  else
+    err "没有任何注册记录：进程在跑，但连不上 CF"
+    tunnel_hints
+  fi
+
+  printf '\n  切换协议：bash %s diag auto|quic|http2\n\n' "${0##*/}"
+}
+
+# ==============================================================================
 #  出口跳板
 # ==============================================================================
 hop_show() {
@@ -1771,6 +1928,7 @@ do_tunnel_setup() {
   printf '  4) WS 兜底子域（当前：%s）\n' "${ws_h:-未设置}"
   printf '  5) 订阅子域（当前：%s）\n' "${sub_h:-未设置}"
   printf '  6) 节点地址模式（当前：%s）\n' "$mode_v"
+  printf '  7) cloudflared 出站诊断（7844 通不通）\n'
   printf '  0) 返回\n'
   local c; read -rp "  选择: " c
   case "$c" in
@@ -1876,6 +2034,9 @@ do_tunnel_setup() {
       gen_sub >/dev/null 2>&1 || true
       show_nodes
       ;;
+    7)
+      do_diag
+      ;;
     *) return 0 ;;
   esac
 }
@@ -1959,6 +2120,7 @@ main() {
     nodes|show) show_nodes ;;
     links)     show_links ;;
     hop)       do_hop "${2:-}" "${3:-}" ;;
+    diag)      do_diag "${2:-}" ;;
     sub)       gen_sub && cat "${SUBD}/argox.b64" ;;
     uninstall) do_uninstall ;;
     ""|menu)   require_root; menu_main ;;
@@ -1977,6 +2139,9 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 hop          出口跳板状态（菜单 16）
   bash $0 hop on       全部流量走本地代理（自动探测 socks/http）
   bash $0 hop off      关闭跳板，流量从 VPS 本机出口出去
+  bash $0 diag         cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）
+  bash $0 diag http2   强制隧道走 TCP（UDP 7844 被封时用）
+  bash $0 diag auto    恢复自动选择（默认）
   bash $0 uninstall    卸载
 
   curl -fsSL <地址> | bash     ← 不推荐，请先 curl -o 下来看一眼

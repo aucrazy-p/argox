@@ -27,6 +27,7 @@ bash /root/argox.sh
 - ARM64 或 AMD64（自动识别）
 - 域名已托管 Cloudflare，并已创建隧道，见 [docs/cloudflare-setup.md](docs/cloudflare-setup.md)
 - 8001 / 8002 / 8099 端口空闲；仅监听本机，不开放任何公网端口，不占用 443
+- VPS 能**出站**访问 `7844`（cloudflared 隧道端口，UDP + TCP）；出站被封时隧道进程在跑但永远注册不上
 
 ## 菜单
 
@@ -76,6 +77,8 @@ bash argox.sh links      # 单节点链接
 bash argox.sh sub        # Base64 订阅内容
 bash argox.sh ips
 bash argox.sh hop on     # 出口跳板（off / on [socks|http]）
+bash argox.sh diag       # cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）
+bash argox.sh diag http2 # UDP 7844 被封时强制走 TCP
 bash argox.sh restart
 bash argox.sh uninstall
 ```

@@ -140,7 +140,7 @@ Wants=network-online.target
 [Service]
 Type=notify
 EnvironmentFile=/etc/argox/token.env
-ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --protocol quic run
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --protocol auto run
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -160,10 +160,27 @@ TUNNEL_TOKEN=<安装时粘贴>
 | 项 | 选择 | 理由 |
 |---|---|---|
 | token 传递 | `EnvironmentFile` + `TUNNEL_TOKEN` | 不出现在 `ps` / `/proc/cmdline`，规避 Xray-go 的 P0 问题 |
-| 协议 | `--protocol quic` | 全段 UDP，与客户端 H3 对齐 |
+| 协议 | `--protocol auto`（`tunnel_proto` 可改 quic / http2） | 先试 QUIC，UDP 7844 不通时自动退 http2；写死 quic 会在 UDP 被封时永久注册不上 |
 | `--ha-connections` | quic 用默认 1；http2 用 4 | 该参数只对 http2 有效 |
 | 启动方式 | systemd，`Restart=always` | 规避 Xray-go 的 nohup 不自启问题 |
 | ingress | Dashboard → Public Hostname → `http://127.0.0.1:8001` | remotely-managed 不在本地配 |
+
+### 出站诊断（`do_diag`）
+
+cloudflared 出站走 **7844**（QUIC=UDP，http2=TCP）。出站被云厂商安全组 / 防火墙拦住时，进程照样
+`active`，只是永远注册不上——这是最难自查的一类故障，所以单独做一层检测：
+
+| 检查项 | 方法 | 判读 |
+|---|---|---|
+| 边缘域名解析 | `python3 socket.gethostbyname` / `getent ahosts` | 解析不到 = 本机 DNS 问题 |
+| 出站 TCP 7844 | `timeout 6 bash -c 'exec 3<>/dev/tcp/<host>/7844'` | 不通 = 出站被拦，http2 回退路径也没了 |
+| UDP 7844 | 间接：读日志里 `Registered tunnel connection ... protocol=` | `quic` = UDP 通；`http2` = UDP 出不去，已回退 |
+| 注册状态 | 日志计数 `Registered tunnel connection` | 0 条 = 进程在跑但连不上 CF |
+
+入口：安装流程内的「出站预检」、菜单 13 → `7)`、命令行 `argox.sh diag`。
+
+`argox.sh diag quic|http2|auto` 会写入 `tunnel_proto` 并重建 systemd 单元重启，
+用于 UDP 被封时强制走 TCP。
 
 ---
 
