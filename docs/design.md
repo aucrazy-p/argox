@@ -175,7 +175,12 @@ cloudflared 出站走 **7844**（QUIC=UDP，http2=TCP）。出站被云厂商安
 | 边缘域名解析 | `python3 socket.gethostbyname` / `getent ahosts` | 解析不到 = 本机 DNS 问题 |
 | 出站 TCP 7844 | `timeout 6 bash -c 'exec 3<>/dev/tcp/<host>/7844'` | 不通 = 出站被拦，http2 回退路径也没了 |
 | UDP 7844 | 间接：读日志里 `Registered tunnel connection ... protocol=` | `quic` = UDP 通；`http2` = UDP 出不去，已回退 |
-| 注册状态 | 日志计数 `Registered tunnel connection` | 0 条 = 进程在跑但连不上 CF |
+| 注册状态 | 日志计数 `Registered tunnel connection`，起点取 `ActiveEnterTimestamp` | 0 条 = 进程在跑但连不上 CF |
+| 链路实测 | `curl https://<隧道域名><path_xhttp>` | 400/404 = 通（Xray 对裸 GET 的正常反应）；530/1033 = 路由没指向本隧道；502/503 = 隧道通但回源失败 |
+
+日志计数和链路实测是**双重判据**：cloudflared 只在建连成功那一刻打一条注册日志，稳定运行几小时后
+时间窗内可能一条都没有；先按 `-n 200` 取行数又会被抖动时的错误刷屏挤掉。所以注册计数改为按
+「本次进程启动时刻」到现在取时间窗，再用一次真实 HTTPS 请求兜底——两者任一通过即判定在线。
 
 入口：安装流程内的「出站预检」、菜单 13 → `7)`、命令行 `argox.sh diag`。
 
@@ -394,7 +399,7 @@ bash argox.sh            → 进入菜单 → 选 1
 |---|---|---|
 | Xray 启动 | `systemctl status argox-xray` | active |
 | 隧道在线 | `systemctl status argox-tunnel` + Dashboard Healthy | 是 |
-| 隧道注册 | `journalctl -u argox-tunnel -n 30 \| grep Registered` | 有记录 |
+| 隧道注册 | `bash argox.sh diag`（日志时间窗 + 链路实测） | 至少一条判据通过 |
 | 本地入站 | `curl -sI http://127.0.0.1:8001/<path>` | 非 000 / 非 502 |
 | 隧道回源 | 菜单 15 → 3 测试 | 非 1033 / 530 / 502 |
 | 客户端连通 | karing 日志 | 无 handshake 失败 |

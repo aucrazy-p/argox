@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -535,18 +535,62 @@ edge_tcp7844() {
   return 1
 }
 
-# 已注册的连接条数
+# 日志统计起点：本次隧道进程的启动时刻（避免稳定运行后窗口内没有注册日志）
+tunnel_since() {
+  local ts dt
+  ts="$(systemctl show -p ActiveEnterTimestamp --value "$SVC_TUN" 2>/dev/null \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  # 形如 "Fri 2026-11-06 21:05:03 CST"：只取日期与时间，时区交给 journalctl 按本机时区解释
+  dt="$(printf '%s' "$ts" | awk 'NF>=3 {print $2, $3}')"
+  if [[ "$dt" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
+    printf '%s' "$dt"; return
+  fi
+  printf '%s' '-30min'
+}
+
+# 已注册的连接条数（本次进程启动以来）
 tunnel_registered() {
   local n
-  n="$(journalctl -u "$SVC_TUN" -n 200 --no-pager 2>/dev/null | grep -c 'Registered tunnel connection' || true)"
+  n="$(journalctl -u "$SVC_TUN" --since "$(tunnel_since)" --no-pager 2>/dev/null \
+        | grep -c 'Registered tunnel connection' || true)"
   printf '%s' "${n:-0}"
 }
 
 # cloudflared 实际使用的协议（quic / http2）
 tunnel_live_proto() {
-  journalctl -u "$SVC_TUN" -n 200 --no-pager 2>/dev/null \
+  journalctl -u "$SVC_TUN" --since "$(tunnel_since)" --no-pager 2>/dev/null \
     | grep 'Registered tunnel connection' | tail -1 \
     | sed -n 's/.*protocol=\([a-zA-Z0-9]*\).*/\1/p'
+}
+
+# 直接打一次隧道域名，判断链路是否真的可用
+# 输出：ok:<code> | origin:<code> | noroute | fail | nohost
+tunnel_probe() {
+  local host px code
+  host="$(node_get tunnel_host 2>/dev/null || true)"
+  [[ -z "$host" ]] && { printf 'nohost'; return; }
+  px="$(node_get path_xhttp 2>/dev/null || true)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+          "https://${host}${px}" 2>/dev/null || echo 000)"
+  case "$code" in
+    000)       printf 'fail' ;;
+    530|1033)  printf 'noroute' ;;
+    502|503)   printf "origin:${code}" ;;
+    *)         printf "ok:${code}" ;;
+  esac
+}
+
+# 等隧道注册（重启后日志落盘有延迟，轮询最多 $1 秒，默认 20）
+tunnel_await() {
+  local max="${1:-20}" i=0 n
+  while (( i < max )); do
+    n="$(tunnel_registered)"
+    [[ "${n:-0}" -gt 0 ]] && { printf '%s' "$n"; return 0; }
+    sleep 2
+    i=$((i + 2))
+  done
+  printf '%s' "$(tunnel_registered)"
+  return 1
 }
 
 # 未注册时的排查提示（安装和诊断共用）
@@ -1262,13 +1306,18 @@ do_status() {
   hr
   # 隧道在线状态（CF 侧健康检查）
   if svc_active "$SVC_TUN"; then
-    local q live
+    local q live pb
     q="$(tunnel_registered)"; live="$(tunnel_live_proto)"
     if [[ "${q:-0}" -gt 0 ]]; then
       ok "隧道已向 CF 注册 ${q} 条连接（实际协议 ${live:-未知}，配置 $(node_tunnel_proto)）"
       [[ "$live" == "http2" ]] && info "走了 TCP/http2：UDP 7844 出不去，QUIC 未生效"
     else
-      info "隧道进程在跑，但日志中尚未看到注册成功的记录（bash $0 diag 可查）"
+      pb="$(tunnel_probe)"
+      if [[ "$pb" == ok:* ]]; then
+        ok "隧道在线（实测 HTTP ${pb#ok:}，日志窗口内暂无注册记录属正常）"
+      else
+        info "隧道进程在跑，但未确认在线（bash $0 diag 可查）"
+      fi
     fi
   fi
   hr
@@ -1490,14 +1539,16 @@ EOF
     esac
 
     systemctl restart "$SVC_TUN"
-    sleep 4
+    sleep 2
     if svc_active "$SVC_TUN"; then
       ok "隧道进程运行中"
-      local nlive nreg
-      nreg="$(tunnel_registered)"; nlive="$(tunnel_live_proto)"
+      local nlive nreg pb
+      nreg="$(tunnel_await 20)"; nlive="$(tunnel_live_proto)"; pb="$(tunnel_probe)"
       if [[ "${nreg:-0}" -gt 0 ]]; then
         ok "隧道已注册 ${nreg} 条到 Cloudflare（实际协议 ${nlive:-未知}）"
         [[ "$nlive" == "http2" ]] && warn "实际走 TCP/http2：UDP 7844 出不去，QUIC 用不上（功能正常，抗丢包差一档）"
+      elif [[ "$pb" == ok:* ]]; then
+        warn "日志暂无注册记录，但链路实测可用（HTTP ${pb#ok:}），继续即可"
       else
         warn "隧道尚未注册成功"
         tunnel_hints
@@ -1763,11 +1814,20 @@ do_diag() {
       write_tunnel_service || { err "还没有 Token，无法创建隧道服务"; return 1; }
       systemctl daemon-reload
       systemctl restart "$SVC_TUN" 2>/dev/null
-      sleep 5
+      sleep 2
       ok "隧道协议已设为 ${act}"
-      printf '  注册连接 : %s 条\n' "$(tunnel_registered)"
-      printf '  实际协议 : %s\n' "$(tunnel_live_proto)"
-      [[ "$(tunnel_registered)" -eq 0 ]] && tunnel_hints
+      info "等待注册（最多 20 秒）..."
+      local nreg
+      if nreg="$(tunnel_await 20)"; then
+        printf '  注册连接 : %s 条\n' "$nreg"
+        printf '  实际协议 : %s\n' "$(tunnel_live_proto)"
+        [[ "$(tunnel_live_proto)" == "http2" && "$act" != "http2" ]] \
+          && warn "已回退到 http2：UDP 7844 出不去（能用，抗丢包差一档）"
+      else
+        printf '  注册连接 : 0 条\n'
+        err "20 秒内未注册成功"
+        tunnel_hints
+      fi
       return 0
       ;;
     ""|check|status) : ;;
@@ -1801,12 +1861,30 @@ do_diag() {
   if [[ ! -s "$TOKEN_FILE" ]]; then warn "还没有 Token，隧道未创建"; return 0; fi
   if svc_active "$SVC_TUN"; then ok "隧道进程运行中"; else err "隧道进程未运行：systemctl status ${SVC_TUN}"; fi
 
-  local n cfg; n="$(tunnel_registered)"; cfg="$(node_tunnel_proto)"
+  local n cfg pb; n="$(tunnel_registered)"; cfg="$(node_tunnel_proto)"; pb="$(tunnel_probe)"
   if [[ "${n:-0}" -gt 0 ]]; then
     ok "已注册 ${n} 条连接（实际 ${live:-未知}，配置 ${cfg}）"
   else
-    err "没有任何注册记录：进程在跑，但连不上 CF"
-    tunnel_hints
+    case "$pb" in
+      ok:*)
+        warn "日志窗口内暂无注册记录，但链路实测可用（HTTP ${pb#ok:}）—— 刚重启或日志轮转，可忽略"
+        ;;
+      origin:*)
+        err "隧道已连上 CF，但回源失败（HTTP ${pb#origin:}）"
+        info "检查 127.0.0.1:${DEF_PORT_XHTTP} 是否在听：systemctl status ${SVC_XRAY}"
+        ;;
+      nohost)
+        warn "还没填隧道域名，无法实测链路（菜单 13 → 2）"
+        ;;
+      fail|noroute|*)
+        err "没有任何注册记录：进程在跑，但连不上 CF"
+        case "$pb" in
+          noroute) info "实测返回 530/1033：隧道在线，但 Public Hostname 没指向本隧道" ;;
+          fail)    info "实测连不上：本机 DNS 解析不到隧道域名，或 CF 边缘不可达" ;;
+        esac
+        tunnel_hints
+        ;;
+    esac
   fi
 
   printf '\n  切换协议：bash %s diag auto|quic|http2\n\n' "${0##*/}"
