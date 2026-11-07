@@ -149,11 +149,12 @@ AnyTLS 解决的是 **TLS-in-TLS 指纹**：代理把用户 TLS 流量装进自�
 
 | 客户端 | AnyTLS |
 |---|---|
+| **Throne（Xray + sing-box 双内核）** | **支持**（当前在用，无兼容问题） |
 | sing-box 1.12+ | 支持 |
 | mihomo / FlClash | 支持 |
 | Shadowrocket 2.2.65+ | 支持 |
 | v2rayN 7.x（sing-box 内核） | 支持 |
-| **v2rayN 6.x / 纯 Xray 内核** | **不支持** |
+| v2rayN 6.x / 纯 Xray 内核 | **不支持** |
 
 v2rayN 的 Xray 内核没有 AnyTLS 实现。7.x 可以按节点切 sing-box 内核；
 6.x 无解，那条节点在客户端里点不动。

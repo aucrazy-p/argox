@@ -748,10 +748,48 @@ EOF
   fi
 }
 
+# 放行本机防火墙：Oracle 的 Ubuntu 镜像默认在 INPUT 末尾挂 REJECT，
+# 云安全组放行了、实例内还是不通，是这个原因。
+fw_open() { # $1=tcp|udp  $2=端口 或 起-止
+  local pr="$1" p="$2" did=0
+
+  if has ufw && ufw status 2>/dev/null | grep -qi "Status: active"; then
+    ufw allow "${p}/${pr}" >/dev/null 2>&1 && did=1
+  fi
+
+  if has firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --permanent --add-port="${p}/${pr}" >/dev/null 2>&1 \
+      && firewall-cmd --reload >/dev/null 2>&1 && did=1
+  fi
+
+  if has iptables; then
+    if ! iptables -C INPUT -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null; then
+      iptables -I INPUT 1 -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null && did=1
+    fi
+    # 持久化：有 netfilter-persistent 用它，否则写 /etc/iptables/rules.v4
+    if has netfilter-persistent; then
+      netfilter-persistent save >/dev/null 2>&1 || true
+    elif [[ -d /etc/iptables ]]; then
+      iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+  fi
+
+  [[ $did -eq 1 ]] && ok "本机防火墙已放行 ${pr^^} ${p}"
+  return 0
+}
+
+# 直连协议的端口全部放行一遍（云安全组仍需手动配，脚本改不了）
+fw_open_direct() {
+  proto_on hy2    && fw_open udp "$(hy2_hop)"
+  proto_on tuic   && fw_open udp "$(tuic_port)"
+  proto_on anytls && fw_open tcp "$(anytls_port)"
+  return 0
+}
+
 write_sb_service() {
   cat > "/etc/systemd/system/${SVC_SB}.service" <<EOF
 [Unit]
-Description=argox sing-box (Hysteria2 / TUIC)
+Description=argox sing-box (Hysteria2 / TUIC / AnyTLS)
 Documentation=https://sing-box.sagernet.org
 After=network-online.target
 Wants=network-online.target
@@ -794,6 +832,7 @@ sb_sync() {
   fi
 
   proto_on hy2 && sb_hop_apply
+  fw_open_direct
   ok "sing-box 运行中（$(proto_label)）"
 }
 
