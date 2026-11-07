@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.3.0"
+VERSION="2.3.1"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -1266,18 +1266,50 @@ is_cf_ip() {
   return 1
 }
 
-# 解析任意格式列表：IP / IP:PORT#备注 / CSV，输出 "ip<TAB>备注"
+# 解析任意格式列表，输出 "ip<TAB>备注"
+#
+# 支持的输入形态（实测都要能吃下，否则用户从 Excel / cfst 复制过来会 0 条）：
+#   1. 纯 IP                    104.16.132.229
+#   2. IP#备注                  104.16.1.1#移动
+#   3. IP:443 / IP:443#备注
+#   4. 逗号 CSV（cfst 原样）    104.17.154.227,4,4,0,186.54,5.89,SJC
+#   5. Tab 分隔（Excel 复制）   104.17.154.227<TAB>4<TAB>…<TAB>SJC
+#   6. 空格分隔                 104.16.1.1 移动 12ms 3.2mb/s
+#
+# 关键点：Tab 必须先归一成逗号再取第一列。旧实现先把整行空白全删掉，
+# 结果 "104.17.154.227\t4\t4…" 会粘成 "104.17.154.227440186.54…"，一条都认不出。
 parse_ipfile() {
-  local line raw port ip note
+  local line raw port ip note rest
   while IFS= read -r line; do
     line="${line%$'\r'}"
     [[ -z "${line//[[:space:]]/}" ]] && continue
     [[ "$line" == \#* ]] && continue
+
+    # Tab 归一成逗号，让 Tab 分隔与 CSV 走同一条路径
+    line="${line//$'\t'/,}"
+    while [[ "$line" == *",,"* ]]; do line="${line//,,/,}"; done
+
     note=""
     [[ "$line" == *"#"* ]] && note="${line#*#}"
+
+    # cfst / Excel 表格（≥7 列）最后一列是地区码，拿来当备注，节点名更好认
+    if [[ -z "$note" && "$line" == *,*,*,*,*,*,* ]]; then
+      note="${line##*,}"
+      note="${note//[[:space:]]/}"
+    fi
+
+    # 空格分隔的社区列表（"104.16.1.1 移动 12ms 3.2mb/s"）：余下部分当备注。
+    # 只在没有逗号/Tab 时启用，避免把 CSV 的数字列误当备注（那会让 sort_cand 丢条目）
+    if [[ -z "$note" && "$line" != *","* ]]; then
+      rest="${line#*[[:space:]]}"
+      [[ "$rest" != "$line" ]] && note="$rest"
+    fi
+
     raw="${line%%#*}"
+    raw="${raw%%,*}"                                   # 取第一列
+    [[ "$raw" == *[[:space:]]* ]] && raw="${raw%%[[:space:]]*}"  # 空格分隔只取首 token
     raw="${raw//[[:space:]]/}"
-    if [[ "$raw" == *,* ]]; then raw="${raw%%,*}"; fi
+
     port=443
     if [[ "$raw" == *:* ]]; then
       port="${raw##*:}"
@@ -1445,13 +1477,17 @@ update_ips() {
   gen_sub >/dev/null 2>&1 || true
 }
 
-# 备注文字 → 运营商短标签（用于节点名后缀与列表展示）
+# 备注文字 → 节点名后缀
+#   带运营商关键词 → 移动 / 联通 / 电信 / 多线
+#   三字母机场码（cfst 的「地区码」列）→ 原样保留，如 SJC / NRT / HKG
+#   其余 → 本机
 note_isp_label() {
   case "${1:-}" in
     *移动*) printf '移动' ;;
     *联通*) printf '联通' ;;
     *电信*) printf '电信' ;;
     *多线*) printf '多线' ;;
+    [A-Z][A-Z][A-Z]) printf '%s' "${1}" ;;
     *)      printf '本机' ;;
   esac
 }
