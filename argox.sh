@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="1.2.1"
+VERSION="2.0.0"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -44,6 +44,18 @@ SVC_SUB="argox-sub"
 DEF_PORT_XHTTP=8001     # 仅本机，给 Argo 隧道回源
 DEF_PORT_WS=8002        # 仅本机，给 Argo 隧道回源（WS 兜底）
 DEF_PORT_SUB=8099       # 仅本机，订阅服务
+
+# ---- 节点显示名（只影响客户端里看到的名字，不影响服务/tag/路径）--------------
+# 规则：走 CF 隧道的加 Argo- 前缀；直连 VPS 公网端口的用裸协议名；
+#       住宅落地版统一加 -RH 后缀（residential home）。
+NAME_H3="Argo-H3"
+NAME_H2="Argo-H2"
+NAME_WS="Argo-WS"
+NAME_HY2="Hy2"
+NAME_TUIC="TUIC"
+NAME_REALITY="Reality"
+NAME_ANYTLS="AnyTLS"
+NAME_RH="-RH"
 
 # ==============================================================================
 #  基础输出
@@ -1056,14 +1068,21 @@ build_links() {
   [[ -z "$ws_host" ]] && ws_host="$host"
   mode="$(node_mode)"
 
+  # ⚠ 节点顺序约定（客户端按订阅里的先后显示，不要随意打乱）：
+  #    1) Argo 三条：H3 → H2 → WS
+  #    2) 直连 UDP：Hy2 → TUIC
+  #    3) 直连 TCP：Reality → AnyTLS（阶段 4，默认关）
+  #    4) 落地家宽（-RH）全部追加在最后
+  # 理由：默认出口的节点排前面，-RH 是特殊用途，放末尾不干扰日常切换。
+
   # ---------- 域名模式：3 条，地址写域名，由客户端解析到最近的 CF 节点 ----------
   if [[ "$mode" != "ip" ]]; then
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#argox-H3\n' \
-      "$uuid" "$host" "$host" "$ex" "$host"
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#argox-H2\n' \
-      "$uuid" "$host" "$host" "$ex" "$host"
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#argox-WS\n' \
-      "$uuid" "$ws_host" "$ws_host" "$enc_pw" "$ws_host"
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s\n' \
+      "$uuid" "$host" "$host" "$ex" "$host" "$NAME_H3"
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s\n' \
+      "$uuid" "$host" "$host" "$ex" "$host" "$NAME_H2"
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#%s\n' \
+      "$uuid" "$ws_host" "$ws_host" "$enc_pw" "$ws_host" "$NAME_WS"
     return 0
   fi
 
@@ -1078,33 +1097,34 @@ build_links() {
 
   # 与 IPSF 对齐读取运营商标签
   local idx=0
+  [[ -n "${IPMETA:-}" && -r "${IPMETA:-}" ]] && \
   while IFS=$'\t' read -r l t; do
     (( idx >= ${#ips[@]} )) && break
     tags[$idx]="${t:-其他}"
     idx=$((idx+1))
-  done < "$IPMETA" 2>/dev/null
+  done < "$IPMETA"
   for (( idx=0; idx<${#ips[@]}; idx++ )); do
-    [[ -z "${tags[$idx]}" ]] && tags[$idx]="其他"
+    [[ -z "${tags[$idx]:-}" ]] && tags[$idx]="其他"
   done
 
   local i n
   # H3 主力：UDP/QUIC，抗丢包
   for (( i=0; i<${#ips[@]} && i<MAX_H3_NODES; i++ )); do
     n=$((i+1))
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#argox-H3-%02d-%s\n' \
-      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$n" "${tags[$i]}"
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s-%02d-%s\n' \
+      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$NAME_H3" "$n" "${tags[$i]}"
   done
   # H2 对照：同一批 IP 走 TCP，用于 A/B 判断 H3 是否真的更抗丢包
   for (( i=0; i<${#ips[@]} && i<MAX_H2_NODES; i++ )); do
     n=$((i+1))
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#argox-H2-%02d-%s\n' \
-      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$n" "${tags[$i]}"
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s-%02d-%s\n' \
+      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$NAME_H2" "$n" "${tags[$i]}"
   done
   # WS 兜底：必须走 ws 子域（ws 子域在 CF 侧指向 8002）
   for (( i=0; i<${#ips[@]} && i<MAX_WS_NODES; i++ )); do
     n=$((i+1))
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#argox-WS-%02d-%s\n' \
-      "$uuid" "${ips[$i]}" "$ws_host" "$enc_pw" "$ws_host" "$n" "${tags[$i]}"
+    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#%s-%02d-%s\n' \
+      "$uuid" "${ips[$i]}" "$ws_host" "$enc_pw" "$ws_host" "$NAME_WS" "$n" "${tags[$i]}"
   done
 }
 
@@ -1451,6 +1471,25 @@ do_install() {
   # 隧道传输协议：重装时沿用
   local tproto_prev; tproto_prev="$(node_tunnel_proto)"
 
+  # v2 扩展字段（直连协议 / 落地 / 证书）：重装时原样保留，
+  # 否则以后开了 Hy2 再重装一次就被重置成关闭。
+  local ext_json=""
+  if [[ -f "$NODEF" ]] && has python3; then
+    ext_json="$(python3 - "$NODEF" 2>/dev/null <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+keep = {k: d[k] for k in
+        ("install_mode", "proto", "landing", "hy2", "tuic", "reality", "anytls", "cert")
+        if k in d}
+if keep:
+    print(json.dumps(keep, ensure_ascii=False))
+PY
+)"
+  fi
+
   cat > "$NODEF" <<EOF
 {
   "uuid": "${uuid}",
@@ -1467,10 +1506,32 @@ do_install() {
   "path_ws": "${pw}",
   "isp_pref": "${isp_prev}",
   "sub_token": "${sub_token}",
+  "install_mode": "A",
+  "proto": { "argo": true, "hy2": false, "tuic": false, "reality": false, "anytls": false },
+  "landing": { "enabled": false, "uuid": "", "target": ["h3", "h2"] },
+  "hy2":     { "port": 20000, "hop": "20000-30000", "obfs": false, "up": 50, "down": 300 },
+  "tuic":    { "port": 30001, "password": "", "cc": "bbr" },
+  "reality": { "port": 8443, "sni": "www.microsoft.com", "short_id": "" },
+  "anytls":  { "port": 8445, "password": "" },
+  "cert":    { "sni": "${host}", "path": "${BASE}/cert" },
   "installed_at": "$(date -Iseconds)",
   "version": "${VERSION}"
 }
 EOF
+
+  # 把重装前已有的扩展字段合回去（保持值不变）
+  if [[ -n "$ext_json" ]] && has python3; then
+    python3 - "$NODEF" "$ext_json" 2>/dev/null <<'PY'
+import json, sys
+p = sys.argv[1]
+ext = json.loads(sys.argv[2])
+with open(p) as f:
+    d = json.load(f)
+d.update(ext)
+with open(p, "w") as f:
+    json.dump(d, f, indent=2, ensure_ascii=False)
+PY
+  fi
   chmod 600 "$NODEF"
 
   ok "UUID: ${uuid}"
@@ -1891,6 +1952,321 @@ do_diag() {
 }
 
 # ==============================================================================
+#  自检 check（全只读，不修改任何东西）
+#
+#  检查项来自实际踩过的坑：
+#   · path 带前导空格 → 全部节点不通（v1.1.x 事故）
+#   · WS 链接 host 写成主域名 → WS 永远不通
+#   · 订阅文件名与令牌不一致 → 404
+#   · 服务 active 但端口没起 → 客户端全挂
+# ==============================================================================
+CK_FAIL=0
+CK_WARN=0
+CK_QUIET=0
+ck_ok()   { [[ $CK_QUIET -eq 1 ]] || printf '  %s✓%s %s\n' "$C_GRN" "$C_R" "$*"; }
+ck_warn() { CK_WARN=$((CK_WARN+1)); [[ $CK_QUIET -eq 1 ]] || printf '  %s!%s %s\n' "$C_YEL" "$C_R" "$*"; }
+ck_err()  { CK_FAIL=$((CK_FAIL+1)); [[ $CK_QUIET -eq 1 ]] || printf '  %s✗%s %s\n' "$C_RED" "$C_R" "$*"; }
+
+# 端口是否在监听
+listen_on() { # $1=port $2=tcp|udp
+  local -a f=(-lnt)
+  [[ "${2:-tcp}" == "udp" ]] && f=(-lnu)
+  ss "${f[@]}" -H "sport = :$1" 2>/dev/null | grep -q .
+}
+
+# 域名是否有解析记录
+dns_has() { # $1=host
+  if has getent; then getent hosts "$1" >/dev/null 2>&1
+  elif has host;   then host -W 3 "$1" >/dev/null 2>&1
+  else nslookup "$1" >/dev/null 2>&1
+  fi
+}
+
+check_summary() {
+  if [[ $CK_QUIET -eq 1 ]]; then
+    [[ $CK_FAIL -eq 0 ]]
+    return
+  fi
+  printf '\n'
+  hr
+  if [[ $CK_FAIL -eq 0 && $CK_WARN -eq 0 ]]; then
+    ok "全部检查通过"
+  elif [[ $CK_FAIL -eq 0 ]]; then
+    printf '%s!%s %d 项警告，0 项失败\n' "$C_YEL" "$C_R" "$CK_WARN"
+  else
+    printf '%s✗%s %d 项失败，%d 项警告\n' "$C_RED" "$C_R" "$CK_FAIL" "$CK_WARN"
+  fi
+  hr
+  [[ $CK_FAIL -eq 0 ]]
+}
+
+do_check() {
+  require_root
+  local quiet=0
+  [[ "${1:-}" == "-q" ]] && quiet=1
+
+  CK_FAIL=0; CK_WARN=0; CK_QUIET=$quiet
+  [[ $quiet -eq 1 ]] || step "argox 自检 v${VERSION}（只读，不改任何东西）"
+
+  if ! installed; then
+    ck_err "尚未安装（缺 ${XRAY_BIN} 或 ${CONF}）"
+    [[ $quiet -eq 1 ]] || printf '\n'
+    check_summary
+    return 1
+  fi
+
+  local uuid host px pw ws_host
+  uuid="$(node_get uuid)"
+  host="$(node_get tunnel_host)"
+  px="$(node_get path_xhttp)"
+  pw="$(node_get path_ws)"
+  ws_host="$(node_ws_host)"
+
+  # ---------- 配置 ----------
+  [[ $quiet -eq 1 ]] || printf '\n%s[配置]%s\n' "$C_B" "$C_R"
+
+  if has jq; then
+    jq empty "$NODEF" 2>/dev/null && ck_ok "node.json 可解析" || ck_err "node.json JSON 语法错误"
+  elif has python3; then
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$NODEF" 2>/dev/null \
+      && ck_ok "node.json 可解析" || ck_err "node.json JSON 语法错误"
+  else
+    ck_warn "缺 jq / python3，跳过 node.json 校验"
+  fi
+
+  # 首尾空白污染（最隐蔽的坑：链接看着正常，节点全不通）
+  local dirty=""
+  if has python3; then
+    dirty="$(python3 - "$NODEF" 2>/dev/null <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for k, v in d.items():
+    if isinstance(v, str) and v != v.strip():
+        print('%s="%s"' % (k, v))
+PY
+)"
+  fi
+  if [[ -n "$dirty" ]]; then
+    ck_err "字段含首尾空白字符（会让节点全部不通）："
+    [[ $quiet -eq 1 ]] || printf '%s\n' "$dirty" | sed 's/^/      /'
+  else
+    ck_ok "字段无空白字符污染"
+  fi
+
+  if "$XRAY_BIN" run -test -c "$CONF" >/dev/null 2>&1; then
+    ck_ok "config.json 语法通过"
+  else
+    ck_err "config.json 语法错误："
+    [[ $quiet -eq 1 ]] || "$XRAY_BIN" run -test -c "$CONF" 2>&1 | tail -5 | sed 's/^/      /'
+  fi
+
+  local perm; perm="$(stat -c '%a' "$NODEF" 2>/dev/null || echo '')"
+  [[ "$perm" == "600" ]] && ck_ok "node.json 权限 600" || ck_warn "node.json 权限 ${perm:-未知}（建议 600）"
+
+  # ---------- 服务 ----------
+  [[ $quiet -eq 1 ]] || printf '\n%s[服务]%s\n' "$C_B" "$C_R"
+  local s
+  for s in "$SVC_XRAY" "$SVC_TUN" "$SVC_SUB"; do
+    if svc_active "$s"; then ck_ok "${s} 运行中"; else ck_err "${s} 未运行"; fi
+  done
+  systemctl is-enabled --quiet "$SVC_XRAY" 2>/dev/null \
+    && ck_ok "Xray 开机自启已启用" || ck_warn "Xray 未设开机自启"
+
+  # ---------- 端口 ----------
+  [[ $quiet -eq 1 ]] || printf '\n%s[端口]%s\n' "$C_B" "$C_R"
+  listen_on "$DEF_PORT_XHTTP" tcp \
+    && ck_ok "${DEF_PORT_XHTTP}/tcp 在听（XHTTP 回源）" \
+    || ck_err "${DEF_PORT_XHTTP}/tcp 没在听 → H3/H2 全部不可用"
+  listen_on "$DEF_PORT_WS" tcp \
+    && ck_ok "${DEF_PORT_WS}/tcp 在听（WS 回源）" \
+    || ck_err "${DEF_PORT_WS}/tcp 没在听 → WS 不可用"
+  listen_on "$DEF_PORT_SUB" tcp \
+    && ck_ok "${DEF_PORT_SUB}/tcp 在听（订阅服务）" \
+    || ck_err "${DEF_PORT_SUB}/tcp 没在听 → 订阅 404"
+
+  # ---------- 订阅 ----------
+  [[ $quiet -eq 1 ]] || printf '\n%s[订阅]%s\n' "$C_B" "$C_R"
+  local stok; stok="$(node_get sub_token 2>/dev/null || true)"
+  if [[ -z "$stok" ]]; then
+    ck_err "sub_token 为空，订阅地址无法生成"
+  else
+    if [[ -f "${SUBPUB}/${stok}" ]]; then
+      ck_ok "订阅文件与令牌一致"
+    else
+      ck_err "订阅文件缺失：${SUBPUB}/${stok}（执行 sub 重建）"
+    fi
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+      "http://127.0.0.1:${DEF_PORT_SUB}/${stok}" 2>/dev/null)"
+    [[ "$code" == "200" ]] && ck_ok "订阅本地自测 HTTP 200" \
+      || ck_err "订阅本地自测 HTTP ${code:-超时}（服务没起或文件不在）"
+  fi
+
+  # ---------- 节点链接 ----------
+  [[ $quiet -eq 1 ]] || printf '\n%s[节点链接]%s\n' "$C_B" "$C_R"
+  local links; links="$(build_links 2>/dev/null)"
+  if [[ -z "$links" ]]; then
+    ck_err "生成不出节点链接（缺 UUID 或隧道域名）"
+  else
+    local nlink; nlink="$(printf '%s\n' "$links" | grep -c .)"
+    ck_ok "生成 ${nlink} 条链接（模式 $(node_mode)）"
+
+    local bad=0 line sni hostarg pth exp_sni exp_host exp_path
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      sni="$(printf '%s' "$line"     | sed -n 's/.*[?&]sni=\([^&#]*\).*/\1/p')"
+      hostarg="$(printf '%s' "$line" | sed -n 's/.*[?&]host=\([^&#]*\).*/\1/p')"
+      pth="$(printf '%s' "$line"     | sed -n 's/.*[?&]path=\([^&#]*\).*/\1/p')"
+      if [[ "$line" == *"type=ws"* ]]; then
+        exp_sni="$ws_host"; exp_host="$ws_host"; exp_path="$(urlenc "$pw")"
+      else
+        exp_sni="$host";    exp_host="$host";    exp_path="$(urlenc "$px")"
+      fi
+      [[ "$sni"     == "$exp_sni"  ]] || { ck_err "sni 不一致：${sni} ≠ ${exp_sni}";  bad=1; }
+      [[ "$hostarg" == "$exp_host" ]] || { ck_err "Host 不一致：${hostarg} ≠ ${exp_host}"; bad=1; }
+      [[ "$pth"     == "$exp_path" ]] || { ck_err "path 不一致：${pth} ≠ ${exp_path}"; bad=1; }
+    done <<< "$links"
+    [[ $bad -eq 0 ]] && ck_ok "链接参数与服务端一致（sni / Host / path）"
+
+    printf '%s\n' "$links" | grep -q '#argox-' \
+      && ck_warn "订阅里还有旧命名 argox-*（客户端需重新导入）" \
+      || ck_ok "节点名已是新命名（Argo-*）"
+  fi
+
+  # ---------- DNS ----------
+  [[ $quiet -eq 1 ]] || printf '\n%s[DNS]%s\n' "$C_B" "$C_R"
+  local h
+  for h in "$host" "$ws_host" "$(node_sub_host)"; do
+    [[ -z "$h" ]] && continue
+    if dns_has "$h"; then ck_ok "${h} 有解析"; else ck_err "${h} 无解析（NXDOMAIN，客户端连不上）"; fi
+  done
+
+  # ---------- 隧道 ----------
+  [[ $quiet -eq 1 ]] || printf '\n%s[隧道]%s\n' "$C_B" "$C_R"
+  if [[ ! -s "$TOKEN_FILE" ]]; then
+    ck_warn "未配置 Tunnel Token，隧道未启用"
+  else
+    local nreg live pb
+    nreg="$(tunnel_registered)"; live="$(tunnel_live_proto)"; pb="$(tunnel_probe)"
+    if [[ "${nreg:-0}" -gt 0 ]]; then
+      ck_ok "已注册 ${nreg} 条连接（实际协议 ${live:-未知}）"
+      [[ "$live" == "http2" ]] && ck_warn "回退到 http2：UDP 7844 出不去，H3 抗丢包优势用不上"
+    else
+      case "$pb" in
+        ok:*)     ck_ok "链路实测可用（HTTP ${pb#ok:}），日志窗口内无注册记录属正常" ;;
+        origin:*) ck_err "隧道连上 CF 但回源失败（HTTP ${pb#origin:}）→ 检查 127.0.0.1:${DEF_PORT_XHTTP}" ;;
+        nohost)   ck_warn "未填隧道域名，无法实测链路" ;;
+        *)        ck_err "没有任何注册记录：进程在跑但连不上 CF（运行 diag 看详情）" ;;
+      esac
+    fi
+  fi
+
+  # ---------- 落地 / 跳板 ----------
+  if [[ "$(node_hop_mode)" == "all" ]]; then
+    [[ $quiet -eq 1 ]] || printf '\n%s[出口跳板]%s\n' "$C_B" "$C_R"
+    local ha hp pr
+    ha="$(node_hop_addr)"; hp="$(node_hop_port)"
+    if timeout 5 bash -c ">/dev/tcp/${ha}/${hp}" 2>/dev/null; then
+      pr="$(hop_probe || true)"
+      [[ -n "$pr" ]] && ck_ok "跳板 ${ha}:${hp} 可用（${pr}）" \
+                     || ck_warn "跳板端口开着但代理不通（协议可能选错，试试 http）"
+    else
+      ck_err "跳板 ${ha}:${hp} 连不上 → 全部流量会走不通（菜单 16 关掉）"
+    fi
+  fi
+
+  # ---------- 证书（阶段 3 之后才有，现在没文件就跳过） ----------
+  if [[ -f "${BASE}/cert/cert.pem" ]]; then
+    [[ $quiet -eq 1 ]] || printf '\n%s[证书]%s\n' "$C_B" "$C_R"
+    if openssl x509 -checkend 2592000 -noout -in "${BASE}/cert/cert.pem" >/dev/null 2>&1; then
+      ck_ok "自签证书 30 天内不会过期"
+    else
+      ck_err "自签证书已过期或 30 天内过期（cert gen 重新生成）"
+    fi
+  fi
+
+  [[ $quiet -eq 1 ]] || printf '\n'
+  check_summary
+}
+
+# ==============================================================================
+#  升级配置（对老版本：补字段 + 对齐单元 + 重建订阅，不动服务）
+# ==============================================================================
+do_upgrade() {
+  require_root
+  step "升级配置到 v${VERSION}（不动运行中的服务）"
+
+  [[ -r "$NODEF" ]] || die "还没安装过（缺 ${NODEF}），请先执行 install"
+
+  local bak; bak="${BACKD}/node.json.$(date +%Y%m%d-%H%M%S).bak"
+  mkdir -p "$BACKD"
+  cp -a "$NODEF" "$bak" && ok "已备份：${bak}"
+
+  # 补齐新字段：已存在的绝不覆盖
+  local added="-"
+  if has python3; then
+    added="$(python3 - "$NODEF" "$VERSION" 2>/dev/null <<'PY'
+import json, sys
+p, ver = sys.argv[1], sys.argv[2]
+with open(p) as f:
+    d = json.load(f)
+defaults = {
+    "install_mode": "A",
+    "proto": {"argo": True, "hy2": False, "tuic": False,
+              "reality": False, "anytls": False},
+    "landing": {"enabled": False, "uuid": "", "target": ["h3", "h2"]},
+    "hy2":     {"port": 20000, "hop": "20000-30000", "obfs": False,
+                "up": 50, "down": 300},
+    "tuic":    {"port": 30001, "password": "", "cc": "bbr"},
+    "reality": {"port": 8443, "sni": "www.microsoft.com", "short_id": ""},
+    "anytls":  {"port": 8445, "password": ""},
+    "cert":    {"sni": d.get("tunnel_host", ""), "path": "/opt/argox/cert"},
+}
+added = [k for k in defaults if k not in d]
+for k in added:
+    d[k] = defaults[k]
+d["version"] = ver
+with open(p, "w") as f:
+    json.dump(d, f, indent=2, ensure_ascii=False)
+print(",".join(added) if added else "-")
+PY
+)"
+    if [[ "$added" == "-" ]]; then ok "字段已是最新，无需补齐"
+    else ok "已补齐字段：${added}"; fi
+  else
+    warn "缺 python3，跳过字段补齐"
+  fi
+
+  write_xray_service
+  [[ -s "$TOKEN_FILE" ]] && write_tunnel_service
+  write_sub_server
+  write_sub_service
+  systemctl daemon-reload
+  ok "systemd 单元已对齐当前脚本路径"
+
+  if gen_sub >/dev/null 2>&1; then
+    ok "订阅已重建：${NAME_H3} / ${NAME_H2} / ${NAME_WS}"
+  else
+    warn "订阅重建失败，运行 check 查看原因"
+  fi
+
+  printf '\n'
+  info "服务未重启，运行中的连接不受影响"
+  info "直连协议全部为关闭状态（install_mode=A，与升级前一致）"
+  printf '\n'
+  warn "节点名已改为 Argo-*：客户端里旧的 argox-* 节点请删掉后重新导入订阅"
+
+  local sh tok
+  sh="$(node_sub_host)"; tok="$(node_get sub_token 2>/dev/null || true)"
+  if [[ -n "$sh" && -n "$tok" ]]; then
+    printf '\n  订阅地址：%shttps://%s/%s%s\n\n' "$C_B" "$sh" "$tok" "$C_R"
+  fi
+}
+
+# ==============================================================================
 #  出口跳板
 # ==============================================================================
 hop_show() {
@@ -2154,6 +2530,7 @@ menu_main() {
    7) 更新到最新版             15) 订阅地址 / 二维码
 EOF
     printf '   8) 更换 UUID（用户名/密码）    16) 出口跳板（%s）\n' "$hop_label"
+    printf '  17) 自检 check                18) 升级配置（补字段）\n'
     printf '\n    0) 退出\n'
     printf '%s\n' "──────────────────────────────────────────────────"
     read -rp "  请选择: " choice
@@ -2174,6 +2551,8 @@ EOF
       14) menu_ips ;;
       15) show_nodes ;;
       16) do_hop ;;
+      17) do_check ;;
+      18) do_upgrade ;;
       0|q|Q) printf '\n  再见\n\n'; exit 0 ;;
       *) warn "无效选项：${choice:-<空>}" ;;
     esac
@@ -2199,6 +2578,8 @@ main() {
     links)     show_links ;;
     hop)       do_hop "${2:-}" "${3:-}" ;;
     diag)      do_diag "${2:-}" ;;
+    check)     do_check "${2:-}" ;;
+    upgrade)   do_upgrade ;;
     sub)       gen_sub && cat "${SUBD}/argox.b64" ;;
     uninstall) do_uninstall ;;
     ""|menu)   require_root; menu_main ;;
@@ -2220,6 +2601,9 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 diag         cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）
   bash $0 diag http2   强制隧道走 TCP（UDP 7844 被封时用）
   bash $0 diag auto    恢复自动选择（默认）
+  bash $0 check        自检：配置 / 端口 / 订阅 / 链接 / 隧道（只读）
+  bash $0 check -q     静默自检，只返回退出码（0=全通过）
+  bash $0 upgrade      对老版本补齐字段 + 对齐单元 + 重建订阅（不重启服务）
   bash $0 uninstall    卸载
 
   curl -fsSL <地址> | bash     ← 不推荐，请先 curl -o 下来看一眼

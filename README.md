@@ -32,14 +32,15 @@ bash /root/argox.sh
 ## 菜单
 
 ```
- 1) 安装 / 重新部署        9) 系统优化
- 2) 启动                  10) 清理缓存
- 3) 停止                  11) 备份配置
- 4) 重启                  12) 卸载
- 5) 查看状态              13) 隧道设置
- 6) 查看日志              14) 优选 IP 源（链接 / 运营商）
- 7) 更新到最新版          15) 订阅地址
- 8) 更换 UUID             16) 出口跳板
+ 1) 安装 / 重新部署        10) 清理缓存
+ 2) 启动                  11) 备份配置
+ 3) 停止                  12) 卸载
+ 4) 重启                  13) 隧道设置
+ 5) 查看状态              14) 优选 IP 源（链接 / 运营商）
+ 6) 查看日志              15) 订阅地址
+ 7) 更新到最新版          16) 出口跳板
+ 8) 更换 UUID             17) 自检 check
+ 9) 系统优化              18) 升级配置（补字段）
 ```
 
 ## 订阅
@@ -50,9 +51,43 @@ bash /root/argox.sh
 https://<订阅子域>/<订阅令牌>
 ```
 
-默认输出 3 个节点（`domain` 模式）：H3 主力 / H2 兜底 / WS 兜底，地址都写域名，由客户端自行解析到最近的 CF 节点。
+默认输出 3 个节点（`domain` 模式），节点名与顺序固定：
 
+```
+Argo-H3     主力，QUIC 抗丢包
+Argo-H2     同链路的 TCP 对照
+Argo-WS     最后兜底（ws 子域）
+```
+
+命名约定：走 Cloudflare 隧道的加 `Argo-` 前缀；直连 VPS 公网端口的用裸协议名
+（`Hy2` / `TUIC` / `Reality` / `AnyTLS`）；住宅落地版统一加 `-RH` 后缀，
+且全部排在列表最后。当前版本只启用 Argo 三条，直连协议在后续版本接入。
+
+地址都写域名，由客户端自行解析到最近的 CF 节点。
 需要按 IP 展开时，菜单 13 → `6) 节点地址模式` 切成 `ip`，再菜单 14 导入优选 IP。
+
+## 自检
+
+```bash
+bash argox.sh check      # 配置 / 服务 / 端口 / 订阅 / 链接 / DNS / 隧道，全只读
+bash argox.sh check -q   # 静默，只用退出码（0=全通过），适合脚本调用
+```
+
+专治踩过的坑：`path` 带前导空格导致节点全不通、订阅文件名与令牌不一致、
+服务 active 但端口没起、WS 链接的 Host 写错。
+
+## 升级
+
+从 v1.x 升到 v2：
+
+```bash
+bash argox.sh upgrade
+```
+
+只做三件事：备份 `node.json` → 补齐新字段 → 对齐 systemd 单元 + 重建订阅。
+**不重启任何服务**，运行中的连接不受影响。
+
+注意：节点名从 `argox-*` 改成了 `Argo-*`，客户端里旧节点请删掉后重新导入。
 
 ## 出口跳板
 
@@ -79,6 +114,8 @@ bash argox.sh ips
 bash argox.sh hop on     # 出口跳板（off / on [socks|http]）
 bash argox.sh diag       # cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）
 bash argox.sh diag http2 # UDP 7844 被封时强制走 TCP
+bash argox.sh check      # 自检（-q 静默，只返回退出码）
+bash argox.sh upgrade    # 老版本补齐字段（不重启服务）
 bash argox.sh restart
 bash argox.sh uninstall
 ```
@@ -87,3 +124,4 @@ bash argox.sh uninstall
 
 - [docs/cloudflare-setup.md](docs/cloudflare-setup.md) — 隧道创建、Token、HTTP/3
 - [docs/design.md](docs/design.md) — 设计文档
+- [docs/plan-v2.md](docs/plan-v2.md) — v2.0 双核方案（Argo + Hy2 + TUIC，分 5 阶段实施）
