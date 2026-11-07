@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.5.1"
+VERSION="2.5.2"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -3227,6 +3227,21 @@ PY
         continue
       fi
 
+      # Reality：直连 TCP，不走域名 / Host / path，只校验地址与伪装 sni
+      if [[ "$line" == *"security=reality"* ]]; then
+        dip="$(printf '%s' "$line" | sed -n 's#^vless://[^@]*@\([^:/]*\):.*#\1#p')"
+        sni="$(printf '%s' "$line" | sed -n 's/.*[?&]sni=\([^&#]*\).*/\1/p')"
+        local rsni; rsni="$(reality_sni)"
+        if [[ -z "$vip" || "$dip" != "$vip" ]]; then
+          ck_err "Reality 地址 ${dip:-空} ≠ 公网 IP ${vip:-未知}"; bad=1
+        elif [[ "$sni" != "$rsni" ]]; then
+          ck_err "Reality sni 不一致：${sni:-空} ≠ ${rsni}"; bad=1
+        else
+          ck_ok "Reality 地址正确（${dip}，伪装 ${sni}）"
+        fi
+        continue
+      fi
+
       sni="$(printf '%s' "$line"     | sed -n 's/.*[?&]sni=\([^&#]*\).*/\1/p')"
       hostarg="$(printf '%s' "$line" | sed -n 's/.*[?&]host=\([^&#]*\).*/\1/p')"
       pth="$(printf '%s' "$line"     | sed -n 's/.*[?&]path=\([^&#]*\).*/\1/p')"
@@ -3241,9 +3256,13 @@ PY
     done <<< "$links"
     [[ $bad -eq 0 ]] && ck_ok "链接参数与服务端一致（sni / Host / path / 直连地址）"
 
-    printf '%s\n' "$links" | grep -q '#argox-' \
-      && ck_warn "订阅里还有旧命名 argox-*（客户端需重新导入）" \
-      || ck_ok "节点名已是新命名（Argo-*）"
+    # 用 here-string 而不是管道：脚本开了 pipefail，grep -q 匹配即退出会让上游
+    # 收到 SIGPIPE（141），pipefail 取到非零就把整句判成假——明明匹配上了也报失败。
+    if grep -q '#argox-' <<< "$links"; then
+      ck_warn "订阅里还有旧命名 argox-*（客户端需重新导入）"
+    else
+      ck_ok "节点名已是新命名（Argo-*）"
+    fi
   fi
 
   # ---------- DNS ----------
@@ -3418,7 +3437,9 @@ PY
     else
       ck_ok "伪装目标 $(reality_sni) 可用（证书 ${PR_REC} 字节，余量 $((REALITY_CERT_LIMIT - PR_REC))）"
     fi
-    if build_links 2>/dev/null | grep -q -- "#${NAME_REALITY}$"; then
+    # 同上：here-string 避免 pipefail 把 SIGPIPE 当成失败。
+    # 按 security=reality 判断比按节点名判断更准（改名也不会误报）。
+    if grep -q 'security=reality' <<< "$(build_links 2>/dev/null)"; then
       ck_ok "订阅里有 ${NAME_REALITY} 节点"
     else
       ck_err "订阅里缺 ${NAME_REALITY} 节点（重新生成订阅）"
