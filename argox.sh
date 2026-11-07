@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.5.0"
+VERSION="2.5.1"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -525,8 +525,26 @@ reality_probe_one() {
   # TLS1.3 Certificate 消息 = ΣDER + 5×张数 + 8（含 4 字节 handshake 头），已与 openssl -msg 逐字节核对
   rec=$(( ${der:-0} + 5*n + 8 ))
 
-  issuer="$(printf '%s\n' "$pem" | openssl x509 -noout -issuer 2>/dev/null \
-            | sed -n 's/.*O=\([^,]*\).*/\1/p' | head -1)"
+  # 签发方：只取第一张证书，-nameopt RFC2253 强制统一格式。
+  # 不能直接对整段 s_client 输出跑 x509，也不依赖默认 DN 格式——
+  # OpenSSL 3.0 输出 "C = US, O = Amazon"（等号带空格），3.5 输出 "C=US, O=Amazon"，
+  # 按 "O=" 硬匹配在 3.0 上会静默取空。
+  local cert1 issln
+  cert1="$(printf '%s\n' "$pem" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' \
+           | sed -n '1,/-----END CERTIFICATE-----/p')"
+  issln="$(printf '%s\n' "$cert1" | openssl x509 -noout -issuer -nameopt RFC2253 2>/dev/null)"
+  # 提取顺序：O= → CN= → 整行截断。/ 兼容老式 /C=US/O=X/CN=Y 格式；
+  # [[:space:]]* 兼容某些版本忽略 -nameopt 时的 "O = Amazon" 写法。
+  issuer="$(printf '%s\n' "$issln" | sed -n 's/.*[=,\/][[:space:]]*O[[:space:]]*=[[:space:]]*\([^,\/]*\).*/\1/p' | head -1)"
+  [[ -z "$issuer" ]] && issuer="$(printf '%s\n' "$issln" | sed -n 's/.*[=,\/][[:space:]]*CN[[:space:]]*=[[:space:]]*\([^,\/]*\).*/\1/p' | head -1)"
+  [[ -z "$issuer" ]] && issuer="$(printf '%s\n' "$issln" | sed 's/^issuer=//' | cut -c1-28)"
+  # 输出列宽是 20（printf %-20s），超长按词边界截断，避免撑破对齐
+  issuer="$(printf '%s' "$issuer" | tr -d '\\' | sed 's/[[:space:]]*$//')"
+  if (( ${#issuer} > 20 )); then
+    local _t="${issuer:0:20}"
+    _t="${_t% *}"
+    (( ${#_t} >= 8 )) && issuer="$_t" || issuer="${issuer:0:20}"
+  fi
   [[ -z "$issuer" ]] && issuer="?"
 
   pair="$(timeout 8 curl -s -o /dev/null -m 8 \
