@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.6.1"
+VERSION="2.6.2"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -411,10 +411,13 @@ landing_wants() { # $1=h3|h2|ws|anytls|reality
   [[ "$tg" == *" $1 "* ]]
 }
 
-# AnyTLS 落地入站端口：主入站 +1，两条链路各自独立监听（同一入站无法按用户分流）
+# AnyTLS 落地入站端口：主入站 -1（8445 → 8444），与主口连成一个连续段，
+# 云安全组一次放行 8444-8445 即可，不必再单独加一个端口。
+# 两个保护：算出来低于 1024（非 root 端口段），或跟 Reality 端口撞车时，退回主口 +1。
 anytls_rh_port() {
-  local p; p="$(anytls_port)"
-  printf '%s' $(( p + 1 ))
+  local p; p="$(anytls_port)"; local rh=$(( p - 1 ))
+  if [[ $rh -lt 1024 || "$rh" == "$(reality_port)" ]]; then rh=$(( p + 1 )); fi
+  printf '%s' "$rh"
 }
 
 # ==============================================================================
@@ -1138,7 +1141,7 @@ sb_sync() {
 
   proto_on hy2 && sb_hop_apply
   fw_open_direct
-  ok "sing-box 运行中（$(proto_label)）"
+  ok "sing-box 运行中（$(proto_label_sb)）"
 }
 
 proto_label() {
@@ -1147,6 +1150,16 @@ proto_label() {
   proto_on tuic   && out+=("TUIC:$(tuic_port)")
   proto_on anytls && out+=("AnyTLS:$(anytls_port)")
   proto_on reality && out+=("Reality:$(reality_port)")
+  local IFS=" "
+  printf '%s' "${out[*]:-无}"
+}
+
+# 只列 sing-box 管的三个（Reality 在 Xray 内核里，混进来会让人以为 sing-box 崩了 Reality 就没了）
+proto_label_sb() {
+  local out=()
+  proto_on hy2    && out+=("Hy2:$(hy2_port)")
+  proto_on tuic   && out+=("TUIC:$(tuic_port)")
+  proto_on anytls && out+=("AnyTLS:$(anytls_port)")
   local IFS=" "
   printf '%s' "${out[*]:-无}"
 }
@@ -3414,7 +3427,7 @@ PY
 
     if proto_on hy2 || proto_on tuic || proto_on anytls; then
       if svc_active "$SVC_SB"; then
-        ck_ok "${SVC_SB} 运行中（$(proto_label)）"
+        ck_ok "${SVC_SB} 运行中（$(proto_label_sb)）"
       else
         ck_err "${SVC_SB} 未运行，但协议已开启（journalctl -u ${SVC_SB} 看原因）"
       fi
@@ -3651,6 +3664,26 @@ PY
   write_sub_service
   systemctl daemon-reload
   ok "systemd 单元已对齐当前脚本路径"
+
+  # 落地 AnyTLS 入站端口随版本变过（v2.6.2：主口 +1 → 主口 -1，8446 → 8444）。
+  # 配置里的 listen_port 跟当前计算值不一致就重建 sing-box，否则客户端会连到一个
+  # 已不存在的端口（check 会报「TCP 8444 没在听」）。
+  if landing_on && proto_on anytls && landing_wants anytls && [[ -f "$SBCONF" ]]; then
+    local cur_rh want_rh
+    want_rh="$(anytls_rh_port)"
+    cur_rh="$(grep -A6 '"tag": "anytls-rh-in"' "$SBCONF" 2>/dev/null \
+             | sed -n 's/.*"listen_port": *\([0-9][0-9]*\).*/\1/p' | head -1)"
+    if [[ -n "$cur_rh" && "$cur_rh" != "$want_rh" ]]; then
+      ok "AnyTLS 落地端口已变更：${cur_rh} → ${want_rh}（与主口 $(anytls_port) 连号，安全组少开一个口）"
+      if sb_sync; then
+        ok "sing-box 已按新端口重启（TCP ${want_rh}）"
+        info "云安全组放行 TCP ${want_rh}；旧的 ${cur_rh} 可以删掉"
+      else
+        warn "sing-box 重建失败，端口仍是 ${cur_rh}"
+        info "手动重应用：bash $0 landing off && bash $0 landing on"
+      fi
+    fi
+  fi
 
   if gen_sub >/dev/null 2>&1; then
     local names="${NAME_H3} / ${NAME_H2}"

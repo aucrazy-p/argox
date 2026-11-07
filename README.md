@@ -133,14 +133,14 @@ bash argox.sh cert gen --force     # 重签
 
 首次开启会自动装 sing-box、生成 ECC P-256 自签证书（10 年）、写配置、起服务。
 
-**云安全组必须放行三条**：
+**云安全组必须放行**（前两条常开，其余按需开）：
 
 | 协议 | 端口 | 类型 |
 |---|---|---|
 | Hy2 | `23000-27000`（整段） | UDP |
 | TUIC | `30001` | UDP |
 | AnyTLS | `8445` | TCP |
-| AnyTLS-RH | `8446` | TCP（落地开启时才有） |
+| AnyTLS-RH | `8444` | TCP（落地开启时才有，与 8445 连号，可一次放行 `8444-8445`） |
 | Reality | `8443` | TCP（默认关，不开不监听） |
 
 Hy2 的端口跳跃靠 nftables 的 `redirect` 实现，sing-box 实际只监听 `23000` 一个口，
@@ -260,7 +260,7 @@ bash argox.sh landing proto socks|http  # 落地出口协议
 | 入口 | 实现方式 | 端口 |
 |---|---|---|
 | `h3` / `h2` / `ws` / `reality` | Xray 同一条入站挂第二个 UUID，路由按 `user` 条件分流 | 复用原端口 |
-| `anytls` | sing-box **独立入站** `anytls-rh-in` + `socks` 出口 + 路由规则 | `8446`（主口 +1） |
+| `anytls` | sing-box **独立入站** `anytls-rh-in` + `socks` 出口 + 路由规则 | `8444`（主口 8445 − 1，连号） |
 
 AnyTLS 之所以要独立端口：sing-box 的入站无法按「用户」分流，只能按入站分流。
 它也是**唯一能做落地版的直连协议**——Hy2 / TUIC 是 UDP，本地代理不支持 UDP ASSOCIATE。
