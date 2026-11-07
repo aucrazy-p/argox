@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -55,7 +55,17 @@ DEF_PORT_HY2=23000      # Hy2 实监听端口（UDP）——取跳跃段首
 DEF_PORT_TUIC=30001     # TUIC 监听端口（UDP）
 DEF_PORT_ANYTLS=8445    # AnyTLS 监听端口（TCP）——UDP 全灭时的唯一出路
 DEF_PORT_REALITY=8443   # Reality 监听端口（TCP）——Xray 内核，默认关
-REALITY_SNI="www.microsoft.com"   # Reality 伪装目标（须 TLS1.3 + H2，且 VPS 可直连 443）
+# Reality 伪装目标（dest / serverNames）。选型依据见 docs/plan-v2.md 2.6：
+#   - 必须 TLS1.3 + ALPN h2，且从 VPS 可直连 443
+#   - 证书 TLS 记录须 ≤ 8192 字节（Xray 硬编码上限，超了直接握手失败且不报错）
+#   - 优先「证书链由 CDN 自动管理、长度固定」的目标，避免证书轮换后突然越线
+# 默认 www.lovelive-anime.jp：CloudFront + AWS ACM，链固定 3 张 ≈3821 字节，
+# 余量 2.1 倍；非巨头 SNI，root 带浏览器 UA 返回 200 无跳转。
+REALITY_SNI="www.lovelive-anime.jp"
+# 备选（VPS 实测均可，按长期稳定性排序）：www.intel.com(2051，链最短) / www.microsoft.com(5902)
+# 不推荐：apple|icloud（Xray 启动即硬编码警告）、nvidia（307 跳中国站）、amd（握手 141ms）
+REALITY_PROBE_HOSTS="www.lovelive-anime.jp www.intel.com www.microsoft.com www.nvidia.com www.amd.com"
+REALITY_CERT_LIMIT=8192   # Xray REALITY 的 TLS Certificate 记录硬编码上限（字节）
 DEF_HOP_RANGE="23000-27000"   # Hy2 端口跳跃段，默认不含 RustDesk(21115-21119) 等常用服务段
 SB_VER_DEFAULT="1.12.0"       # sing-box 默认版本
 
@@ -463,6 +473,160 @@ reality_apply() {
   fi
   proto_on reality && fw_open tcp "$(reality_port)"
   gen_sub >/dev/null 2>&1 || warn "订阅重建失败"
+  return 0
+}
+
+# ==============================================================================
+#  Reality 伪装目标体检（dest / serverNames）
+#
+#  为什么需要单独体检：Xray 的 REALITY 对目标站下发证书的 TLS Certificate
+#  记录有 8192 字节硬编码上限（Xray-core issue #6356），超了握手直接失败；
+#  而这个大小随 CDN 边缘节点与证书轮换变化——同一域名在不同机器上测出的值不同。
+#  更麻烦的是失效时 Xray 既不报错也不打日志，只能靠主动探测提前发现。
+#
+#  四项硬指标：TLS1.3 / ALPN h2 / 证书链受信 / 证书记录 ≤ 8192
+#  三项加分：非流量巨头、证书链由 CDN 自动管理（长度固定）、root 无跨域跳转
+#  选型结论与实测记录见 docs/plan-v2.md 2.6
+# ==============================================================================
+
+sni_valid() { # $1=域名
+  local s="${1// /}"
+  [[ -n "$s" ]] || { err "域名不能为空"; return 1; }
+  [[ "$s" == *.* ]] || { err "需要完整域名（含点）：${s}"; return 1; }
+  [[ "$s" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
+    || { err "域名格式不合法：${s}"; return 1; }
+  return 0
+}
+
+# 探测一个目标。返回 0=可用 1=不可用 2=可用但有风险
+# $1=域名  $2=1 时静默（结果放全局 PR_REC/PR_MS/PR_CODE/PR_NOTE，供 check 使用）
+reality_probe_one() {
+  local h="$1" quiet="${2:-0}"
+  local pem n body der rec t0 t1 ms pair code redir rhost issuer note mark color rc
+
+  PR_REC=0; PR_MS=0; PR_CODE="000"; PR_NOTE=""
+
+  t0=$(date +%s%3N)
+  pem="$(printf '' | timeout 8 openssl s_client -connect "${h}:443" -servername "$h" \
+        -tls1_3 -alpn h2 -showcerts 2>/dev/null || true)"
+  t1=$(date +%s%3N)
+  ms=$((t1 - t0))
+
+  n="$(printf '%s\n' "$pem" | grep -c -- '-----BEGIN CERTIFICATE-----' || true)"
+  if [[ -z "$pem" || "${n:-0}" -eq 0 ]]; then
+    PR_NOTE="连不上（TLS1.3 / ALPN h2 握手失败或超时）"
+    [[ "$quiet" == "1" ]] || printf '  %s✗%s %-26s %s\n' "$C_RED" "$C_R" "$h" "$PR_NOTE"
+    return 1
+  fi
+
+  # 证书链总长：把所有 PEM 正文拼起来一次性解码，比逐个 openssl x509 更省事
+  body="$(printf '%s\n' "$pem" | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/{/-----/d;p}')"
+  der="$(printf '%s\n' "$body" | tr -d '\r\n ' | base64 -d 2>/dev/null | wc -c || true)"
+  # TLS1.3 Certificate 消息 = ΣDER + 5×张数 + 8（含 4 字节 handshake 头），已与 openssl -msg 逐字节核对
+  rec=$(( ${der:-0} + 5*n + 8 ))
+
+  issuer="$(printf '%s\n' "$pem" | openssl x509 -noout -issuer 2>/dev/null \
+            | sed -n 's/.*O=\([^,]*\).*/\1/p' | head -1)"
+  [[ -z "$issuer" ]] && issuer="?"
+
+  pair="$(timeout 8 curl -s -o /dev/null -m 8 \
+      -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' \
+      -w '%{http_code}|%{redirect_url}' "https://${h}/" 2>/dev/null || printf '000|')"
+  code="${pair%%|*}"; redir="${pair#*|}"
+  rhost="${redir#https://}"; rhost="${rhost#http://}"; rhost="${rhost%%/*}"
+
+  mark="✓"; color="$C_GRN"; note=""; rc=0
+  if (( rec > REALITY_CERT_LIMIT )); then
+    mark="✗"; color="$C_RED"; rc=1
+    note="证书 ${rec} > ${REALITY_CERT_LIMIT}，Xray 会直接拒绝握手"
+  elif (( rec > REALITY_CERT_LIMIT * 85 / 100 )); then
+    mark="!"; color="$C_YEL"; rc=2
+    note="余量不足 15%，证书轮换后可能越线"
+  fi
+  if [[ -n "$rhost" && "$rhost" != "$h" ]]; then
+    [[ "$rc" -eq 0 ]] && { mark="!"; color="$C_YEL"; rc=2; }
+    note="${note:+${note}；}root 跳到 ${rhost}"
+  fi
+  if printf '%s' "$h" | grep -qiE '(^|\.)(apple|icloud)\.'; then
+    [[ "$rc" -eq 0 ]] && { mark="!"; color="$C_YEL"; rc=2; }
+    note="${note:+${note}；}Xray 对 apple/icloud 有硬编码封 IP 警告"
+  fi
+
+  PR_REC="$rec"; PR_MS="$ms"; PR_CODE="$code"; PR_NOTE="$note"
+  if [[ "$quiet" != "1" ]]; then
+    printf '  %s%s%s %-26s %6s  %6sms  %-4s %-20s %s\n' \
+      "$color" "$mark" "$C_R" "$h" "$rec" "$ms" "$code" "$issuer" "$note"
+  fi
+  return $rc
+}
+
+# 批量体检；不带参数时测内置候选
+reality_probe() {
+  local hosts=() h rc bad=0 warn=0 good=0
+  for h in "$@"; do hosts+=("$h"); done
+  if [[ ${#hosts[@]} -eq 0 ]]; then
+    read -ra hosts <<< "$REALITY_PROBE_HOSTS"
+  fi
+
+  printf '\n  %sReality 伪装目标体检%s  证书上限 %s 字节\n' "$C_B" "$C_R" "$REALITY_CERT_LIMIT"
+  printf '  %s标记 域名                        证书    握手  HTTP  签发方%s\n' "$C_DIM" "$C_R"
+
+  for h in "${hosts[@]}"; do
+    sni_valid "$h" || continue
+    reality_probe_one "$h"; rc=$?
+    case $rc in
+      0) good=$((good+1)) ;;
+      1) bad=$((bad+1)) ;;
+      2) warn=$((warn+1)) ;;
+    esac
+  done
+
+  printf '\n'
+  printf '  当前 dest：%s\n' "$(reality_sni)"
+  if [[ $bad -gt 0 ]]; then
+    err "${bad} 个目标不可用（标记 ✗）：证书超限或握手失败，选了会导致节点直接连不上"
+  fi
+  if [[ $warn -gt 0 ]]; then
+    warn "${warn} 个目标有风险（标记 !）：能用但余量不足 / 有跳转 / 被官方点名"
+  fi
+  [[ $good -gt 0 ]] && ok "${good} 个目标可用"
+  printf '  %s判断口径：证书越短越抗证书轮换；非巨头 SNI 更不易被单独针对；%s\n' \
+    "$C_DIM" "root 无跨域跳转才像真站$C_R"
+  if [[ -n "$(reality_sni)" && "$(reality_sni)" != "$REALITY_SNI" ]]; then
+    printf '  %s当前不是脚本默认值，切换：bash %s reality sni <域名>%s\n' \
+      "$C_DIM" "$APP" "$C_R"
+  fi
+}
+
+# 改伪装目标：写 node.json → 开了 Reality 就重写配置并重启 → 重建订阅
+reality_sni_set() { # $1=域名
+  local s="${1// /}" old rc
+  sni_valid "$s" || return 1
+  old="$(reality_sni)"
+  if [[ "$s" == "$old" ]]; then
+    info "伪装目标已经是 ${s}，无需改动"
+    return 0
+  fi
+
+  printf '\n  %s先体检新目标%s\n' "$C_B" "$C_R"
+  reality_probe_one "$s"; rc=$?
+  if [[ $rc -eq 1 ]]; then
+    err "该目标不可用，已放弃修改（原配置一字未动：${old}）"
+    return 1
+  fi
+  [[ $rc -eq 2 ]] && warn "该目标有风险，但可继续（见上面的说明）"
+
+  node_jset reality.sni "\"$s\"" || { err "写入 node.json 失败"; return 1; }
+  ok "伪装目标：${old} → ${s}"
+
+  if proto_on reality; then
+    reality_apply || { err "应用失败，手动重开：bash $0 direct off reality && bash $0 direct on reality"; return 1; }
+    ok "已重写 Xray 配置并重启 argox-xray"
+  else
+    gen_sub >/dev/null 2>&1 || warn "订阅重建失败"
+    info "Reality 当前未开启，改动已落盘，下次开启时生效"
+  fi
+  warn "客户端需删旧节点重拉订阅：旧订阅里的 sni 还是 ${old}"
   return 0
 }
 
@@ -3225,6 +3389,17 @@ PY
     else
       ck_err "Reality 密钥缺失（重开一次 Reality 会自动生成）"
     fi
+    # 伪装目标体检：Xray 对证书 TLS 记录有 8192 字节硬编码上限，超了握手直接失败
+    # 且不打日志——不主动探测就会表现成「节点突然连不上」而查无实据
+    local prc=0
+    reality_probe_one "$(reality_sni)" 1 || prc=$?
+    if [[ $prc -eq 1 ]]; then
+      ck_err "伪装目标 $(reality_sni) 不可用：${PR_NOTE:-握手失败}（reality probe 看候选）"
+    elif [[ $prc -eq 2 ]]; then
+      ck_warn "伪装目标 $(reality_sni) 有风险：${PR_NOTE}"
+    else
+      ck_ok "伪装目标 $(reality_sni) 可用（证书 ${PR_REC} 字节，余量 $((REALITY_CERT_LIMIT - PR_REC))）"
+    fi
     if build_links 2>/dev/null | grep -q -- "#${NAME_REALITY}$"; then
       ck_ok "订阅里有 ${NAME_REALITY} 节点"
     else
@@ -3254,10 +3429,11 @@ do_upgrade() {
   # 补齐新字段：已存在的绝不覆盖
   local added="-"
   if has python3; then
-    added="$(python3 - "$NODEF" "$VERSION" "$DEF_PORT_HY2" "$DEF_HOP_RANGE" 2>/dev/null <<'PY'
+    added="$(python3 - "$NODEF" "$VERSION" "$DEF_PORT_HY2" "$DEF_HOP_RANGE" "$REALITY_SNI" 2>/dev/null <<'PY'
 import json, sys
 p, ver = sys.argv[1], sys.argv[2]
 hp, hop = int(sys.argv[3]), sys.argv[4]
+rsni = sys.argv[5]
 with open(p) as f:
     d = json.load(f)
 defaults = {
@@ -3268,7 +3444,7 @@ defaults = {
     "hy2":     {"port": hp, "hop": hop, "obfs": False,
                 "up": 50, "down": 300},
     "tuic":    {"port": 30001, "password": "", "cc": "bbr"},
-    "reality": {"port": 8443, "sni": "www.microsoft.com", "short_id": "",
+    "reality": {"port": 8443, "sni": rsni, "short_id": "",
                 "private_key": "", "public_key": ""},
     "anytls":  {"port": 8445, "password": ""},
     "cert":    {"sni": d.get("tunnel_host", ""), "path": "/opt/argox/cert"},
@@ -3280,7 +3456,7 @@ for k in added:
 # reality 子字段补齐：老版本只有 port/sni/short_id，缺密钥对（阶段 4 新增）
 r = d.get("reality")
 if isinstance(r, dict):
-    for k, dv in (("port", 8443), ("sni", "www.microsoft.com"),
+    for k, dv in (("port", 8443), ("sni", rsni),
                   ("short_id", ""), ("private_key", ""), ("public_key", "")):
         if k not in r:
             r[k] = dv
@@ -3297,13 +3473,24 @@ if str(h.get("port")) == "20000" and str(h.get("hop")) == "20000-30000":
     d["hy2"] = h
     mig = "%s|%s" % (hp, hop)
 
+# 旧默认伪装目标迁移。条件收紧到「从未启用过 Reality」（无密钥、无 shortId）：
+# 已经生成过密钥说明用过，改 SNI 会让客户端静默断连，一律不动只提示。
+mig_sni = "-"
+rv = d.get("reality") or {}
+if str(rv.get("sni")) == "www.microsoft.com" and str(rv.get("port")) == "8443" \
+        and not rv.get("private_key") and not rv.get("short_id"):
+    rv["sni"] = rsni
+    d["reality"] = rv
+    mig_sni = rsni
+
 d["version"] = ver
 with open(p, "w") as f:
     json.dump(d, f, indent=2, ensure_ascii=False)
-print(("%s" % (",".join(added) if added else "-")) + ";" + mig)
+print(("%s" % (",".join(added) if added else "-")) + ";" + mig + ";" + mig_sni)
 PY
 )"
-    local added_s="${added%%;*}" mig="${added##*;}"
+    local added_s="${added%%;*}" rest_s="${added#*;}"
+    local mig="${rest_s%%;*}" mig_sni="${rest_s#*;}"
     added="$added_s"
     if [[ "$added" == "-" ]]; then ok "字段已是最新，无需补齐"
     else ok "已补齐字段：${added}"; fi
@@ -3315,6 +3502,13 @@ PY
       # 用户自己改过 port，只把段留着 → 不擅自改，给提示
       warn "Hy2 跳跃段仍是 20000-30000，可能和 RustDesk(21115-21119) 等端口冲突"
       info "要改运行：bash $0 hy2 hop 23000-27000（监听口会自动跟到段首）"
+    fi
+    if [[ "$mig_sni" != "-" ]]; then
+      ok "Reality 伪装目标已迁移：www.microsoft.com → ${mig_sni}"
+      info "依据：微软证书链 5902 字节（余量仅 39%），且 Xray 作者不建议用微软做目标"
+    elif [[ "$(reality_sni)" == "www.microsoft.com" ]]; then
+      warn "Reality 伪装目标仍是 www.microsoft.com（已启用过，故未自动改）"
+      info "换目标：bash $0 reality sni www.lovelive-anime.jp（会先体检，客户端需重拉订阅）"
     fi
   else
     warn "缺 python3，跳过字段补齐"
@@ -3921,7 +4115,7 @@ direct_switch() { # $1=on|off  $2=hy2|tuic|anytls|reality|all
 
 direct_menu() {
   require_root
-  local c r yn
+  local c r yn rh
   while true; do
     direct_show
     cat <<'EOF'
@@ -3934,6 +4128,7 @@ direct_menu() {
   6) 改 Hy2 跳跃段
   7) 查看 / 重签证书
   8) 重启 sing-box
+  9) Reality 伪装目标体检 / 换目标
   0) 返回
 EOF
     read -rp "  选择: " c
@@ -3958,6 +4153,11 @@ EOF
            cert_gen
          fi ;;
       8) if proto_on hy2 || proto_on tuic || proto_on anytls; then sb_sync; else warn "sing-box 侧协议都未开启"; fi ;;
+      9) reality_probe; printf '\n'
+         read -rp "  换成哪个？（留空则不改）: " rh
+         if [[ -n "${rh// /}" ]]; then
+           reality_sni_set "${rh// /}"
+         fi ;;
       0|"") return 0 ;;
       *) warn "无效选项" ;;
     esac
@@ -3973,6 +4173,32 @@ do_direct() {
     status)  direct_show ;;
     on|off)  direct_switch "$1" "${2:-}" ;;
     *) err "用法：direct [status|on|off] <hy2|tuic|anytls|reality|all>"; return 1 ;;
+  esac
+}
+
+do_reality() {
+  require_root
+  case "${1:-status}" in
+    probe|test)
+      shift
+      reality_probe "$@" ;;
+    sni|set)
+      [[ -z "${2:-}" ]] && { err "用法：reality sni www.example.com"; return 1; }
+      reality_sni_set "${2:-}" ;;
+    ""|status)
+      local on sid
+      proto_on reality && on="${C_GRN}已开启${C_R}" || on="${C_DIM}未开启${C_R}"
+      [[ -n "$(reality_sid)" ]] && sid="已生成" || sid="${C_YEL}未生成${C_R}"
+      printf '\n  %sReality%s（Xray 内核）\n' "$C_B" "$C_R"
+      printf '  状态        : %s\n' "$on"
+      printf '  监听        : TCP %s\n' "$(reality_port)"
+      printf '  伪装目标    : %s\n' "$(reality_sni)"
+      printf '  证书上限    : %s 字节（超了 Xray 直接拒绝握手）\n' "$REALITY_CERT_LIMIT"
+      printf '  密钥        : %s\n' "$sid"
+      printf '  shortId     : %s\n' "$(reality_sid)"
+      printf '\n  %s体检当前目标：bash %s reality probe%s\n' "$C_DIM" "$APP" "$C_R"
+      printf '  %s换目标：bash %s reality sni <域名>%s\n' "$C_DIM" "$APP" "$C_R" ;;
+    *) err "用法：reality [status|probe [域名…]|sni <域名>]"; return 1 ;;
   esac
 }
 
@@ -4086,6 +4312,7 @@ main() {
     hop)       do_hop "${2:-}" "${3:-}" ;;
     landing)   shift; do_landing "$@" ;;
     direct)    do_direct "${2:-}" "${3:-}" ;;
+    reality)   shift; do_reality "$@" ;;
     hy2)       do_hy2 "${2:-}" "${3:-}" ;;
     cert)      do_cert "${2:-}" "${3:-}" ;;
     diag)      do_diag "${2:-}" ;;
@@ -4115,10 +4342,14 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 landing off  关闭落地
   bash $0 landing target h3,h2,reality   选择落地作用入口
   bash $0 landing proto socks|http  落地出口协议
-  bash $0 direct       直连协议状态（Hy2 / TUIC / AnyTLS，菜单 20）
-  bash $0 direct on all   一次开启 Hy2 + TUIC + AnyTLS（推荐）
+  bash $0 direct       直连协议状态（Hy2 / TUIC / AnyTLS / Reality，菜单 20）
+  bash $0 direct on all   一次开启 Hy2 + TUIC + AnyTLS + Reality（推荐）
   bash $0 direct on hy2    开启 Hy2（自动装 sing-box + 自签证书）
   bash $0 direct off tuic  关闭 TUIC
+  bash $0 reality       Reality 状态（伪装目标 / 端口 / 密钥）
+  bash $0 reality probe    体检当前伪装目标 + 内置候选（证书大小 / 握手 / 跳转）
+  bash $0 reality probe www.intel.com   只测指定域名，可一次给多个
+  bash $0 reality sni www.lovelive-anime.jp   换伪装目标（先体检，不合格拒绝写入）
   bash $0 hy2 hop 23000-27000  改 Hy2 端口跳跃段（监听口自动跟随段首）
   bash $0 cert         查看自签证书
   bash $0 cert gen     重新生成证书（--force 强制）

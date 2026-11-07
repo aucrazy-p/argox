@@ -2,7 +2,9 @@
 
 > 状态：**阶段 1–4 已完成**（v2.0.0 新命名 + `check` + `upgrade`；v2.1.0 住宅落地；
 > v2.2.0 sing-box 双核 + 自签证书 + Hy2 / TUIC / AnyTLS + 端口跳跃，WS 下线；
-> **v2.4.0 Reality 接入**：Xray 内核、默认关、`xray x25519` 自动生成密钥、支持 `Reality-RH`）。
+> **v2.4.0 Reality 接入**：Xray 内核、默认关、`xray x25519` 自动生成密钥、支持 `Reality-RH`；
+> **v2.5.0 伪装目标选型**：默认改为 `www.lovelive-anime.jp`，新增 `reality probe` 体检与
+> `reality sni` 换目标，`check` 增加证书 8192 上限校验）。
 > 下一步：阶段 5（菜单统一重排，把 17/18/19/20 塞回正位）。
 > 变更：**v2.3.2 起 Hy2 默认段 `20000-30000` → `23000-27000`**（用户 VPS 上 RustDesk 与
 > 其他服务占用 20000-30000，实测冲突）。监听口同步改为段首 `23000`；`hy2 hop` 会
@@ -242,6 +244,83 @@ QUIC 在 CF 边缘就终结了，进入 Xray 之后到 Aimili 那段**永远是 
 
 所以你现在不开 `Reality-RH` 完全不影响以后：等哪天 Reality 节点测通了，
 菜单 8 → 勾一下 `Reality` 的落地，订阅里立刻多一条 `Reality-RH`。
+
+---
+
+### 2.6 Reality 伪装目标（dest / serverNames）怎么选
+
+Reality 不用自己的证书，而是**借目标站的真实 TLS 握手**：客户端发 SNI=目标域名，
+VPS 把这握手转给目标站，拿回它的真证书。所以目标站选错，节点直接不通，
+而且**失效时 Xray 不报错、不打日志**——只会表现成"Reality 节点突然连不上"。
+
+#### 一个必须知道的硬限制：证书 ≤ 8192 字节
+
+Xray 对目标站下发的证书 TLS Certificate 记录有 **8192 字节硬编码上限**
+（[Xray-core issue #6356](https://github.com/XTLS/Xray-core/issues/6356)），
+超过则握手被直接拒绝。截至 v26.7.28 仍未修复。
+
+**坑在于这个大小不是常量**：
+
+- 同一域名在不同 CDN 边缘节点下发的证书链长度不同
+- CDN 轮换证书后长度会变
+
+所以网上「`www.microsoft.com` 能用」和「`www.microsoft.com` 不能用」两种说法
+**都可能是真的**——取决于测的人落在哪个节点。上报者测得 8273 字节（超限），
+而本项目 VPS（大阪）实测 5902 字节（未超）。**只能在自己的 VPS 上测。**
+
+#### 四项硬指标（缺一不可）
+
+| 指标 | 要求 | 怎么测 |
+|---|---|---|
+| TLS 版本 | 必须 TLS 1.3 | `openssl s_client -tls1_3` |
+| ALPN | 必须协商出 `h2` | `-alpn h2` 后看 `ALPN protocol: h2` |
+| 证书链 | 必须能验到受信根 | `openssl s_client` 不出 `verify error` |
+| 证书大小 | **≤ 8192 字节** | `reality probe`（或 `-msg` 读 `length`） |
+
+#### 三项判断项（软指标）
+
+1. **不要流量巨头**：`google.com` / `microsoft.com` / `apple.com` 是全球被分析最透的 SNI。
+   Xray-core 甚至对 `apple` / `icloud` 有硬编码警告：`Choosing apple, icloud, etc. as the target may get your IP blocked by the GFW`。
+2. **证书链由 CDN 自动管理的优先**：AWS ACM / CloudFront 这类托管证书链长度固定，
+   不会因为客户换 CA 突然变长；企业自己上传的证书（Akamai 上的 DigiCert / Sectigo）会变。
+3. **root 不要跨域跳转**：`301/307` 跳到别的域名，会让"探测你的 IP"看到的行为与真站不一致。
+   `www.nvidia.com` → `307 www.nvidia.cn`、`www.amd.com` → `301 /zh-cn.html` 都属于这类。
+
+#### 2026-11 实测记录（Oracle 大阪 ARM64）
+
+| 域名 | 证书链 | VPS 握手 | root 行为 | 签发方 | 结论 |
+|---|---|---|---|---|---|
+| **www.lovelive-anime.jp** | 3821 | 58ms | 200 | Amazon（CloudFront） | **默认**，余量 2.1 倍 |
+| www.intel.com | **2051** | 47ms | 403（WAF 拦裸请求） | Sectigo | 备选，链最短 |
+| www.microsoft.com | 5902 | 48ms | 200 | Microsoft（Akamai） | 旧默认，能用但余量仅 39% |
+| www.nvidia.com | 4350 | 46ms | **307 → www.nvidia.cn** | DigiCert | 排除：跨域跳转 |
+| www.amd.com | 3318 | **141ms** | 301 → /zh-cn.html | DigiCert | 排除：延迟 + 跳转 |
+| www.apple.com | 3249 | 49ms | — | — | 排除：Xray 硬编码警告 |
+| m.media-amazon.com | 4306 | **276ms** | — | — | 排除：延迟过高 |
+
+> 顺带否掉一个常见说法：这几个域名从国内解析**全部落到境外节点**（实测 195–320ms），
+> 并不存在"微软在大陆有 CDN 节点导致 SNI 与 IP 不符"的问题。
+> 选目标的核心理由是**证书链稳定性**，不是 IP 归属。
+
+#### 为什么默认是 lovelive 而不是证书更小的 intel
+
+`www.intel.com` 证书只有 2051 字节（余量 4 倍），看着更抗风险。但它是**企业自管证书**
+（Sectigo，随 Intel 自己换），而 `www.lovelive-anime.jp` 走 CloudFront + AWS ACM，
+**证书链由 ACM 自动签发、长度固定 3 张**——对手动换证书这件事免疫。
+
+再加上它不是巨头 SNI、root 返回 200 无跳转。综合下来长期最稳。
+
+#### 更换与体检
+
+```bash
+bash argox.sh reality                 # 当前目标 / 端口 / 密钥
+bash argox.sh reality probe           # 体检当前目标 + 内置候选
+bash argox.sh reality probe www.intel.com www.amd.com   # 只测指定域名
+bash argox.sh reality sni <域名>      # 换目标：先体检，不合格拒绝写入
+```
+
+`check` 里也会自动探测当前 dest，**证书超 8192 直接报红**——补上"证书越线导致
+节点静默失效"这个盲区。改 SNI 后客户端必须重拉订阅（旧订阅里的 `sni` 参数还是旧的）。
 
 ---
 
@@ -486,6 +565,7 @@ argox.sh nodes|links|sub|qr
 argox.sh proto [list|on <name>|off <name>]     # argo|hy2|tuic|reality|anytls
 argox.sh landing [on|off|status|target <list>|proto socks|http]  # target h3,h2,ws,reality
 argox.sh hy2 hop <start-end>                   # 端口段（B）
+argox.sh reality [status|probe [域名…]|sni <域名>]   # 伪装目标体检与更换（见 2.6）
 argox.sh tunnel [token|host|proto]
 argox.sh port [show|set]
 argox.sh cert [show|gen]

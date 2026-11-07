@@ -120,6 +120,9 @@ bash argox.sh direct on hy2
 bash argox.sh direct off tuic
 bash argox.sh direct on reality    # Xray 内核，默认关；纯 Xray 客户端（v2rayN 6.x）用它
 bash argox.sh hy2 hop 23000-27000  # 改 Hy2 端口跳跃段
+bash argox.sh reality              # Reality 状态（伪装目标 / 端口 / 密钥）
+bash argox.sh reality probe        # 体检伪装目标：证书大小 / 握手 / 跨域跳转
+bash argox.sh reality sni <域名>   # 换伪装目标（先体检，超 8192 直接拒绝）
 bash argox.sh cert                 # 查看自签证书
 bash argox.sh cert gen --force     # 重签
 ```
@@ -152,11 +155,25 @@ Hy2 的端口跳跃靠 nftables 的 `redirect` 实现，sing-box 实际只监听
 （v2rayN 6.x、老版 v2rayNG 等不认识 AnyTLS 的客户端）。
 
 - 端口 `8443/TCP`，开启后需在云安全组放行
-- 伪装目标默认 `www.microsoft.com:443`（须 TLS 1.3 + H2，且 VPS 能直连它的 443）
+- 伪装目标默认 `www.lovelive-anime.jp:443`（CloudFront 托管，证书链固定 3821 字节）
 - 首次开启自动用 `xray x25519` 生成密钥对，写入 `node.json`，之后不再变动
 - 走 `xtls-rprx-vision` 流控，Throne / v2rayN 7.x / v2rayNG / sing-box 都支持
 - 想要「Reality 也走家宽」：菜单 19 勾上 `REALITY`，订阅末尾会多一条 `Reality-RH`
   （同一个 8443 入站的第二个 UUID，不占新端口）
+
+**伪装目标为什么不能随便选**：Xray 对目标站证书的 TLS 记录有 **8192 字节硬编码上限**，
+超了握手直接失败，而且 Xray 不报错、不打日志——只表现成"节点连不上"。
+这个大小还会随 CDN 边缘节点与证书轮换变化，同一域名不同机器测出来不一样，
+所以别照抄网上的清单，换之前先体检：
+
+```bash
+bash argox.sh reality              # 当前目标 / 端口 / 密钥
+bash argox.sh reality probe        # 体检当前目标 + 内置候选
+bash argox.sh reality sni <域名>   # 换目标（先体检，超限直接拒绝写入）
+```
+
+`check` 也会自动探测当前 dest，超 8192 直接报红。选型标准与 2026-11 实测记录见
+[`docs/plan-v2.md` 2.6](docs/plan-v2.md)。
 
 ```bash
 bash argox.sh direct on reality    # 开（自动生成密钥 + 重启 Xray + 放行端口）
