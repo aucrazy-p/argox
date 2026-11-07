@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.5.2"
+VERSION="2.6.0"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -406,9 +406,15 @@ landing_proto() {
 }
 
 # 当前 target 是否包含某个入口
-landing_wants() { # $1=h3|h2|ws
+landing_wants() { # $1=h3|h2|ws|anytls|reality
   local tg; tg=" $(landing_targets) "
   [[ "$tg" == *" $1 "* ]]
+}
+
+# AnyTLS 落地入站端口：主入站 +1，两条链路各自独立监听（同一入站无法按用户分流）
+anytls_rh_port() {
+  local p; p="$(anytls_port)"
+  printf '%s' $(( p + 1 ))
 }
 
 # ==============================================================================
@@ -919,12 +925,20 @@ EOF
 }
 
 # AnyTLS：TCP + TLS，UDP 全被 QoS 时的唯一活路
-sb_inbound_anytls() {
-  local ap; ap="$(anytls_port)"; local pw; pw="$(anytls_pass)"
+sb_inbound_anytls() { # $1=rh 时生成落地入站（独立端口，密码用落地 UUID）
+  local tag="anytls-in" ap pw
+  if [[ "${1:-}" == "rh" ]]; then
+    tag="anytls-rh-in"
+    ap="$(anytls_rh_port)"
+    pw="$(landing_uuid)"
+  else
+    ap="$(anytls_port)"
+    pw="$(anytls_pass)"
+  fi
   cat <<EOF
     {
       "type": "anytls",
-      "tag": "anytls-in",
+      "tag": "${tag}",
       "listen": "::",
       "listen_port": ${ap},
       "users": [ { "password": "${pw}" } ],
@@ -940,7 +954,7 @@ EOF
 
 write_sb_config() {
   mkdir -p "$LOGD"
-  local body=""
+  local body="" need_land=0
   if proto_on hy2; then body="$(sb_inbound_hy2)"; fi
   if proto_on tuic; then
     if [[ -n "$body" ]]; then body="${body},"$'\n'; fi
@@ -949,11 +963,24 @@ write_sb_config() {
   if proto_on anytls; then
     if [[ -n "$body" ]]; then body="${body},"$'\n'; fi
     body="${body}$(sb_inbound_anytls)"
+    # AnyTLS 落地：独立入站 + socks 出口。sing-box 侧只有它可以走落地，
+    # Hy2 / TUIC 是 UDP，落地代理（Aimili）不支持 UDP ASSOCIATE。
+    if landing_on && landing_wants anytls && [[ -n "$(landing_uuid)" ]]; then
+      body="${body},"$'\n'"$(sb_inbound_anytls rh)"
+      need_land=1
+    fi
   fi
 
   if [[ -z "$body" ]]; then
     warn "Hy2 / TUIC / AnyTLS 都未开启，sing-box 不启用"
     return 1
+  fi
+
+  local ob="    { \"type\": \"direct\", \"tag\": \"direct\" }" rt=""
+  if [[ $need_land -eq 1 ]]; then
+    # 落地出口：sing-box 直接把该入站的流量交给本机代理（与 Xray 用同一个 Aimili）
+    ob="${ob},"$'\n'"    { \"type\": \"$(landing_proto)\", \"tag\": \"landing\", \"server\": \"$(node_hop_addr)\", \"server_port\": $(node_hop_port) }"
+    rt=","$'\n'"  \"route\": {"$'\n'"    \"rules\": ["$'\n'"      { \"inbound\": [ \"anytls-rh-in\" ], \"outbound\": \"landing\" }"$'\n'"    ]"$'\n'"  }"
   fi
 
   cat > "$SBCONF" <<EOF
@@ -967,8 +994,8 @@ write_sb_config() {
 ${body}
   ],
   "outbounds": [
-    { "type": "direct", "tag": "direct" }
-  ]
+${ob}
+  ]${rt}
 }
 EOF
   chmod 600 "$SBCONF"
@@ -1056,7 +1083,10 @@ fw_open() { # $1=tcp|udp  $2=端口 或 起-止
 fw_open_direct() {
   proto_on hy2    && fw_open udp "$(hy2_hop)"
   proto_on tuic   && fw_open udp "$(tuic_port)"
-  proto_on anytls && fw_open tcp "$(anytls_port)"
+  if proto_on anytls; then
+    fw_open tcp "$(anytls_port)"
+    landing_on && landing_wants anytls && fw_open tcp "$(anytls_rh_port)"
+  fi
   proto_on reality && fw_open tcp "$(reality_port)"
   return 0
 }
@@ -1116,7 +1146,19 @@ proto_label() {
   proto_on hy2    && out+=("Hy2:$(hy2_port)")
   proto_on tuic   && out+=("TUIC:$(tuic_port)")
   proto_on anytls && out+=("AnyTLS:$(anytls_port)")
+  proto_on reality && out+=("Reality:$(reality_port)")
   local IFS=" "
+  printf '%s' "${out[*]:-无}"
+}
+
+# 只要协议名不带端口，菜单头部状态行用（带端口太长会折行）
+proto_label_short() {
+  local out=()
+  proto_on hy2     && out+=("Hy2")
+  proto_on tuic    && out+=("TUIC")
+  proto_on anytls  && out+=("AnyTLS")
+  proto_on reality && out+=("Reality")
+  local IFS="/"
   printf '%s' "${out[*]:-无}"
 }
 
@@ -1415,7 +1457,7 @@ tunnel_hints() {
   else
     info "TCP 7844 通但没注册成功，两种可能："
     info "  a) UDP 7844 被拦（QUIC 出不去）→ bash ${0##*/} diag http2"
-    info "  b) Token 不对 / 隧道已在面板删除 → 菜单 13 → 1) 重新粘贴 Token"
+    info "  b) Token 不对 / 隧道已在面板删除 → 菜单 11 → 1) 重新粘贴 Token"
   fi
   info "看日志：journalctl -u ${SVC_TUN} -n 60"
 }
@@ -2042,7 +2084,7 @@ urlenc() { # 简单 URL 编码（path 里的 / 需编码）
 emit_direct_links() {
   local ip; ip="$(vps_ip)"
   if [[ -z "$ip" ]]; then
-    warn "拿不到 VPS 公网 IP，跳过 Hy2 / TUIC 节点（可在菜单 10 手动填）"
+    warn "拿不到 VPS 公网 IP，跳过 Hy2 / TUIC 节点（VPS 出网不通？或手动填 node.json 的 vps_ip）"
     return 0
   fi
   local sni; sni="$(node_get tunnel_host 2>/dev/null || true)"
@@ -2086,7 +2128,7 @@ emit_landing_links() { # $1=host $2=ws_host $3=ex $4=enc_pw
   local lu; lu="$(landing_uuid)"
   [[ -z "$lu" ]] && return 0
   local t
-  for t in h3 h2 ws reality; do
+  for t in h3 h2 ws anytls reality; do
     landing_wants "$t" || continue
     case "$t" in
       h3) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s%s\n' \
@@ -2095,6 +2137,11 @@ emit_landing_links() { # $1=host $2=ws_host $3=ex $4=enc_pw
             "$lu" "$host" "$host" "$ex" "$host" "$NAME_H2" "$NAME_RH" ;;
       ws) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#%s%s\n' \
             "$lu" "$ws_host" "$ws_host" "$enc_pw" "$ws_host" "$NAME_WS" "$NAME_RH" ;;
+      anytls)
+        # AnyTLS 落地：走 VPS 公网 IP 的独立端口，直连协议没开就没有这条
+        proto_on anytls || continue
+        printf 'anytls://%s@%s:%s?security=tls&sni=%s&insecure=1&allowInsecure=1#%s%s\n' \
+              "$lu" "$(vps_ip)" "$(anytls_rh_port)" "$(node_get tunnel_host)" "$NAME_ANYTLS" "$NAME_RH" ;;
       reality)
         # Reality 走 VPS 公网 IP，与 Argo 域名无关；协议本身没开就没有这条
         proto_on reality || continue
@@ -2323,7 +2370,7 @@ do_start() {
     sleep 1
     if svc_active "$SVC_TUN"; then ok "隧道已启动"; else warn "隧道启动失败，查看日志：journalctl -u ${SVC_TUN} -n 50"; fi
   else
-    warn "未配置 Tunnel Token，隧道未启动（菜单 13 可填写）"
+    warn "未配置 Tunnel Token，隧道未启动（菜单 11 可填写）"
   fi
   [[ -f "$PYSRV" ]] && systemctl start "$SVC_SUB" 2>/dev/null
   ok "已启动"
@@ -2379,7 +2426,7 @@ do_status() {
     if proto_on hy2 || proto_on tuic || proto_on anytls; then
       printf '  直连协议   : %s（公网 %s）\n' "$(proto_label)" "$(vps_ip)"
     else
-      printf '  直连协议   : 全部关闭（菜单 20 开启）\n'
+      printf '  直连协议   : 全部关闭（菜单 14 开启）\n'
     fi
   else
     warn "尚未安装"
@@ -2465,7 +2512,7 @@ do_install() {
   # ---------- 交互参数 ----------
   step "隧道参数"
   printf '  说明：隧道需在 CF Dashboard 建（Zero Trust → Networks → Tunnels）。\n'
-  printf '        现在没有可以先跳过，装完用菜单 13 补填。\n\n'
+  printf '        现在没有可以先跳过，装完用菜单 11 补填。\n\n'
 
   local host token cur_host
   host=""
@@ -2573,7 +2620,7 @@ PY
   "sub_token": "${sub_token}",
   "install_mode": "A",
   "proto": { "argo": true, "hy2": true, "tuic": true, "reality": false, "anytls": true },
-  "landing": { "enabled": false, "uuid": "", "target": ["h3", "h2"] },
+  "landing": { "enabled": false, "uuid": "", "target": ["h3", "anytls"] },
   "hy2":     { "port": ${DEF_PORT_HY2}, "hop": "${DEF_HOP_RANGE}", "obfs": false, "up": 50, "down": 300 },
   "tuic":    { "port": 30001, "password": "", "cc": "bbr" },
   "reality": { "port": ${DEF_PORT_REALITY}, "sni": "${REALITY_SNI}", "short_id": "", "private_key": "", "public_key": "" },
@@ -2633,7 +2680,7 @@ PY
   if proto_on hy2 || proto_on tuic || proto_on anytls; then
     step "直连协议（$(proto_label)）"
     if proto_on hy2 && port_in_use "$(hy2_port)" udp; then
-      warn "UDP $(hy2_port) 已被占用，Hy2 可能起不来（菜单 20 改端口）"
+      warn "UDP $(hy2_port) 已被占用，Hy2 可能起不来（菜单 14 改端口）"
     fi
     if proto_on tuic && port_in_use "$(tuic_port)" udp; then
       warn "UDP $(tuic_port) 已被占用，TUIC 可能起不来"
@@ -2717,20 +2764,20 @@ PY
   if [[ "$mode_prev" == "ip" ]]; then
     step "优选 IP"
     if [[ -s "$IPSF" ]]; then
-      info "已有 $(wc -l < "$IPSF") 个 IP，跳过（菜单 14 可更新）"
+      info "已有 $(wc -l < "$IPSF") 个 IP，跳过（菜单 12 可更新）"
     else
       read -rp "  现在导入优选 IP 并校验？约需 1-3 分钟（Y/n）: " yn2
       if [[ "${yn2,,}" != "n" ]]; then
         import_ips || printf '%s\n' "$DEFAULT_IPS" > "$IPSF"
       else
         printf '%s\n' "$DEFAULT_IPS" > "$IPSF"
-        info "已写入默认 IP 列表（菜单 14 可重新导入）"
+        info "已写入默认 IP 列表（菜单 12 可重新导入）"
       fi
     fi
   else
     step "节点地址"
     ok "使用域名直连（$host），跳过优选 IP"
-    info "如需改用优选 IP：菜单 13 → 6) 切换地址模式"
+    info "如需改用优选 IP：菜单 11 → 6) 切换地址模式"
   fi
 
   # ---------- 收尾 ----------
@@ -2753,7 +2800,7 @@ PY
   hr
 
   if [[ -z "$host" ]]; then
-    warn "还需在 CF Dashboard 配置 Public Hostname，然后回到菜单 13 填域名"
+    warn "还需在 CF Dashboard 配置 Public Hostname，然后回到菜单 11 填域名"
   fi
 
   printf '\n'
@@ -3026,7 +3073,7 @@ do_diag() {
         info "检查 127.0.0.1:${DEF_PORT_XHTTP} 是否在听：systemctl status ${SVC_XRAY}"
         ;;
       nohost)
-        warn "还没填隧道域名，无法实测链路（菜单 13 → 2）"
+        warn "还没填隧道域名，无法实测链路（菜单 11 → 2）"
         ;;
       fail|noroute|*)
         err "没有任何注册记录：进程在跑，但连不上 CF"
@@ -3313,21 +3360,29 @@ PY
   # 落地一致性：UUID 进了配置、订阅里有对应 -RH 节点
   if landing_on; then
     [[ $quiet -eq 1 ]] || printf '\n%s[住宅落地]%s\n' "$C_B" "$C_R"
-    local lu want got
-    lu="$(landing_uuid)"
-    if [[ -z "$lu" ]]; then
-      ck_err "落地已开启但 landing.uuid 为空（重开一次落地）"
-    elif grep -q "$lu" "$CONF" 2>/dev/null; then
-      ck_ok "落地 UUID 已写入 Xray 配置"
-    else
-      ck_err "落地已开启但 UUID 不在 config.json（重开一次落地）"
-    fi
-    # want 要排除「选了 reality 但 Reality 协议没开」的情况，否则会误报不一致
-    want=0
+    local lu want got has_xray_land=0
     local wt
     for wt in $(landing_targets); do
-      [[ "$wt" == "reality" ]] && ! proto_on reality && continue
-      want=$((want+1))
+      case "$wt" in h3|h2|ws|reality) has_xray_land=1 ;; esac
+    done
+    lu="$(landing_uuid)"
+    if [[ $has_xray_land -eq 1 ]]; then
+      if [[ -z "$lu" ]]; then
+        ck_err "落地已开启但 landing.uuid 为空（重开一次落地）"
+      elif grep -q "$lu" "$CONF" 2>/dev/null; then
+        ck_ok "落地 UUID 已写入 Xray 配置"
+      else
+        ck_err "落地已开启但 UUID 不在 config.json（重开一次落地）"
+      fi
+    fi
+    # want 要排除「选了协议但协议没开」的入口，否则会误报不一致
+    want=0
+    for wt in $(landing_targets); do
+      case "$wt" in
+        reality) proto_on reality && want=$((want+1)) ;;
+        anytls)  proto_on anytls  && want=$((want+1)) ;;
+        *)       want=$((want+1)) ;;
+      esac
     done
     got="$(build_links 2>/dev/null | grep -c -- '-RH$')"
     if [[ "${want:-0}" == "${got:-0}" ]]; then
@@ -3382,6 +3437,14 @@ PY
         else
           ck_err "TCP $(anytls_port) 没在听（AnyTLS 不可用）"
         fi
+        # AnyTLS 落地是独立入站，端口不在听就说明 landing_on 之后没重建 sing-box
+        if landing_on && landing_wants anytls && [[ -n "$(landing_uuid)" ]]; then
+          if listen_on "$(anytls_rh_port)" tcp; then
+            ck_ok "TCP $(anytls_rh_port) 在听（AnyTLS-RH 落地）"
+          else
+            ck_err "TCP $(anytls_rh_port) 没在听（AnyTLS 落地没生效，重开一次落地）"
+          fi
+        fi
       fi
 
       local dwant dgot
@@ -3389,7 +3452,8 @@ PY
       proto_on hy2    && dwant=$((dwant+1))
       proto_on tuic   && dwant=$((dwant+1))
       proto_on anytls && dwant=$((dwant+1))
-      dgot="$(build_links 2>/dev/null | grep -cE '^(hysteria2|tuic|anytls)://')"
+      # 排除 -RH 落地节点：它们也是 anytls:// 开头，混进来会让数量对不上
+      dgot="$(build_links 2>/dev/null | grep -E '^(hysteria2|tuic|anytls)://' | grep -vc -- '-RH$')"
       if [[ "$dwant" == "${dgot:-0}" ]]; then
         ck_ok "订阅直连节点 ${dgot} 条，与开关一致"
       else
@@ -3479,7 +3543,7 @@ defaults = {
     "install_mode": "A",
     "proto": {"argo": True, "hy2": True, "tuic": True,
               "reality": False, "anytls": True},
-    "landing": {"enabled": False, "uuid": "", "target": ["h3", "h2"]},
+    "landing": {"enabled": False, "uuid": "", "target": ["h3", "anytls"]},
     "hy2":     {"port": hp, "hop": hop, "obfs": False,
                 "up": 50, "down": 300},
     "tuic":    {"port": 30001, "password": "", "cc": "bbr"},
@@ -3522,14 +3586,25 @@ if str(rv.get("sni")) == "www.microsoft.com" and str(rv.get("port")) == "8443" \
     d["reality"] = rv
     mig_sni = rsni
 
+# 落地默认入口迁移：纯默认态 ["h3","h2"] → ["h3","anytls"]。
+# H2 与 H3 同走 CF，落地版重复度高；AnyTLS 是 TCP 兜底，更值得有家宽出口。
+# 只认精确的默认数组，用户自己勾过的一律不动。
+mig_land = "-"
+ld = d.get("landing") or {}
+if isinstance(ld.get("target"), list) and ld["target"] == ["h3", "h2"]:
+    ld["target"] = ["h3", "anytls"]
+    d["landing"] = ld
+    mig_land = "h3 anytls"
+
 d["version"] = ver
 with open(p, "w") as f:
     json.dump(d, f, indent=2, ensure_ascii=False)
-print(("%s" % (",".join(added) if added else "-")) + ";" + mig + ";" + mig_sni)
+print(("%s" % (",".join(added) if added else "-")) + ";" + mig + ";" + mig_sni + ";" + mig_land)
 PY
 )"
     local added_s="${added%%;*}" rest_s="${added#*;}"
-    local mig="${rest_s%%;*}" mig_sni="${rest_s#*;}"
+    local mig="${rest_s%%;*}" rest2="${rest_s#*;}"
+    local mig_sni="${rest2%%;*}" mig_land="${rest2#*;}"
     added="$added_s"
     if [[ "$added" == "-" ]]; then ok "字段已是最新，无需补齐"
     else ok "已补齐字段：${added}"; fi
@@ -3541,6 +3616,13 @@ PY
       # 用户自己改过 port，只把段留着 → 不擅自改，给提示
       warn "Hy2 跳跃段仍是 20000-30000，可能和 RustDesk(21115-21119) 等端口冲突"
       info "要改运行：bash $0 hy2 hop 23000-27000（监听口会自动跟到段首）"
+    fi
+    if [[ "$mig_land" != "-" ]]; then
+      ok "落地默认入口已迁移：h3,h2 → ${mig_land}（H2 与 H3 同走 CF，重复；AnyTLS 是 TCP 兜底）"
+      if landing_on; then
+        info "落地已开启，正在应用新入口（会重启 Xray / sing-box）"
+        landing_set_target "h3" "anytls" || warn "应用失败，手动跑：bash $0 landing target h3,anytls"
+      fi
     fi
     if [[ "$mig_sni" != "-" ]]; then
       ok "Reality 伪装目标已迁移：www.microsoft.com → ${mig_sni}"
@@ -3588,7 +3670,7 @@ PY
   fi
   if ! proto_on hy2 && ! proto_on tuic && ! proto_on anytls; then
     warn "直连协议全部关闭：Argo 走 CF，线路差时会全挂"
-    info "开一条 TCP 兜底：bash $0 direct on all（菜单 20）"
+    info "开一条 TCP 兜底：bash $0 direct on all（菜单 14）"
   else
     info "直连协议当前：$(proto_label)"
   fi
@@ -3643,7 +3725,7 @@ hop_set() { # $1=all|off  $2=可选协议 socks|http
     pr="$(hop_probe || true)"
     if [[ -z "$pr" ]]; then
       err "本地代理 $(node_hop_addr):$(node_hop_port) 不通，未切换"
-      info "确认代理已启动；地址/端口不对就用菜单 3 改"
+      info "确认代理已启动；地址/端口不对就用菜单 13 → 3) 改代理地址"
       return 1
     fi
     [[ -z "$proto" ]] && proto="${pr%% *}"
@@ -3708,16 +3790,17 @@ do_hop() {
 }
 
 # ==============================================================================
-#  住宅落地（菜单 19 / landing 子命令）
+#  住宅落地（菜单 15 / landing 子命令）
 # ==============================================================================
 landing_names() {
   local t out=""
-  for t in h3 h2 ws reality; do
+  for t in h3 h2 ws anytls reality; do
     landing_wants "$t" || continue
     case "$t" in
       h3) out+="${NAME_H3}${NAME_RH} " ;;
       h2) out+="${NAME_H2}${NAME_RH} " ;;
       ws) out+="${NAME_WS}${NAME_RH} " ;;
+      anytls) proto_on anytls && out+="${NAME_ANYTLS}${NAME_RH} " ;;
       reality) proto_on reality && out+="${NAME_REALITY}${NAME_RH} " ;;
     esac
   done
@@ -3738,6 +3821,9 @@ landing_show() {
   fi
   printf '  出口代理 : %s:%s（%s）\n' "$ha" "$hp" "$(landing_proto)"
   printf '  落地 UUID: %s\n' "${lu:-未生成}"
+  if [[ "$on" == "true" ]] && landing_wants anytls && proto_on anytls; then
+    printf '  AnyTLS-RH: TCP %s（sing-box 独立入站，与主入站分流）\n' "$(anytls_rh_port)"
+  fi
   # 先探端口再探代理：代理不在时省掉 curl 的两个 8 秒超时
   if timeout 2 bash -c ">/dev/tcp/${ha}/${hp}" 2>/dev/null; then
     pr="$(hop_probe || true)"
@@ -3765,7 +3851,7 @@ landing_set() { # $1=on|off
     pr="$(hop_probe || true)"
     if [[ -z "$pr" ]]; then
       err "本地代理 $(node_hop_addr):$(node_hop_port) 不通，未开启"
-      info "Aimili 没启动或端口变了；地址端口在菜单 16 → 3 里改"
+      info "Aimili 没启动或端口变了；地址端口在菜单 13 → 3 里改"
       return 1
     fi
     lu="$(landing_uuid)"
@@ -3792,6 +3878,14 @@ landing_set() { # $1=on|off
 
   systemctl restart "$SVC_XRAY" 2>/dev/null
   sleep 2
+  # AnyTLS 落地在 sing-box 侧（独立入站 + socks 出口），Xray 重写带不上，必须单独同步
+  if proto_on anytls; then
+    if write_sb_config; then
+      systemctl restart "$SVC_SB" 2>/dev/null; sleep 1
+    else
+      warn "sing-box 配置生成失败（AnyTLS 落地可能没生效，运行 check 查看）"
+    fi
+  fi
   if svc_active "$SVC_XRAY"; then
     gen_sub >/dev/null 2>&1 || warn "订阅重建失败，运行 check 查看"
     if [[ "$want" == "on" ]]; then
@@ -3811,15 +3905,15 @@ landing_set() { # $1=on|off
   fi
 }
 
-landing_set_target() { # $@=h3 h2 ws（支持逗号分隔）
+landing_set_target() { # $@=h3 h2 ws anytls reality（支持逗号分隔）
   local t arr=() json="" i
   for t in $(printf '%s' "$*" | tr ',' ' '); do
     case "$t" in
-      h3|h2|ws|reality) arr+=("$t") ;;
-      *) err "未知入口：$t（只支持 h3 h2 ws reality）"; return 1 ;;
+      h3|h2|ws|anytls|reality) arr+=("$t") ;;
+      *) err "未知入口：$t（只支持 h3 h2 ws anytls reality）"; return 1 ;;
     esac
   done
-  [[ ${#arr[@]} -eq 0 ]] && { err "至少选一个入口（h3 h2 ws reality）"; return 1; }
+  [[ ${#arr[@]} -eq 0 ]] && { err "至少选一个入口（h3 h2 ws anytls reality）"; return 1; }
   json="["
   for (( i=0; i<${#arr[@]}; i++ )); do
     [[ $i -gt 0 ]] && json+=","
@@ -3830,16 +3924,27 @@ landing_set_target() { # $@=h3 h2 ws（支持逗号分隔）
   ok "落地入口：${arr[*]}"
 
   if landing_on; then
-    local uuid px pw
+    local uuid px pw rc=0
     uuid="$(node_get uuid)"; px="$(node_get path_xhttp)"; pw="$(node_get path_ws)"
     if write_xray_config "$uuid" "$px" "$pw"; then
       systemctl restart "$SVC_XRAY" 2>/dev/null; sleep 1
-      gen_sub >/dev/null 2>&1 || warn "订阅重建失败"
-      ok "已生效，订阅：$(landing_names)"
     else
-      err "配置生成失败，入口未改动"
-      return 1
+      err "Xray 配置生成失败，入口未改动"
+      rc=1
     fi
+    # AnyTLS 落地在 sing-box 侧，Xray 重写不会带上它，必须单独重建
+    if proto_on anytls; then
+      landing_wants anytls && fw_open tcp "$(anytls_rh_port)"
+      if write_sb_config; then
+        systemctl restart "$SVC_SB" 2>/dev/null; sleep 1
+      else
+        err "sing-box 配置生成失败（AnyTLS 落地可能没生效）"
+        rc=1
+      fi
+    fi
+    gen_sub >/dev/null 2>&1 || warn "订阅重建失败"
+    [[ $rc -eq 0 ]] && ok "已生效，订阅：$(landing_names)"
+    return $rc
   fi
 }
 
@@ -3859,10 +3964,12 @@ landing_set_proto() { # $1=socks|http
 landing_pick_target() {
   local t ans cur a=()
   printf '\n  逐项确认（直接回车 = 保留当前）\n'
-  for t in h3 h2 ws reality; do
+  for t in h3 h2 ws anytls reality; do
     if landing_wants "$t"; then cur="${C_GRN}是${C_R}"; else cur="${C_DIM}否${C_R}"; fi
-    [[ "$t" == "reality" ]] && ! proto_on reality && \
-      printf '  %s（Reality 未开启，选了暂不生效）%s\n' "$C_YEL" "$C_R"
+    case "$t" in
+      anytls)  proto_on anytls  || printf '  %s（AnyTLS 未开启，选了暂不生效）%s\n' "$C_YEL" "$C_R" ;;
+      reality) proto_on reality || printf '  %s（Reality 未开启，选了暂不生效）%s\n' "$C_YEL" "$C_R" ;;
+    esac
     read -rp "  $(printf '%-7s' "$(printf '%s' "$t" | tr '[:lower:]' '[:upper:]')") 落地？（当前 ${cur}，y/n/回车）: " ans
     case "${ans,,}" in
       y) a+=("$t") ;;
@@ -4065,6 +4172,11 @@ direct_show() {
     esac
     printf '  %-9s : %s   %s %-6s%s\n' "$p" "$on" "$kind" "$port" "$extra"
   done
+  # AnyTLS 落地：sing-box 的第二个入站，只有落地开了才有
+  if proto_on anytls && landing_on && landing_wants anytls; then
+    printf '  %-9s : %s   %s %-6s  落地家宽（独立入站）\n' \
+      "anytls-rh" "${C_GRN}开${C_R}" "TCP" "$(anytls_rh_port)"
+  fi
   # Reality 走 Xray 内核，与上面三个不同服务
   proto_on reality && on="${C_GRN}开${C_R}" || on="${C_DIM}关${C_R}"
   local rx; svc_active "$SVC_XRAY" && rx="${C_GRN}运行中${C_R}" || rx="${C_DIM}未运行${C_R}"
@@ -4082,6 +4194,7 @@ direct_show() {
   printf '\n  云安全组需放行：UDP %s（Hy2 整段）、UDP %s（TUIC）、TCP %s（AnyTLS）' \
     "$(hy2_hop)" "$(tuic_port)" "$(anytls_port)"
   proto_on reality && printf '、TCP %s（Reality）' "$(reality_port)"
+  proto_on anytls && landing_on && landing_wants anytls && printf '、TCP %s（AnyTLS-RH）' "$(anytls_rh_port)"
   printf '\n'
 }
 
@@ -4266,7 +4379,7 @@ do_cert() {
 }
 
 menu_header() {
-  local st_x st_t host
+  local st_x st_t host hop_l land_l
   if svc_active "$SVC_XRAY"; then st_x="${C_GRN}●运行${C_R}"; else st_x="${C_DIM}○停止${C_R}"; fi
   if [[ -s "$TOKEN_FILE" ]]; then
     if svc_active "$SVC_TUN"; then st_t="${C_GRN}●在线${C_R}"; else st_t="${C_YEL}○未运行${C_R}"; fi
@@ -4274,35 +4387,39 @@ menu_header() {
     st_t="${C_DIM}未配置${C_R}"
   fi
   host="$(node_get tunnel_host 2>/dev/null)"
+  if [[ "$(node_hop_mode)" == "all" ]]; then hop_l="${C_YEL}全部${C_R}"; else hop_l="${C_DIM}关闭${C_R}"; fi
+  if landing_on && [[ -n "$(landing_names)" ]]; then
+    land_l="${C_GRN}$(landing_names)${C_R}"
+  else
+    land_l="${C_DIM}关闭${C_R}"
+  fi
   printf '\n'
   printf '%s╔══════════════════════════════════════════════════╗%s\n' "$C_B$C_BLU" "$C_R"
   printf '%s║%s  argox  ·  Argo 隧道 + Xray(XHTTP/WS)  %s%-8s%s%s║%s\n' "$C_B$C_BLU" "$C_R$C_B" "$C_DIM" "v${VERSION}" "$C_R" "$C_B$C_BLU" "$C_R"
   printf '%s╚══════════════════════════════════════════════════╝%s\n' "$C_B$C_BLU" "$C_R"
   printf '  Xray %s   Tunnel %s   域名 %s\n' "$st_x" "$st_t" "${host:-${C_DIM}未设置${C_R}}"
+  printf '  直连 %s   跳板 %s   落地 %s\n' "$(proto_label_short)" "$hop_l" "$land_l"
   printf '%s\n' "──────────────────────────────────────────────────"
 }
 
 menu_main() {
-  local hop_label landing_label
   while true; do
-    if [[ "$(node_hop_mode)" == "all" ]]; then hop_label="${C_YEL}全部${C_R}"; else hop_label="关闭"; fi
-    if landing_on; then landing_label="${C_GRN}$(landing_names)${C_R}"; else landing_label="关闭"; fi
     menu_header
     cat <<'EOF'
-   1) 安装 / 重新部署           9) 系统优化（BBR / 重启 / 日志）
-   2) 启动                     10) 清理缓存
-   3) 停止                     11) 备份配置
-   4) 重启                     12) 卸载
-   5) 查看状态                 13) 隧道设置（Token / 域名 / 测试）
-   6) 查看日志                 14) 优选 IP（导入本机测速结果）
-   7) 更新到最新版             15) 订阅地址 / 二维码
+   1) 安装 / 重新部署           9) 更换 UUID
+   2) 启动                     10) 升级配置（补字段）
+   3) 停止                     11) 隧道设置（Token / 域名 / 测试）
+   4) 重启                     12) 优选 IP（导入测速结果）
+   5) 查看状态                 13) 出口跳板
+   6) 查看日志                 14) 直连协议（Hy2/TUIC/AnyTLS/Reality）
+   7) 更新到最新版             15) 住宅落地
+   8) 自检 check               16) 订阅地址 / 二维码
+   17) 系统优化                18) 清理缓存
+   19) 备份配置                20) 卸载
 EOF
-    printf '   8) 更换 UUID（用户名/密码）    16) 出口跳板（%s）\n' "$hop_label"
-    printf '  17) 自检 check                18) 升级配置（补字段）\n'
-    printf '  19) 住宅落地（%s）\n' "$landing_label"
-    printf '  20) 直连协议（%s）\n' "$(proto_label)"
     printf '\n    0) 退出\n'
     printf '%s\n' "──────────────────────────────────────────────────"
+    printf '  %s左列＝常用动作，右列＝配置项；菜单已重排（自检→8 隧道→11 直连→14 落地→15）%s\n' "$C_DIM" "$C_R"
     read -rp "  请选择: " choice
     case "${choice:-}" in
       1)  do_install ;;
@@ -4312,19 +4429,19 @@ EOF
       5)  do_status ;;
       6)  do_logs ;;
       7)  do_update ;;
-      8)  do_change_uuid ;;
-      9)  do_sysopt ;;
-      10) do_clean ;;
-      11) do_backup ;;
-      12) do_uninstall ;;
-      13) do_tunnel_setup ;;
-      14) menu_ips ;;
-      15) show_nodes ;;
-      16) do_hop ;;
-      17) do_check ;;
-      18) do_upgrade ;;
-      19) do_landing ;;
-      20) do_direct ;;
+      8)  do_check ;;
+      9)  do_change_uuid ;;
+      10) do_upgrade ;;
+      11) do_tunnel_setup ;;
+      12) menu_ips ;;
+      13) do_hop ;;
+      14) do_direct ;;
+      15) do_landing ;;
+      16) show_nodes ;;
+      17) do_sysopt ;;
+      18) do_clean ;;
+      19) do_backup ;;
+      20) do_uninstall ;;
       0|q|Q) printf '\n  再见\n\n'; exit 0 ;;
       *) warn "无效选项：${choice:-<空>}" ;;
     esac
@@ -4371,17 +4488,17 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 nodes        打印订阅地址 + 二维码
   bash $0 links        打印单节点链接
   bash $0 sub          输出 Base64 订阅内容
-  bash $0 ips          从 IP 源拉取并校验（菜单 14）
+  bash $0 ips          从 IP 源拉取并校验（菜单 12）
   bash $0 ips <链接>   从你本机测速结果导入（保序不重排，也可填本地文件路径）
-  bash $0 hop          出口跳板状态（菜单 16）
+  bash $0 hop          出口跳板状态（菜单 13）
   bash $0 hop on       全部流量走本地代理（自动探测 socks/http）
   bash $0 hop off      关闭跳板，流量从 VPS 本机出口出去
-  bash $0 landing      住宅落地状态（菜单 19）
+  bash $0 landing      住宅落地状态（菜单 15）
   bash $0 landing on   给 -RH 节点挂住宅落地（需本地代理可用）
   bash $0 landing off  关闭落地
-  bash $0 landing target h3,h2,reality   选择落地作用入口
+  bash $0 landing target h3,anytls,reality  选择落地作用入口
   bash $0 landing proto socks|http  落地出口协议
-  bash $0 direct       直连协议状态（Hy2 / TUIC / AnyTLS / Reality，菜单 20）
+  bash $0 direct       直连协议状态（Hy2 / TUIC / AnyTLS / Reality，菜单 14）
   bash $0 direct on all   一次开启 Hy2 + TUIC + AnyTLS + Reality（推荐）
   bash $0 direct on hy2    开启 Hy2（自动装 sing-box + 自签证书）
   bash $0 direct off tuic  关闭 TUIC

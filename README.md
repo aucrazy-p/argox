@@ -31,23 +31,27 @@ bash /root/argox.sh
 
 ## 菜单
 
+左列是常用动作，右列是配置项：
+
 ```
- 1) 安装 / 重新部署        10) 清理缓存
- 2) 启动                  11) 备份配置
- 3) 停止                  12) 卸载
- 4) 重启                  13) 隧道设置
- 5) 查看状态              14) 优选 IP（导入本机测速结果）
- 6) 查看日志              15) 订阅地址
- 7) 更新到最新版          16) 出口跳板
- 8) 更换 UUID             17) 自检 check
- 9) 系统优化              18) 升级配置（补字段）
-                          19) 住宅落地
-                          20) 直连协议（Hy2 / TUIC / AnyTLS / Reality）
+   1) 安装 / 重新部署           9) 更换 UUID
+   2) 启动                     10) 升级配置（补字段）
+   3) 停止                     11) 隧道设置（Token / 域名 / 测试）
+   4) 重启                     12) 优选 IP（导入测速结果）
+   5) 查看状态                 13) 出口跳板
+   6) 查看日志                 14) 直连协议（Hy2/TUIC/AnyTLS/Reality）
+   7) 更新到最新版             15) 住宅落地
+   8) 自检 check               16) 订阅地址 / 二维码
+   17) 系统优化                18) 清理缓存
+   19) 备份配置                20) 卸载
 ```
+
+> v2.6.0 重排过编号：自检 check 从 17 → **8**，隧道设置 13 → **11**，
+> 直连协议 20 → **14**，住宅落地 19 → **15**，优选 IP 14 → **12**，出口跳板 16 → **13**。
 
 ## 订阅
 
-安装后菜单 15 输出订阅地址：
+安装后菜单 16 输出订阅地址：
 
 ```
 https://<订阅子域>/<订阅令牌>
@@ -71,7 +75,7 @@ Reality     直连 VPS，TCP，Xray 内核（默认关，纯 Xray 客户端用�
 留着只会干扰选择。
 
 地址都写域名，由客户端自行解析到最近的 CF 节点。
-需要按 IP 展开时，先用下面的「优选 IP」把列表准备好，再菜单 13 → `6) 节点地址模式` 切成 `ip`。
+需要按 IP 展开时，先用下面的「优选 IP」把列表准备好，再菜单 11 → `6) 节点地址模式` 切成 `ip`。
 直连协议（Hy2 / TUIC / AnyTLS / Reality）不受地址模式影响，永远写 VPS 公网 IP。
 
 ## 优选 IP（两条路，别搞混）
@@ -91,7 +95,7 @@ bash argox.sh ips https://gist.githubusercontent.com/.../raw/result.csv
 bash argox.sh ips /root/result.csv      # 也可以直接给本机路径
 ```
 
-或者菜单 14 → `6) 从链接导入`。把 cfst 跑出来的 CSV 传到任意能直链打开的网页
+或者菜单 12 → `6) 从链接导入`。把 cfst 跑出来的 CSV 传到任意能直链打开的网页
 （Gist 要用 **raw** 地址），脚本会：
 
 1. 只取第一列，兼容这几种（都实测过）：cfst 的逗号 CSV、**Excel 里直接复制出来的
@@ -106,7 +110,7 @@ bash argox.sh ips /root/result.csv      # 也可以直接给本机路径
 > 只差 QUIC / TCP）。列表里第 5 个往后的 IP 会被存下来但不进订阅，避免节点爆炸。
 > 想要更多可以在脚本里改 `MAX_H3_NODES` / `MAX_H2_NODES`。
 
-**另一条：社区列表**（菜单 14 → 3 拉取校验）。会按源备注里的运营商和 `ms`/`MB·s⁻¹`
+**另一条：社区列表**（菜单 12 → 3 拉取校验）。会按源备注里的运营商和 `ms`/`MB·s⁻¹`
 排序——但那些数字是列表作者在自己网络测的，**跟你的线路无关**，仅供兜底。
 
 ## 直连协议（Hy2 / TUIC / AnyTLS / Reality）
@@ -114,7 +118,7 @@ bash argox.sh ips /root/result.csv      # 也可以直接给本机路径
 不走 Cloudflare，直接连 VPS 公网端口。CF 线路差的时候这是主力。
 
 ```bash
-bash argox.sh direct               # 状态 + 交互菜单（菜单 20）
+bash argox.sh direct               # 状态 + 交互菜单（菜单 14）
 bash argox.sh direct on all        # 一次开启 Hy2 + TUIC + AnyTLS + Reality（推荐）
 bash argox.sh direct on hy2
 bash argox.sh direct off tuic
@@ -136,6 +140,7 @@ bash argox.sh cert gen --force     # 重签
 | Hy2 | `23000-27000`（整段） | UDP |
 | TUIC | `30001` | UDP |
 | AnyTLS | `8445` | TCP |
+| AnyTLS-RH | `8446` | TCP（落地开启时才有） |
 | Reality | `8443` | TCP（默认关，不开不监听） |
 
 Hy2 的端口跳跃靠 nftables 的 `redirect` 实现，sing-box 实际只监听 `23000` 一个口，
@@ -158,7 +163,7 @@ Hy2 的端口跳跃靠 nftables 的 `redirect` 实现，sing-box 实际只监听
 - 伪装目标默认 `www.lovelive-anime.jp:443`（CloudFront 托管，证书链固定 3821 字节）
 - 首次开启自动用 `xray x25519` 生成密钥对，写入 `node.json`，之后不再变动
 - 走 `xtls-rprx-vision` 流控，Throne / v2rayN 7.x / v2rayNG / sing-box 都支持
-- 想要「Reality 也走家宽」：菜单 19 勾上 `REALITY`，订阅末尾会多一条 `Reality-RH`
+- 想要「Reality 也走家宽」：菜单 15 勾上 `REALITY`，订阅末尾会多一条 `Reality-RH`
   （同一个 8443 入站的第二个 UUID，不占新端口）
 
 **伪装目标为什么不能随便选**：Xray 对目标站证书的 TLS 记录有 **8192 字节硬编码上限**，
@@ -234,9 +239,9 @@ VPS 上装了住宅 IP / 商业 VPN 客户端（如 AimiliVPN），并提供本�
 
 ```bash
 bash argox.sh landing                   # 状态 + 交互菜单
-bash argox.sh landing on                # 开启（多出 Argo-H3-RH / Argo-H2-RH）
+bash argox.sh landing on                # 开启（默认多出 Argo-H3-RH / AnyTLS-RH）
 bash argox.sh landing off               # 关闭
-bash argox.sh landing target h3,h2,ws   # 选择哪些入口带落地版
+bash argox.sh landing target h3,anytls  # 选择哪些入口带落地版（h3/h2/ws/anytls/reality）
 bash argox.sh landing proto socks|http  # 落地出口协议
 ```
 
@@ -250,8 +255,18 @@ bash argox.sh landing proto socks|http  # 落地出口协议
 
 两者可以同时开：落地路由规则排在跳板兜底规则之前，跳板开着也不会污染 `-RH` 节点。
 
-实现上不额外开端口、不额外加入站——同一条隧道挂第二个 UUID，
-靠 Xray 的路由 `user` 条件分流到本地代理出口。`-RH` 节点永远排在订阅最后。
+实现分两条链路，`-RH` 节点永远排在订阅最后：
+
+| 入口 | 实现方式 | 端口 |
+|---|---|---|
+| `h3` / `h2` / `ws` / `reality` | Xray 同一条入站挂第二个 UUID，路由按 `user` 条件分流 | 复用原端口 |
+| `anytls` | sing-box **独立入站** `anytls-rh-in` + `socks` 出口 + 路由规则 | `8446`（主口 +1） |
+
+AnyTLS 之所以要独立端口：sing-box 的入站无法按「用户」分流，只能按入站分流。
+它也是**唯一能做落地版的直连协议**——Hy2 / TUIC 是 UDP，本地代理不支持 UDP ASSOCIATE。
+
+默认 `target` 是 `h3 + anytls`：H2 与 H3 同走 CF，再给 H2 一个落地版意义不大；
+AnyTLS 是 TCP 兜底，配上家宽出口更实用。
 
 ## 命令行
 
@@ -263,7 +278,7 @@ bash argox.sh sub        # Base64 订阅内容
 bash argox.sh ips                      # 从社区源拉取并校验
 bash argox.sh ips <链接|文件>           # 导入本机测速结果（保序，不重排）
 bash argox.sh hop on     # 出口跳板（off / on [socks|http]）
-bash argox.sh landing on # 住宅落地（off / status / target h3,h2,ws）
+bash argox.sh landing on # 住宅落地（off / status / target h3,anytls）
 bash argox.sh direct on all # 直连协议（status / on|off hy2|tuic|anytls|all）
 bash argox.sh hy2 hop 23000-27000 # Hy2 端口跳跃段
 bash argox.sh cert       # 自签证书（show / gen [--force]）
