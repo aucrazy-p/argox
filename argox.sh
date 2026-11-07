@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.6.0"
+VERSION="2.6.1"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -2870,7 +2870,7 @@ do_sysopt() {
   printf '  1) 全套优化（BBR + fq + 端口范围 + 文件句柄）\n'
   printf '  2) 仅检查当前状态\n'
   printf '  3) 设置 MTU 1400（QUIC 大包分片问题时用）\n'
-  printf '  4) 重启策略（systemd 自动拉起）\n'
+  printf '  4) 开机自启（Xray / 隧道 / 订阅 / sing-box）\n'
   printf '  5) 日志轮转（限制 xray/cloudflared 日志体积）\n'
   printf '  0) 返回\n'
   local c; read -rp "  选择: " c
@@ -2889,8 +2889,18 @@ do_sysopt() {
       printf '  持久化：echo "MTU=1400" >> /etc/network/interfaces.d/50-cloud-init\n'
       ;;
     4)
-      systemctl enable "$SVC_XRAY" >/dev/null 2>&1 && ok "Xray 已设为开机自启"
-      [[ -s "$TOKEN_FILE" ]] && systemctl enable "$SVC_TUN" >/dev/null 2>&1 && ok "隧道已设为开机自启"
+      # 原来叫「重启策略」，但 service 文件里本来就写了 Restart=always，
+      # 这一步实际只是 enable（开机拉起）。改名并补上订阅 / sing-box 两个服务。
+      local s cnt=0
+      for s in "$SVC_XRAY" "$SVC_TUN" "$SVC_SUB" "$SVC_SB"; do
+        svc_exists "$s" || { info "${s} 未创建，跳过"; continue; }
+        if systemctl enable "$s" >/dev/null 2>&1; then
+          ok "${s} 已设为开机自启"; cnt=$((cnt+1))
+        else
+          err "${s} 设置开机自启失败"
+        fi
+      done
+      [[ $cnt -gt 0 ]] && info "崩溃自动拉起由 service 内的 Restart=always 负责，无需额外设置"
       ;;
     5)
       cat > /etc/logrotate.d/argox <<'EOF'
@@ -4198,14 +4208,90 @@ direct_show() {
   printf '\n'
 }
 
+# 批量切换（on all / off all）：四个开关一次写完，配置只重建一次、服务只重启一次。
+# 旧实现是 for 循环逐个调 direct_switch，代价是 sing-box 重启 3 次、nft 跳跃表
+# 重建 3 次、ufw/iptables 全端口重复放行 3 轮、Xray 重启 1 次、订阅重建 4 次，
+# 外加「证书已存在」刷 6 遍。中途某步失败还会留下半开半关的中间态。
+direct_all() { # $1=on|off
+  local act="$1" v=false rc=0 links nlink skip_r=0
+  [[ "$act" == "on" ]] && v=true
+
+  # 旧值留存，失败时整体回滚
+  local o_hy2 o_tuic o_anytls o_reality
+  o_hy2="$(proto_on hy2 && echo true || echo false)"
+  o_tuic="$(proto_on tuic && echo true || echo false)"
+  o_anytls="$(proto_on anytls && echo true || echo false)"
+  o_reality="$(proto_on reality && echo true || echo false)"
+
+  if [[ "$v" == "true" ]]; then
+    step "批量开启直连协议（Hy2 + TUIC + AnyTLS + Reality）"
+    install_singbox || return 1
+    # Reality 走 Xray 内核，与 sing-box 三件套互不影响：密钥拿不到就只跳过它，
+    # 别把 Hy2 / TUIC / AnyTLS 一起拖死（旧实现是逐个 try，单个失败不影响其他）
+    reality_keys || { warn "Reality 密钥不可用，本次跳过 Reality（Hy2/TUIC/AnyTLS 照常开启）"; skip_r=1; }
+    # 证书不在这里生成：交给 sb_sync 一次做完（否则会重复打印「证书已存在」）
+  else
+    step "批量关闭直连协议"
+  fi
+
+  node_jset proto.hy2     "$v" || { err "写入 node.json 失败"; return 1; }
+  node_jset proto.tuic    "$v" || { err "写入 node.json 失败"; return 1; }
+  node_jset proto.anytls  "$v" || { err "写入 node.json 失败"; return 1; }
+  node_jset proto.reality "$([[ $skip_r -eq 1 ]] && echo false || echo "$v")" \
+    || { err "写入 node.json 失败"; return 1; }
+
+  # ---- sing-box 侧：Hy2 / TUIC / AnyTLS 一次重建（含证书、nft 跳跃、防火墙）----
+  if ! sb_sync; then
+    err "sing-box 重建失败，四个开关已整体回滚"
+    node_jset proto.hy2     "${o_hy2:-false}"     >/dev/null 2>&1 || true
+    node_jset proto.tuic    "${o_tuic:-false}"    >/dev/null 2>&1 || true
+    node_jset proto.anytls  "${o_anytls:-false}"  >/dev/null 2>&1 || true
+    node_jset proto.reality "${o_reality:-false}" >/dev/null 2>&1 || true
+    sb_sync >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # ---- Xray 侧：Reality 入站的增删（Reality 被跳过时无需动 Xray）----
+  if [[ $skip_r -eq 1 ]]; then
+    rc=1                                   # 部分成功：三个已开，Reality 未开
+  elif ! reality_apply; then
+    err "Xray 侧失败，reality 开关已回滚；sing-box 侧保持已生效"
+    node_jset proto.reality "${o_reality:-false}" >/dev/null 2>&1 || true
+    reality_apply >/dev/null 2>&1 || true
+    rc=1
+  fi
+
+  gen_sub >/dev/null 2>&1 || warn "订阅重建失败，跑 check 查看"
+  links="$(build_links 2>/dev/null)"
+  nlink="$(grep -c . <<< "$links" 2>/dev/null || true)"
+
+  printf '\n'
+  if [[ "$v" == "true" ]]; then
+    local rmark="✓" rcol="$C_GRN" rnote="伪装 $(reality_sni)"
+    [[ $rc -ne 0 ]] && { rmark="✗"; rcol="$C_RED"; }   # reality 那行如实标红，不假报成功
+    [[ $skip_r -eq 1 ]] && rnote="未开启（密钥不可用，已跳过）"
+    printf '  %s✓%s %-9s %s %-6s %s\n' "$C_GRN" "$C_R" "$NAME_HY2"     "UDP" "$(hy2_port)"    "跳跃 $(hy2_hop)"
+    printf '  %s✓%s %-9s %s %-6s %s\n' "$C_GRN" "$C_R" "$NAME_TUIC"    "UDP" "$(tuic_port)"   "备选"
+    printf '  %s✓%s %-9s %s %-6s %s\n' "$C_GRN" "$C_R" "$NAME_ANYTLS"  "TCP" "$(anytls_port)" "UDP 全灭时的出路"
+    printf '  %s%s%s %-9s %s %-6s %s\n' "$rcol" "$rmark" "$C_R" "$NAME_REALITY" "TCP" "$(reality_port)" "$rnote"
+    info "配置只重建 1 轮：sing-box 重启 1 次、Xray 重启 1 次（原来各 3 次 / 6 次）"
+    info "订阅已重建 ${nlink:-0} 条；客户端需重连一次才生效"
+    info "云安全组放行 UDP $(hy2_hop) / UDP $(tuic_port) / TCP $(anytls_port) / TCP $(reality_port)"
+  elif [[ $rc -eq 0 ]]; then
+    ok "Hy2 / TUIC / AnyTLS / Reality 全部关闭（sing-box 已停止，nft 跳跃表已清空）"
+  else
+    warn "四个开关已置 false，但 Xray 侧重建失败，跑 check 确认 reality 入站是否已摘除"
+  fi
+  return $rc
+}
+
 direct_switch() { # $1=on|off  $2=hy2|tuic|anytls|reality|all
   local act="$1" name="$2" v=false
   case "$name" in
     hy2|tuic|anytls|reality) : ;;
     all)
-      local p rc=0
-      for p in hy2 tuic anytls reality; do direct_switch "$act" "$p" || rc=1; done
-      return $rc ;;
+      direct_all "$act"
+      return $? ;;
     *) err "指定协议：hy2 / tuic / anytls / reality / all"; return 1 ;;
   esac
   [[ "$act" == "on" ]] && v=true
@@ -4233,7 +4319,7 @@ direct_switch() { # $1=on|off  $2=hy2|tuic|anytls|reality|all
 
   if [[ "$v" == "true" ]]; then
     install_singbox || return 1
-    cert_gen || return 1
+    # 证书由 sb_sync 内部生成，这里不再调 cert_gen，避免同一个流程打印两遍
   elif ! [[ -x "$SB_BIN" ]]; then
     info "${name} 本来就是关闭状态，无需操作"
     return 0

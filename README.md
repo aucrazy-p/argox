@@ -119,7 +119,7 @@ bash argox.sh ips /root/result.csv      # 也可以直接给本机路径
 
 ```bash
 bash argox.sh direct               # 状态 + 交互菜单（菜单 14）
-bash argox.sh direct on all        # 一次开启 Hy2 + TUIC + AnyTLS + Reality（推荐）
+bash argox.sh direct on all        # 一次开启四个协议（推荐）：四个开关一次写完，sing-box / Xray 各只重启 1 次
 bash argox.sh direct on hy2
 bash argox.sh direct off tuic
 bash argox.sh direct on reality    # Xray 内核，默认关；纯 Xray 客户端（v2rayN 6.x）用它
