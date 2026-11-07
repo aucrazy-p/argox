@@ -1455,7 +1455,14 @@ sort_cand() {
 
 manual_ips() {
   require_root
-  printf '\n  粘贴 IP（一行一个，可带 :443 和 # 备注），空行结束：\n'
+  cat <<'EOF'
+
+  直接粘贴，空行结束。以下三种都认：
+    · 纯 IP 一行一个
+    · 从 Excel / WPS 复制的整张表格（含表头，Tab 分隔，地区码会保留成节点后缀）
+    · IP#移动 这种带备注的
+EOF
+  printf '  > '
   local tmpd; tmpd="$(mktemp -d)"
   local line
   : > "${tmpd}/in"
@@ -1463,12 +1470,25 @@ manual_ips() {
     [[ -z "${line//[[:space:]]/}" ]] && break
     printf '%s\n' "$line" >> "${tmpd}/in"
   done
-  parse_ipfile < "${tmpd}/in" | awk -F'\t' '!seen[$1]++' | cut -f1 > "$IPSF"
-  rm -rf "$tmpd"
-  local n; n="$(wc -l < "$IPSF" | tr -d ' ')"
-  [[ "${n:-0}" -eq 0 ]] && { warn "没有解析到有效 IP，保留原有列表"; return 1; }
+  local keptf="${tmpd}/kept"
+  parse_ipfile < "${tmpd}/in" | awk -F'\t' '!seen[$1]++' > "$keptf"
+  local n; n="$(wc -l < "$keptf" | tr -d ' ')"
+  if [[ "${n:-0}" -eq 0 ]]; then
+    rm -rf "$tmpd"
+    warn "没有解析到有效 IP，保留原有列表"
+    return 1
+  fi
+
+  cut -f1 "$keptf" > "$IPSF"
   : > "$IPMETA"
-  ok "已保存 ${n} 个 IP（未校验）"
+  local ip1 note1
+  while IFS=$'\t' read -r ip1 note1; do
+    printf '%s\t%s\n' "$ip1" "$(note_isp_label "$note1")" >> "$IPMETA"
+  done < "$keptf"
+  rm -rf "$tmpd"
+
+  ok "已保存 ${n} 个 IP（未校验，保持粘贴顺序）"
+  awk -F'\t' '{printf "    %-16s %s\n", $1, $2}' "$IPMETA"
 }
 
 update_ips() {
