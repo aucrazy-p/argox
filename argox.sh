@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.3.3"
+VERSION="2.4.0"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -54,6 +54,8 @@ DEF_PORT_SUB=8099       # 仅本机，订阅服务
 DEF_PORT_HY2=23000      # Hy2 实监听端口（UDP）——取跳跃段首
 DEF_PORT_TUIC=30001     # TUIC 监听端口（UDP）
 DEF_PORT_ANYTLS=8445    # AnyTLS 监听端口（TCP）——UDP 全灭时的唯一出路
+DEF_PORT_REALITY=8443   # Reality 监听端口（TCP）——Xray 内核，默认关
+REALITY_SNI="www.microsoft.com"   # Reality 伪装目标（须 TLS1.3 + H2，且 VPS 可直连 443）
 DEF_HOP_RANGE="23000-27000"   # Hy2 端口跳跃段，默认不含 RustDesk(21115-21119) 等常用服务段
 SB_VER_DEFAULT="1.12.0"       # sing-box 默认版本
 
@@ -384,7 +386,7 @@ landing_on() { [[ "$(node_jget landing.enabled 2>/dev/null)" == "true" ]]; }
 
 landing_uuid() { node_jget landing.uuid 2>/dev/null; }
 
-landing_targets() { node_jget landing.target 2>/dev/null; }   # 空格分隔：h3 h2 ws
+landing_targets() { node_jget landing.target 2>/dev/null; }   # 空格分隔：h3 h2 ws reality
 
 # 落地出口协议：没单独设置就沿用跳板的（指向同一台代理）
 landing_proto() {
@@ -411,6 +413,58 @@ hy2_port() { local p; p="$(node_jget hy2.port 2>/dev/null)"; printf '%s' "${p:-$
 hy2_hop()  { local h; h="$(node_jget hy2.hop  2>/dev/null)"; printf '%s' "${h:-$DEF_HOP_RANGE}"; }
 tuic_port() { local p; p="$(node_jget tuic.port 2>/dev/null)"; printf '%s' "${p:-$DEF_PORT_TUIC}"; }
 anytls_port() { local p; p="$(node_jget anytls.port 2>/dev/null)"; printf '%s' "${p:-$DEF_PORT_ANYTLS}"; }
+
+# ---- Reality（Xray 内核）参数 ------------------------------------------------
+reality_port() { local p; p="$(node_jget reality.port 2>/dev/null)"; printf '%s' "${p:-$DEF_PORT_REALITY}"; }
+reality_sni()  { local s; s="$(node_jget reality.sni 2>/dev/null)";  printf '%s' "${s:-$REALITY_SNI}"; }
+reality_sid()  { node_jget reality.short_id 2>/dev/null; }
+reality_pk()   { node_jget reality.private_key 2>/dev/null; }
+reality_pub()  { node_jget reality.public_key 2>/dev/null; }
+
+# 生成 / 补齐 Reality 密钥对（x25519）与 shortId；已有则不动
+reality_keys() {
+  local pk pub sid out
+  pk="$(reality_pk)"; pub="$(reality_pub)"; sid="$(reality_sid)"
+
+  if [[ -z "$pk" || -z "$pub" ]]; then
+    [[ -x "$XRAY_BIN" ]] || { err "Xray 未安装，无法生成 Reality 密钥"; return 1; }
+    out="$("$XRAY_BIN" x25519 2>/dev/null)"
+    # 不同 Xray 版本标签不一样（Private key / PrivateKey、Password / Public key），
+    # 按行取比按标签匹配稳：第 1 行私钥，第 2 行公钥
+    pk="$(printf '%s\n' "$out" | sed -n '1s/.*: *//p' | tr -d '[:space:]')"
+    pub="$(printf '%s\n' "$out" | sed -n '2s/.*: *//p' | tr -d '[:space:]')"
+    if [[ -z "$pk" || -z "$pub" ]]; then
+      err "生成 Reality 密钥失败（xray x25519 无输出，检查 Xray 版本是否 ≥ 1.8）"
+      return 1
+    fi
+    node_jset reality.private_key "\"$pk\"" >/dev/null 2>&1 || true
+    node_jset reality.public_key  "\"$pub\"" >/dev/null 2>&1 || true
+    ok "Reality 密钥已生成（x25519）"
+  fi
+
+  if [[ -z "$sid" ]]; then
+    sid="$(rand_hex 8)"
+    node_jset reality.short_id "\"$sid\"" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# Reality 改动后的落地动作：重写 Xray 配置 → 重启 → 放行端口 → 重建订阅
+reality_apply() {
+  local uuid px pw
+  uuid="$(node_get uuid)"; px="$(node_get path_xhttp)"; pw="$(node_get path_ws)"
+  write_xray_config "$uuid" "$px" "$pw" || return 1
+  systemctl restart "$SVC_XRAY" 2>/dev/null
+  sleep 1
+  if ! svc_active "$SVC_XRAY"; then
+    err "Xray 重启失败："
+    journalctl -u "$SVC_XRAY" -n 15 --no-pager 2>/dev/null | tail -15
+    return 1
+  fi
+  proto_on reality && fw_open tcp "$(reality_port)"
+  gen_sub >/dev/null 2>&1 || warn "订阅重建失败"
+  return 0
+}
 
 # Hy2 / AnyTLS 密码直接复用主 UUID：少一个字段，就少一处漂移
 hy2_pass() { node_get uuid; }
@@ -821,6 +875,7 @@ fw_open_direct() {
   proto_on hy2    && fw_open udp "$(hy2_hop)"
   proto_on tuic   && fw_open udp "$(tuic_port)"
   proto_on anytls && fw_open tcp "$(anytls_port)"
+  proto_on reality && fw_open tcp "$(reality_port)"
   return 0
 }
 
@@ -889,8 +944,8 @@ proto_label() {
 write_xray_config() {
   local uuid="$1" px="$2" pw="$3"
 
-  # ---- 住宅落地：两个入站各按 target 决定是否挂第二个 UUID ----
-  local use_landing=0 luuid="" x_land=0 w_land=0
+  # ---- 住宅落地：各入站按 target 决定是否挂第二个 UUID ----
+  local use_landing=0 luuid="" x_land=0 w_land=0 r_land=0
   if landing_on; then
     luuid="$(landing_uuid)"
     if [[ -n "$luuid" ]]; then
@@ -898,6 +953,8 @@ write_xray_config() {
       landing_wants h3 && x_land=1
       landing_wants h2 && x_land=1
       landing_wants ws && w_land=1
+      # Reality-RH 还要求 Reality 本身开着，否则入站不存在
+      proto_on reality && landing_wants reality && r_land=1
     fi
   fi
 
@@ -911,6 +968,43 @@ write_xray_config() {
     wclients="[{ \"id\": \"${uuid}\" }, { \"id\": \"${luuid}\", \"email\": \"landing\" }]"
   else
     wclients="[{ \"id\": \"${uuid}\" }]"
+  fi
+
+  # ---- Reality 入站（Xray 内核，默认关；与 sing-box 无关）----
+  local reality_in=""
+  if proto_on reality; then
+    local rp rs rk rsid rclients
+    rp="$(reality_port)"; rs="$(reality_sni)"; rk="$(reality_pk)"; rsid="$(reality_sid)"
+    if [[ -z "$rk" || -z "$rsid" ]]; then
+      err "Reality 密钥 / shortId 缺失，先执行 reality_keys（或重开一次 Reality）"
+      return 1
+    fi
+    if [[ $r_land -eq 1 ]]; then
+      rclients="[{ \"id\": \"${uuid}\", \"flow\": \"xtls-rprx-vision\" }, { \"id\": \"${luuid}\", \"flow\": \"xtls-rprx-vision\", \"email\": \"landing\" }]"
+    else
+      rclients="[{ \"id\": \"${uuid}\", \"flow\": \"xtls-rprx-vision\" }]"
+    fi
+    reality_in=",
+    {
+      \"tag\": \"reality\",
+      \"listen\": \"0.0.0.0\",
+      \"port\": ${rp},
+      \"protocol\": \"vless\",
+      \"settings\": { \"clients\": ${rclients}, \"decryption\": \"none\" },
+      \"streamSettings\": {
+        \"network\": \"tcp\",
+        \"security\": \"reality\",
+        \"realitySettings\": {
+          \"show\": false,
+          \"dest\": \"${rs}:443\",
+          \"xver\": 0,
+          \"serverNames\": [\"${rs}\"],
+          \"privateKey\": \"${rk}\",
+          \"shortIds\": [\"${rsid}\"]
+        }
+      },
+      \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\",\"tls\",\"quic\"], \"routeOnly\": true }
+    }"
   fi
 
   # 出站与路由：跳板开启时把 hop 放在第一位（成为默认出口）
@@ -929,7 +1023,7 @@ write_xray_config() {
 
   # 落地出站追加在最后：不改变 outbounds[0]，默认出口仍然是 direct / hop
   # 落地路由插在最前：确保比 hop 的兜底规则先匹配，跳板开着也不污染落地节点
-  if [[ $use_landing -eq 1 && ( $x_land -eq 1 || $w_land -eq 1 ) ]]; then
+  if [[ $use_landing -eq 1 && ( $x_land -eq 1 || $w_land -eq 1 || $r_land -eq 1 ) ]]; then
     local lp la lport
     lp="$(landing_proto)"; la="$(node_hop_addr)"; lport="$(node_hop_port)"
     ob_json="${ob_json},
@@ -971,7 +1065,7 @@ ${rt_json}"
         "wsSettings": { "path": "${pw}" }
       },
       "sniffing": { "enabled": true, "destOverride": ["http","tls"], "routeOnly": true }
-    }
+    }${reality_in}
   ],
   "outbounds": [
 ${ob_json}
@@ -1794,6 +1888,12 @@ emit_direct_links() {
     printf 'anytls://%s@%s:%s?security=tls&sni=%s&insecure=1&allowInsecure=1#%s\n' \
       "$apw" "$ip" "$ap" "$sni" "$NAME_ANYTLS"
   fi
+
+  # Reality：Xray 内核，不用证书；纯 Xray 客户端（v2rayN 6.x 等）不支持 AnyTLS 时的替代
+  if proto_on reality; then
+    printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
+      "$(node_get uuid)" "$ip" "$(reality_port)" "$(reality_sni)" "$(reality_pub)" "$(reality_sid)" "$NAME_REALITY"
+  fi
 }
 
 # 落地家宽节点（-RH）：地址固定用域名，永远排在订阅最后。
@@ -1804,7 +1904,7 @@ emit_landing_links() { # $1=host $2=ws_host $3=ex $4=enc_pw
   local lu; lu="$(landing_uuid)"
   [[ -z "$lu" ]] && return 0
   local t
-  for t in h3 h2 ws; do
+  for t in h3 h2 ws reality; do
     landing_wants "$t" || continue
     case "$t" in
       h3) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s%s\n' \
@@ -1813,6 +1913,12 @@ emit_landing_links() { # $1=host $2=ws_host $3=ex $4=enc_pw
             "$lu" "$host" "$host" "$ex" "$host" "$NAME_H2" "$NAME_RH" ;;
       ws) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#%s%s\n' \
             "$lu" "$ws_host" "$ws_host" "$enc_pw" "$ws_host" "$NAME_WS" "$NAME_RH" ;;
+      reality)
+        # Reality 走 VPS 公网 IP，与 Argo 域名无关；协议本身没开就没有这条
+        proto_on reality || continue
+        printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s%s\n' \
+              "$lu" "$(vps_ip)" "$(reality_port)" "$(reality_sni)" "$(reality_pub)" "$(reality_sid)" \
+              "$NAME_REALITY" "$NAME_RH" ;;
     esac
   done
 }
@@ -1835,7 +1941,7 @@ build_links() {
   # ⚠ 节点顺序约定（客户端按订阅里的先后显示，不要随意打乱）：
   #    1) Argo 两条：H3 → H2（同一入站，只差 ALPN；UDP 挂时靠 H2 兜底）
   #    2) 直连 UDP：Hy2 → TUIC（直连 VPS，不经 CF）
-  #    3) 直连 TCP：Reality → AnyTLS（阶段 4，默认关）
+  #    3) 直连 TCP：AnyTLS → Reality（AnyTLS 默认开＝主力兜底；Reality 默认关，给纯 Xray 客户端）
   #    4) 落地家宽（-RH）全部追加在最后
   # 理由：默认出口的节点排前面，-RH 是特殊用途，放末尾不干扰日常切换。
   # WS 已下线：它与 H2 同为 TCP 443，路径完全重叠，属于下位替代，留着只会干扰选择。
@@ -2288,7 +2394,7 @@ PY
   "landing": { "enabled": false, "uuid": "", "target": ["h3", "h2"] },
   "hy2":     { "port": ${DEF_PORT_HY2}, "hop": "${DEF_HOP_RANGE}", "obfs": false, "up": 50, "down": 300 },
   "tuic":    { "port": 30001, "password": "", "cc": "bbr" },
-  "reality": { "port": 8443, "sni": "www.microsoft.com", "short_id": "" },
+  "reality": { "port": ${DEF_PORT_REALITY}, "sni": "${REALITY_SNI}", "short_id": "", "private_key": "", "public_key": "" },
   "anytls":  { "port": 8445, "password": "" },
   "cert":    { "sni": "${host}", "path": "${BASE}/cert" },
   "installed_at": "$(date -Iseconds)",
@@ -3015,7 +3121,13 @@ PY
     else
       ck_err "落地已开启但 UUID 不在 config.json（重开一次落地）"
     fi
-    want="$(landing_targets | wc -w | tr -d ' ')"
+    # want 要排除「选了 reality 但 Reality 协议没开」的情况，否则会误报不一致
+    want=0
+    local wt
+    for wt in $(landing_targets); do
+      [[ "$wt" == "reality" ]] && ! proto_on reality && continue
+      want=$((want+1))
+    done
     got="$(build_links 2>/dev/null | grep -c -- '-RH$')"
     if [[ "${want:-0}" == "${got:-0}" ]]; then
       ck_ok "订阅落地节点 ${got} 条，与入口设置一致：$(landing_names)"
@@ -3095,6 +3207,31 @@ PY
     fi
   fi
 
+  # ---------- Reality（Xray 内核，不依赖 sing-box / 证书）----------
+  if proto_on reality; then
+    [[ $quiet -eq 1 ]] || printf '\n%s[Reality]%s\n' "$C_B" "$C_R"
+    if listen_on "$(reality_port)" tcp; then
+      ck_ok "TCP $(reality_port) 在听（Reality，伪装 $(reality_sni)）"
+    else
+      ck_err "TCP $(reality_port) 没在听（Reality 不可用）"
+    fi
+    if grep -q '"reality"' "$CONF" 2>/dev/null; then
+      ck_ok "Reality 入站已写入 config.json"
+    else
+      ck_err "config.json 里没有 Reality 入站（重开一次 Reality）"
+    fi
+    if [[ -n "$(reality_pk)" && -n "$(reality_pub)" && -n "$(reality_sid)" ]]; then
+      ck_ok "x25519 密钥对 + shortId 齐备"
+    else
+      ck_err "Reality 密钥缺失（重开一次 Reality 会自动生成）"
+    fi
+    if build_links 2>/dev/null | grep -q -- "#${NAME_REALITY}$"; then
+      ck_ok "订阅里有 ${NAME_REALITY} 节点"
+    else
+      ck_err "订阅里缺 ${NAME_REALITY} 节点（重新生成订阅）"
+    fi
+  fi
+
   [[ $quiet -eq 1 ]] || printf '\n'
   check_summary
 }
@@ -3131,13 +3268,24 @@ defaults = {
     "hy2":     {"port": hp, "hop": hop, "obfs": False,
                 "up": 50, "down": 300},
     "tuic":    {"port": 30001, "password": "", "cc": "bbr"},
-    "reality": {"port": 8443, "sni": "www.microsoft.com", "short_id": ""},
+    "reality": {"port": 8443, "sni": "www.microsoft.com", "short_id": "",
+                "private_key": "", "public_key": ""},
     "anytls":  {"port": 8445, "password": ""},
     "cert":    {"sni": d.get("tunnel_host", ""), "path": "/opt/argox/cert"},
 }
 added = [k for k in defaults if k not in d]
 for k in added:
     d[k] = defaults[k]
+
+# reality 子字段补齐：老版本只有 port/sni/short_id，缺密钥对（阶段 4 新增）
+r = d.get("reality")
+if isinstance(r, dict):
+    for k, dv in (("port", 8443), ("sni", "www.microsoft.com"),
+                  ("short_id", ""), ("private_key", ""), ("public_key", "")):
+        if k not in r:
+            r[k] = dv
+            added.append("reality." + k)
+    d["reality"] = r
 
 # 旧默认段 20000-30000 与 RustDesk(21115-21119) / 其他服务冲突，自动迁移到新默认段。
 # 只在「port 与 hop 都还是旧默认值」时动手，用户自己改过的一律不碰。
@@ -3184,6 +3332,7 @@ PY
     proto_on hy2    && names="${names} / ${NAME_HY2}"
     proto_on tuic   && names="${names} / ${NAME_TUIC}"
     proto_on anytls && names="${names} / ${NAME_ANYTLS}"
+    proto_on reality && names="${names} / ${NAME_REALITY}"
     ok "订阅已重建：${names}"
   else
     warn "订阅重建失败，运行 check 查看原因"
@@ -3330,12 +3479,13 @@ do_hop() {
 # ==============================================================================
 landing_names() {
   local t out=""
-  for t in h3 h2 ws; do
+  for t in h3 h2 ws reality; do
     landing_wants "$t" || continue
     case "$t" in
       h3) out+="${NAME_H3}${NAME_RH} " ;;
       h2) out+="${NAME_H2}${NAME_RH} " ;;
       ws) out+="${NAME_WS}${NAME_RH} " ;;
+      reality) proto_on reality && out+="${NAME_REALITY}${NAME_RH} " ;;
     esac
   done
   printf '%s' "${out% }"
@@ -3432,11 +3582,11 @@ landing_set_target() { # $@=h3 h2 ws（支持逗号分隔）
   local t arr=() json="" i
   for t in $(printf '%s' "$*" | tr ',' ' '); do
     case "$t" in
-      h3|h2|ws) arr+=("$t") ;;
-      *) err "未知入口：$t（只支持 h3 h2 ws）"; return 1 ;;
+      h3|h2|ws|reality) arr+=("$t") ;;
+      *) err "未知入口：$t（只支持 h3 h2 ws reality）"; return 1 ;;
     esac
   done
-  [[ ${#arr[@]} -eq 0 ]] && { err "至少选一个入口（h3 h2 ws）"; return 1; }
+  [[ ${#arr[@]} -eq 0 ]] && { err "至少选一个入口（h3 h2 ws reality）"; return 1; }
   json="["
   for (( i=0; i<${#arr[@]}; i++ )); do
     [[ $i -gt 0 ]] && json+=","
@@ -3476,9 +3626,11 @@ landing_set_proto() { # $1=socks|http
 landing_pick_target() {
   local t ans cur a=()
   printf '\n  逐项确认（直接回车 = 保留当前）\n'
-  for t in h3 h2 ws; do
+  for t in h3 h2 ws reality; do
     if landing_wants "$t"; then cur="${C_GRN}是${C_R}"; else cur="${C_DIM}否${C_R}"; fi
-    read -rp "  $(printf '%-3s' "$(printf '%s' "$t" | tr '[:lower:]' '[:upper:]')") 落地？（当前 ${cur}，y/n/回车）: " ans
+    [[ "$t" == "reality" ]] && ! proto_on reality && \
+      printf '  %s（Reality 未开启，选了暂不生效）%s\n' "$C_YEL" "$C_R"
+    read -rp "  $(printf '%-7s' "$(printf '%s' "$t" | tr '[:lower:]' '[:upper:]')") 落地？（当前 ${cur}，y/n/回车）: " ans
     case "${ans,,}" in
       y) a+=("$t") ;;
       n) : ;;
@@ -3667,7 +3819,7 @@ direct_show() {
   [[ -x "$SB_BIN" ]] && sbv="$("$SB_BIN" version 2>/dev/null | head -1 | sed 's/^sing-box version //')"
   svc_active "$SVC_SB" && svc="${C_GRN}运行中${C_R}"
 
-  printf '\n  %s直连协议（sing-box）%s\n' "$C_B" "$C_R"
+  printf '\n  %s直连协议%s\n' "$C_B" "$C_R"
   printf '  sing-box  : %s\n' "$sbv"
   printf '  服务      : %s\n' "$svc"
   local p on port extra kind
@@ -3680,30 +3832,58 @@ direct_show() {
     esac
     printf '  %-9s : %s   %s %-6s%s\n' "$p" "$on" "$kind" "$port" "$extra"
   done
+  # Reality 走 Xray 内核，与上面三个不同服务
+  proto_on reality && on="${C_GRN}开${C_R}" || on="${C_DIM}关${C_R}"
+  local rx; svc_active "$SVC_XRAY" && rx="${C_GRN}运行中${C_R}" || rx="${C_DIM}未运行${C_R}"
+  printf '  %-9s : %s   %s %-6s  伪装 %s（Xray %s）\n' \
+    "reality" "$on" "TCP" "$(reality_port)" "$(reality_sni)" "$rx"
   printf '  公网 IP   : %s\n' "$(vps_ip)"
   if [[ -f "${CERTD}/cert.pem" ]]; then
     local end left
     end="$(openssl x509 -noout -enddate -in "${CERTD}/cert.pem" 2>/dev/null | sed 's/^notAfter=//')"
     left=$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
-    printf '  证书      : 剩 %s 天\n' "$left"
+    printf '  证书      : 剩 %s 天（Reality 不用证书）\n' "$left"
   else
-    printf '  证书      : %s未生成%s（首次开启时自动生成）\n' "$C_YEL" "$C_R"
+    printf '  证书      : %s未生成%s（首次开启直连协议时自动生成）\n' "$C_YEL" "$C_R"
   fi
-  printf '\n  云安全组需放行：UDP %s（Hy2 整段）、UDP %s（TUIC）、TCP %s（AnyTLS）\n' \
+  printf '\n  云安全组需放行：UDP %s（Hy2 整段）、UDP %s（TUIC）、TCP %s（AnyTLS）' \
     "$(hy2_hop)" "$(tuic_port)" "$(anytls_port)"
+  proto_on reality && printf '、TCP %s（Reality）' "$(reality_port)"
+  printf '\n'
 }
 
-direct_switch() { # $1=on|off  $2=hy2|tuic|anytls|all
+direct_switch() { # $1=on|off  $2=hy2|tuic|anytls|reality|all
   local act="$1" name="$2" v=false
   case "$name" in
-    hy2|tuic|anytls) : ;;
+    hy2|tuic|anytls|reality) : ;;
     all)
       local p rc=0
-      for p in hy2 tuic anytls; do direct_switch "$act" "$p" || rc=1; done
+      for p in hy2 tuic anytls reality; do direct_switch "$act" "$p" || rc=1; done
       return $rc ;;
-    *) err "指定协议：hy2 / tuic / anytls / all"; return 1 ;;
+    *) err "指定协议：hy2 / tuic / anytls / reality / all"; return 1 ;;
   esac
   [[ "$act" == "on" ]] && v=true
+
+  # ---- Reality 走 Xray 内核：重写 config.json 并重启 argox-xray ----
+  if [[ "$name" == "reality" ]]; then
+    if [[ "$v" == "true" ]]; then
+      reality_keys || return 1
+    fi
+    node_jset proto.reality "$v" || { err "写入 node.json 失败"; return 1; }
+    if ! reality_apply; then
+      node_jset proto.reality "$([[ "$v" == "true" ]] && echo false || echo true)" >/dev/null 2>&1 || true
+      reality_apply >/dev/null 2>&1 || true
+      err "Reality 操作失败，已回滚"
+      return 1
+    fi
+    if [[ "$v" == "true" ]]; then
+      ok "${NAME_REALITY} 已开启（TCP $(reality_port)，伪装 $(reality_sni)）"
+      warn "云安全组放行 TCP $(reality_port)"
+    else
+      ok "${NAME_REALITY} 已关闭（TCP $(reality_port) 不再监听）"
+    fi
+    return 0
+  fi
 
   if [[ "$v" == "true" ]]; then
     install_singbox || return 1
@@ -3746,13 +3926,14 @@ direct_menu() {
     direct_show
     cat <<'EOF'
 
-  1) 全部开启（Hy2 + TUIC + AnyTLS，推荐）*
+  1) 全部开启（Hy2 + TUIC + AnyTLS + Reality，推荐）*
   2) 开启 / 关闭 Hy2（UDP 主力）
   3) 开启 / 关闭 TUIC（UDP 备选）
   4) 开启 / 关闭 AnyTLS（TCP 兜底）
-  5) 改 Hy2 跳跃段
-  6) 查看 / 重签证书
-  7) 重启 sing-box
+  5) 开启 / 关闭 Reality（Xray 内核，纯 Xray 客户端用）
+  6) 改 Hy2 跳跃段
+  7) 查看 / 重签证书
+  8) 重启 sing-box
   0) 返回
 EOF
     read -rp "  选择: " c
@@ -3761,12 +3942,13 @@ EOF
       2) if proto_on hy2; then direct_switch off hy2; else direct_switch on hy2; fi ;;
       3) if proto_on tuic; then direct_switch off tuic; else direct_switch on tuic; fi ;;
       4) if proto_on anytls; then direct_switch off anytls; else direct_switch on anytls; fi ;;
-      5) printf '\n  当前跳跃段：%s（监听 %s）\n' "$(hy2_hop)" "$(hy2_port)"
+      5) if proto_on reality; then direct_switch off reality; else direct_switch on reality; fi ;;
+      6) printf '\n  当前跳跃段：%s（监听 %s）\n' "$(hy2_hop)" "$(hy2_port)"
          read -rp "  新的跳跃段（回车保持不变）: " r
          if [[ -n "${r// /}" ]]; then
            hy2_hop_set "${r// /}"
          fi ;;
-      6) cert_show; printf '\n'
+      7) cert_show; printf '\n'
          if [[ -f "${CERTD}/cert.pem" ]]; then
            read -rp "  重新生成证书？（y/N）: " yn
            if [[ "${yn,,}" == "y" ]]; then
@@ -3775,7 +3957,7 @@ EOF
          else
            cert_gen
          fi ;;
-      7) if proto_on hy2 || proto_on tuic || proto_on anytls; then sb_sync; else warn "直连协议都未开启"; fi ;;
+      8) if proto_on hy2 || proto_on tuic || proto_on anytls; then sb_sync; else warn "sing-box 侧协议都未开启"; fi ;;
       0|"") return 0 ;;
       *) warn "无效选项" ;;
     esac
@@ -3790,7 +3972,7 @@ do_direct() {
     ""|menu) direct_menu ;;
     status)  direct_show ;;
     on|off)  direct_switch "$1" "${2:-}" ;;
-    *) err "用法：direct [status|on <hy2|tuic>|off <hy2|tuic>]"; return 1 ;;
+    *) err "用法：direct [status|on|off] <hy2|tuic|anytls|reality|all>"; return 1 ;;
   esac
 }
 
@@ -3931,7 +4113,7 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 landing      住宅落地状态（菜单 19）
   bash $0 landing on   给 -RH 节点挂住宅落地（需本地代理可用）
   bash $0 landing off  关闭落地
-  bash $0 landing target h3,h2,ws   选择落地作用入口
+  bash $0 landing target h3,h2,reality   选择落地作用入口
   bash $0 landing proto socks|http  落地出口协议
   bash $0 direct       直连协议状态（Hy2 / TUIC / AnyTLS，菜单 20）
   bash $0 direct on all   一次开启 Hy2 + TUIC + AnyTLS（推荐）

@@ -42,7 +42,7 @@ bash /root/argox.sh
  8) 更换 UUID             17) 自检 check
  9) 系统优化              18) 升级配置（补字段）
                           19) 住宅落地
-                          20) 直连协议（Hy2 / TUIC / AnyTLS）
+                          20) 直连协议（Hy2 / TUIC / AnyTLS / Reality）
 ```
 
 ## 订阅
@@ -61,6 +61,7 @@ Argo-H2     CF 隧道，TCP 对照
 Hy2         直连 VPS，UDP，带端口跳跃（速度最快）
 TUIC        直连 VPS，UDP，备选
 AnyTLS      直连 VPS，TCP，UDP 被限速时的唯一出路
+Reality     直连 VPS，TCP，Xray 内核（默认关，纯 Xray 客户端用）
 ```
 
 命名约定：走 Cloudflare 隧道的加 `Argo-` 前缀；直连 VPS 公网端口的用裸协议名；
@@ -71,7 +72,7 @@ AnyTLS      直连 VPS，TCP，UDP 被限速时的唯一出路
 
 地址都写域名，由客户端自行解析到最近的 CF 节点。
 需要按 IP 展开时，先用下面的「优选 IP」把列表准备好，再菜单 13 → `6) 节点地址模式` 切成 `ip`。
-直连协议（Hy2 / TUIC / AnyTLS）不受地址模式影响，永远写 VPS 公网 IP。
+直连协议（Hy2 / TUIC / AnyTLS / Reality）不受地址模式影响，永远写 VPS 公网 IP。
 
 ## 优选 IP（两条路，别搞混）
 
@@ -108,15 +109,16 @@ bash argox.sh ips /root/result.csv      # 也可以直接给本机路径
 **另一条：社区列表**（菜单 14 → 3 拉取校验）。会按源备注里的运营商和 `ms`/`MB·s⁻¹`
 排序——但那些数字是列表作者在自己网络测的，**跟你的线路无关**，仅供兜底。
 
-## 直连协议（Hy2 / TUIC / AnyTLS）
+## 直连协议（Hy2 / TUIC / AnyTLS / Reality）
 
 不走 Cloudflare，直接连 VPS 公网端口。CF 线路差的时候这是主力。
 
 ```bash
 bash argox.sh direct               # 状态 + 交互菜单（菜单 20）
-bash argox.sh direct on all        # 一次开启 Hy2 + TUIC + AnyTLS（推荐）
+bash argox.sh direct on all        # 一次开启 Hy2 + TUIC + AnyTLS + Reality（推荐）
 bash argox.sh direct on hy2
 bash argox.sh direct off tuic
+bash argox.sh direct on reality    # Xray 内核，默认关；纯 Xray 客户端（v2rayN 6.x）用它
 bash argox.sh hy2 hop 23000-27000  # 改 Hy2 端口跳跃段
 bash argox.sh cert                 # 查看自签证书
 bash argox.sh cert gen --force     # 重签
@@ -131,6 +133,7 @@ bash argox.sh cert gen --force     # 重签
 | Hy2 | `23000-27000`（整段） | UDP |
 | TUIC | `30001` | UDP |
 | AnyTLS | `8445` | TCP |
+| Reality | `8443` | TCP（默认关，不开不监听） |
 
 Hy2 的端口跳跃靠 nftables 的 `redirect` 实现，sing-box 实际只监听 `23000` 一个口，
 其余 3999 个端口只是重定向规则，不占进程不占内存。**整段必须放行**——
@@ -143,12 +146,30 @@ Hy2 的端口跳跃靠 nftables 的 `redirect` 实现，sing-box 实际只监听
 
 自签证书没有受信 CA，客户端要勾「跳过证书验证」，订阅链接里已自动带 `insecure=1`。
 
+### Reality（可选，Xray 内核）
+
+默认关闭。它不用证书、不用域名、不依赖 sing-box，是**纯 Xray 内核客户端的兜底**
+（v2rayN 6.x、老版 v2rayNG 等不认识 AnyTLS 的客户端）。
+
+- 端口 `8443/TCP`，开启后需在云安全组放行
+- 伪装目标默认 `www.microsoft.com:443`（须 TLS 1.3 + H2，且 VPS 能直连它的 443）
+- 首次开启自动用 `xray x25519` 生成密钥对，写入 `node.json`，之后不再变动
+- 走 `xtls-rprx-vision` 流控，Throne / v2rayN 7.x / v2rayNG / sing-box 都支持
+- 想要「Reality 也走家宽」：菜单 19 勾上 `REALITY`，订阅末尾会多一条 `Reality-RH`
+  （同一个 8443 入站的第二个 UUID，不占新端口）
+
+```bash
+bash argox.sh direct on reality    # 开（自动生成密钥 + 重启 Xray + 放行端口）
+bash argox.sh direct off reality   # 关（8443 停止监听）
+```
+
 ### 协议优先级
 
 ```
 Hy2      ← 首选，UDP + BBR，速度最好
 TUIC     ← Hy2 被限速时换它，同样 UDP
 AnyTLS   ← UDP 全被 QoS 时的唯一活路（TCP，靠 TLS 伪装）
+Reality  ← 同上是 TCP，Xray 内核原生支持；客户端不支持 AnyTLS 时换它
 Argo-*   ← 上面全挂才用（走 CF；国内到 CF 丢包严重时不可用）
 ```
 
