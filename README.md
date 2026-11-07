@@ -41,6 +41,7 @@ bash /root/argox.sh
  7) 更新到最新版          16) 出口跳板
  8) 更换 UUID             17) 自检 check
  9) 系统优化              18) 升级配置（补字段）
+                          19) 住宅落地
 ```
 
 ## 订阅
@@ -103,6 +104,32 @@ bash argox.sh hop off      # 关闭，回到 VPS 原生出口
 默认关闭。只需在 VPS 本机监听（如 `127.0.0.1:7928`），不用开放任何公网端口。
 代理挂了会自动拒绝切换；切换后 Xray 起不来会自动回滚到原状态。
 
+## 住宅落地
+
+VPS 上装了住宅 IP / 商业 VPN 客户端（如 AimiliVPN），并提供本地 socks5 或 http 端口时，
+可以让订阅里多出 `-RH` 结尾的节点，这些节点从住宅 IP 出去，其余节点完全不受影响。
+
+```bash
+bash argox.sh landing                   # 状态 + 交互菜单
+bash argox.sh landing on                # 开启（多出 Argo-H3-RH / Argo-H2-RH）
+bash argox.sh landing off               # 关闭
+bash argox.sh landing target h3,h2,ws   # 选择哪些入口带落地版
+bash argox.sh landing proto socks|http  # 落地出口协议
+```
+
+与「出口跳板」的区别：
+
+| | 出口跳板 hop | 住宅落地 landing |
+|---|---|---|
+| 作用范围 | VPS 上所有流量 | 只有 `-RH` 结尾的节点 |
+| 切换方式 | 服务端开关，全部节点都变 | 客户端换节点 |
+| 用途 | 整台机器换出口 | 临时给某个目标站换住宅 IP |
+
+两者可以同时开：落地路由规则排在跳板兜底规则之前，跳板开着也不会污染 `-RH` 节点。
+
+实现上不额外开端口、不额外加入站——同一条隧道挂第二个 UUID，
+靠 Xray 的路由 `user` 条件分流到本地代理出口。`-RH` 节点永远排在订阅最后。
+
 ## 命令行
 
 ```bash
@@ -112,6 +139,7 @@ bash argox.sh links      # 单节点链接
 bash argox.sh sub        # Base64 订阅内容
 bash argox.sh ips
 bash argox.sh hop on     # 出口跳板（off / on [socks|http]）
+bash argox.sh landing on # 住宅落地（off / status / target h3,h2,ws）
 bash argox.sh diag       # cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）
 bash argox.sh diag http2 # UDP 7844 被封时强制走 TCP
 bash argox.sh check      # 自检（-q 静默，只返回退出码）

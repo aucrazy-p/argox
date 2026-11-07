@@ -1,7 +1,7 @@
 # argox v2.0 方案（双核合并版 · 决策已定稿）
 
-> 状态：**阶段 1 已完成**（v2.0.0：新命名 + `check` + `upgrade`），运行中服务未改动。
-> 下一步：阶段 2（住宅落地双 UUID）。
+> 状态：**阶段 1、2 已完成**（v2.0.0 新命名 + `check` + `upgrade`；v2.1.0 住宅落地）。
+> 下一步：阶段 3（sing-box + 自签证书 + Hy2 / TUIC + 端口跳跃）。
 > 原状态记录：5 项决策已拍板（A/B/C/D/E 见第 0 节）。
 > 目标：把现有 `argox.sh`（Argo + Xray XHTTP）与 `install_myproxy.sh`（多协议直连）合并为一套脚本，
 > 双核（Xray + sing-box）各管一半协议，全量使用自签证书。
@@ -419,6 +419,10 @@ v2rayN 的 `port hopping` 字段、mihomo 的 `ports` 字段都对应这个值�
 
 ## 7. 菜单
 
+> 下面是阶段 5 的最终布局。当前 v2.1.0 为了不打乱用户习惯，1–16 沿用旧编号，
+> 新功能追加在末尾：`17) 自检 check`、`18) 升级配置`、`19) 住宅落地`。
+> 等阶段 4 全部功能齐了再统一重排。
+
 ```
 ── 部署 ────────────────────────────────────
   1) 安装 / 重新部署          2) 服务控制（启/停/重启）
@@ -464,7 +468,7 @@ v2rayN 的 `port hopping` 字段、mihomo 的 `ports` 字段都对应这个值�
 argox.sh install|start|stop|restart|status|logs|update
 argox.sh nodes|links|sub|qr
 argox.sh proto [list|on <name>|off <name>]     # argo|hy2|tuic|reality|anytls
-argox.sh landing [on|off|status|target <list>] # target h3,h2,ws,reality
+argox.sh landing [on|off|status|target <list>|proto socks|http]  # target h3,h2,ws,reality
 argox.sh hy2 hop <start-end>                   # 端口段（B）
 argox.sh tunnel [token|host|proto]
 argox.sh port [show|set]

@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -218,6 +218,58 @@ node_set_raw() { # $1=key $2=原始 JSON 值
   fi
 }
 
+# 读嵌套字段，点分路径：node_jget landing.enabled / landing.target
+# 标量原样输出；布尔输出 true|false；数组用空格分隔；缺失输出空
+node_jget() {
+  [[ -r "$NODEF" ]] || return 0
+  if has python3; then
+    python3 - "$NODEF" "$1" 2>/dev/null <<'PY'
+import json, sys
+try:
+    cur = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for k in sys.argv[2].split('.'):
+    if isinstance(cur, dict) and k in cur:
+        cur = cur[k]
+    else:
+        sys.exit(0)
+if isinstance(cur, bool):
+    print('true' if cur else 'false')
+elif isinstance(cur, list):
+    print(' '.join(str(x) for x in cur))
+elif isinstance(cur, dict):
+    print(json.dumps(cur, ensure_ascii=False))
+elif cur is not None:
+    print(cur)
+PY
+  elif has jq; then
+    jq -r ".$1 // empty" "$NODEF" 2>/dev/null
+  fi
+}
+
+# 写嵌套字段，点分路径 + 原始 JSON 值：node_jset landing.enabled true
+node_jset() {
+  [[ -r "$NODEF" ]] || return 1
+  has python3 || return 1
+  python3 - "$NODEF" "$1" "$2" 2>/dev/null <<'PY'
+import json, sys
+p, path, raw = sys.argv[1], sys.argv[2].split('.'), sys.argv[3]
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+cur = d
+for k in path[:-1]:
+    if not isinstance(cur.get(k), dict):
+        cur[k] = {}
+    cur = cur[k]
+cur[path[-1]] = json.loads(raw)
+with open(p, "w") as f:
+    json.dump(d, f, indent=2, ensure_ascii=False)
+PY
+}
+
 installed() { [[ -x "$XRAY_BIN" ]] && [[ -f "$CONF" ]]; }
 
 # 由主域名推导同级子域：argo.aucrazy.dpdns.org + ws -> ws.aucrazy.dpdns.org
@@ -311,6 +363,31 @@ hop_probe() {
 }
 
 # ==============================================================================
+#  住宅落地（landing）
+#
+#  同一条隧道、同一个域名，挂第二个 UUID；带该 UUID 的连接走本地代理出口。
+#  不额外开端口、不额外开入站：靠 routing 的 user 条件分流。
+# ==============================================================================
+landing_on() { [[ "$(node_jget landing.enabled 2>/dev/null)" == "true" ]]; }
+
+landing_uuid() { node_jget landing.uuid 2>/dev/null; }
+
+landing_targets() { node_jget landing.target 2>/dev/null; }   # 空格分隔：h3 h2 ws
+
+# 落地出口协议：没单独设置就沿用跳板的（指向同一台代理）
+landing_proto() {
+  local p; p="$(node_jget landing.proto 2>/dev/null)"
+  case "$p" in socks|http) : ;; *) p="$(node_hop_proto)" ;; esac
+  printf '%s' "$p"
+}
+
+# 当前 target 是否包含某个入口
+landing_wants() { # $1=h3|h2|ws
+  local tg; tg=" $(landing_targets) "
+  [[ "$tg" == *" $1 "* ]]
+}
+
+# ==============================================================================
 #  系统优化
 # ==============================================================================
 apply_sysctl() {
@@ -400,6 +477,30 @@ install_cloudflared() {
 write_xray_config() {
   local uuid="$1" px="$2" pw="$3"
 
+  # ---- 住宅落地：两个入站各按 target 决定是否挂第二个 UUID ----
+  local use_landing=0 luuid="" x_land=0 w_land=0
+  if landing_on; then
+    luuid="$(landing_uuid)"
+    if [[ -n "$luuid" ]]; then
+      use_landing=1
+      landing_wants h3 && x_land=1
+      landing_wants h2 && x_land=1
+      landing_wants ws && w_land=1
+    fi
+  fi
+
+  local xclients wclients
+  if [[ $x_land -eq 1 ]]; then
+    xclients="[{ \"id\": \"${uuid}\" }, { \"id\": \"${luuid}\", \"email\": \"landing\" }]"
+  else
+    xclients="[{ \"id\": \"${uuid}\" }]"
+  fi
+  if [[ $w_land -eq 1 ]]; then
+    wclients="[{ \"id\": \"${uuid}\" }, { \"id\": \"${luuid}\", \"email\": \"landing\" }]"
+  else
+    wclients="[{ \"id\": \"${uuid}\" }]"
+  fi
+
   # 出站与路由：跳板开启时把 hop 放在第一位（成为默认出口）
   local ob_json rt_json
   if [[ "$(node_hop_mode)" == "all" ]]; then
@@ -412,6 +513,17 @@ write_xray_config() {
   else
     ob_json='    { "protocol": "freedom", "tag": "direct" }'
     rt_json='      { "type": "field", "ip": ["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8","169.254.0.0/16","::1/128","fc00::/7"], "outboundTag": "direct" }'
+  fi
+
+  # 落地出站追加在最后：不改变 outbounds[0]，默认出口仍然是 direct / hop
+  # 落地路由插在最前：确保比 hop 的兜底规则先匹配，跳板开着也不污染落地节点
+  if [[ $use_landing -eq 1 && ( $x_land -eq 1 || $w_land -eq 1 ) ]]; then
+    local lp la lport
+    lp="$(landing_proto)"; la="$(node_hop_addr)"; lport="$(node_hop_port)"
+    ob_json="${ob_json},
+    { \"protocol\": \"${lp}\", \"tag\": \"landing\", \"settings\": { \"servers\": [{ \"address\": \"${la}\", \"port\": ${lport} }] } }"
+    rt_json="      { \"type\": \"field\", \"user\": [\"landing\"], \"outboundTag\": \"landing\" },
+${rt_json}"
   fi
 
   cat > "$CONF" <<EOF
@@ -427,7 +539,7 @@ write_xray_config() {
       "listen": "127.0.0.1",
       "port": ${DEF_PORT_XHTTP},
       "protocol": "vless",
-      "settings": { "clients": [{ "id": "${uuid}" }], "decryption": "none" },
+      "settings": { "clients": ${xclients}, "decryption": "none" },
       "streamSettings": {
         "network": "xhttp",
         "security": "none",
@@ -440,7 +552,7 @@ write_xray_config() {
       "listen": "127.0.0.1",
       "port": ${DEF_PORT_WS},
       "protocol": "vless",
-      "settings": { "clients": [{ "id": "${uuid}" }], "decryption": "none" },
+      "settings": { "clients": ${wclients}, "decryption": "none" },
       "streamSettings": {
         "network": "ws",
         "security": "none",
@@ -1053,6 +1165,27 @@ urlenc() { # 简单 URL 编码（path 里的 / 需编码）
   printf '%s' "$out"
 }
 
+# 落地家宽节点（-RH）：地址固定用域名，永远排在订阅最后。
+# 顺序固定 h3 → h2 → ws，与主节点保持一致；IP 模式下也用域名，避免节点数翻倍。
+emit_landing_links() { # $1=host $2=ws_host $3=ex $4=enc_pw
+  local host="$1" ws_host="$2" ex="$3" enc_pw="$4"
+  landing_on || return 0
+  local lu; lu="$(landing_uuid)"
+  [[ -z "$lu" ]] && return 0
+  local t
+  for t in h3 h2 ws; do
+    landing_wants "$t" || continue
+    case "$t" in
+      h3) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s%s\n' \
+            "$lu" "$host" "$host" "$ex" "$host" "$NAME_H3" "$NAME_RH" ;;
+      h2) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s%s\n' \
+            "$lu" "$host" "$host" "$ex" "$host" "$NAME_H2" "$NAME_RH" ;;
+      ws) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#%s%s\n' \
+            "$lu" "$ws_host" "$ws_host" "$enc_pw" "$ws_host" "$NAME_WS" "$NAME_RH" ;;
+    esac
+  done
+}
+
 build_links() {
   local uuid host px pw
   uuid="$(node_get uuid)"
@@ -1083,6 +1216,8 @@ build_links() {
       "$uuid" "$host" "$host" "$ex" "$host" "$NAME_H2"
     printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#%s\n' \
       "$uuid" "$ws_host" "$ws_host" "$enc_pw" "$ws_host" "$NAME_WS"
+    # 4) 落地家宽垫底
+    emit_landing_links "$host" "$ws_host" "$ex" "$enc_pw"
     return 0
   fi
 
@@ -1126,6 +1261,9 @@ build_links() {
     printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#%s-%02d-%s\n' \
       "$uuid" "${ips[$i]}" "$ws_host" "$enc_pw" "$ws_host" "$NAME_WS" "$n" "${tags[$i]}"
   done
+
+  # 4) 落地家宽垫底（IP 模式下也用域名，住宅落地是特殊用途，稳定优先）
+  emit_landing_links "$host" "$ws_host" "$ex" "$enc_pw"
 }
 
 gen_sub() {
@@ -2165,16 +2303,40 @@ PY
   fi
 
   # ---------- 落地 / 跳板 ----------
-  if [[ "$(node_hop_mode)" == "all" ]]; then
-    [[ $quiet -eq 1 ]] || printf '\n%s[出口跳板]%s\n' "$C_B" "$C_R"
+  local need_proxy=0
+  [[ "$(node_hop_mode)" == "all" ]] && need_proxy=1
+  landing_on && need_proxy=1
+  if [[ $need_proxy -eq 1 ]]; then
+    [[ $quiet -eq 1 ]] || printf '\n%s[本地代理]%s\n' "$C_B" "$C_R"
     local ha hp pr
     ha="$(node_hop_addr)"; hp="$(node_hop_port)"
     if timeout 5 bash -c ">/dev/tcp/${ha}/${hp}" 2>/dev/null; then
       pr="$(hop_probe || true)"
-      [[ -n "$pr" ]] && ck_ok "跳板 ${ha}:${hp} 可用（${pr}）" \
-                     || ck_warn "跳板端口开着但代理不通（协议可能选错，试试 http）"
+      [[ -n "$pr" ]] && ck_ok "代理 ${ha}:${hp} 可用（${pr}）" \
+                     || ck_warn "代理端口开着但不通（协议可能选错，试试 http）"
     else
-      ck_err "跳板 ${ha}:${hp} 连不上 → 全部流量会走不通（菜单 16 关掉）"
+      ck_err "代理 ${ha}:${hp} 连不上 → 跳板 / 落地节点都会失效"
+    fi
+  fi
+
+  # 落地一致性：UUID 进了配置、订阅里有对应 -RH 节点
+  if landing_on; then
+    [[ $quiet -eq 1 ]] || printf '\n%s[住宅落地]%s\n' "$C_B" "$C_R"
+    local lu want got
+    lu="$(landing_uuid)"
+    if [[ -z "$lu" ]]; then
+      ck_err "落地已开启但 landing.uuid 为空（重开一次落地）"
+    elif grep -q "$lu" "$CONF" 2>/dev/null; then
+      ck_ok "落地 UUID 已写入 Xray 配置"
+    else
+      ck_err "落地已开启但 UUID 不在 config.json（重开一次落地）"
+    fi
+    want="$(landing_targets | wc -w | tr -d ' ')"
+    got="$(build_links 2>/dev/null | grep -c -- '-RH$')"
+    if [[ "${want:-0}" == "${got:-0}" ]]; then
+      ck_ok "订阅落地节点 ${got} 条，与入口设置一致：$(landing_names)"
+    else
+      ck_err "订阅落地节点 ${got} 条 ≠ 入口设置 ${want} 条（重新生成订阅）"
     fi
   fi
 
@@ -2371,6 +2533,213 @@ do_hop() {
   done
 }
 
+# ==============================================================================
+#  住宅落地（菜单 19 / landing 子命令）
+# ==============================================================================
+landing_names() {
+  local t out=""
+  for t in h3 h2 ws; do
+    landing_wants "$t" || continue
+    case "$t" in
+      h3) out+="${NAME_H3}${NAME_RH} " ;;
+      h2) out+="${NAME_H2}${NAME_RH} " ;;
+      ws) out+="${NAME_WS}${NAME_RH} " ;;
+    esac
+  done
+  printf '%s' "${out% }"
+}
+
+landing_show() {
+  local on lu pr ha hp
+  on="$(node_jget landing.enabled 2>/dev/null)"
+  lu="$(landing_uuid)"
+  ha="$(node_hop_addr)"; hp="$(node_hop_port)"
+  if [[ "$on" == "true" ]]; then
+    printf '  状态     : %s已开启%s\n' "$C_GRN" "$C_R"
+    printf '  落地节点 : %s%s%s\n' "$C_B" "$(landing_names)" "$C_R"
+  else
+    printf '  状态     : 关闭（所有节点从 VPS 原生 IP 出去）\n'
+    printf '  落地节点 : 未启用（开启后生成 %s）\n' "$(landing_names)"
+  fi
+  printf '  出口代理 : %s:%s（%s）\n' "$ha" "$hp" "$(landing_proto)"
+  printf '  落地 UUID: %s\n' "${lu:-未生成}"
+  # 先探端口再探代理：代理不在时省掉 curl 的两个 8 秒超时
+  if timeout 2 bash -c ">/dev/tcp/${ha}/${hp}" 2>/dev/null; then
+    pr="$(hop_probe || true)"
+    if [[ -n "$pr" ]]; then
+      printf '  代理探测 : 可用（%s），出口 IP %s\n' "${pr%% *}" "${pr#* }"
+    else
+      printf '  代理探测 : %s端口开着但代理不通%s（换个协议试试 http）\n' "$C_YEL" "$C_R"
+    fi
+  else
+    printf '  代理探测 : %s不可达%s（Aimili 没启动 / 端口不对）\n' "$C_YEL" "$C_R"
+  fi
+}
+
+landing_set() { # $1=on|off
+  local want="$1" prev lu uuid px pw pr
+  prev="$(node_jget landing.enabled 2>/dev/null)"
+  [[ -z "$prev" ]] && prev="false"
+  uuid="$(node_get uuid)"; px="$(node_get path_xhttp)"; pw="$(node_get path_ws)"
+  if [[ -z "$uuid" || -z "$px" || -z "$pw" ]]; then
+    err "缺少 uuid / 路径，先跑菜单 1 完成安装"
+    return 1
+  fi
+
+  if [[ "$want" == "on" ]]; then
+    pr="$(hop_probe || true)"
+    if [[ -z "$pr" ]]; then
+      err "本地代理 $(node_hop_addr):$(node_hop_port) 不通，未开启"
+      info "Aimili 没启动或端口变了；地址端口在菜单 16 → 3 里改"
+      return 1
+    fi
+    lu="$(landing_uuid)"
+    if [[ -z "$lu" ]]; then
+      lu="$(gen_uuid)"
+      node_jset landing.uuid "\"${lu}\""
+    fi
+    # 没单独指定出口协议时，用探测到的那个（代理可能只支持 socks 或 http 之一）
+    if [[ -z "$(node_jget landing.proto 2>/dev/null)" ]]; then
+      node_jset landing.proto "\"${pr%% *}\""
+    fi
+    node_jset landing.enabled true
+    ok "代理可用（${pr%% *}），住宅出口 IP ${pr#* }"
+    info "落地 UUID：${lu}"
+  else
+    node_jset landing.enabled false
+  fi
+
+  if ! write_xray_config "$uuid" "$px" "$pw"; then
+    node_jset landing.enabled "${prev}"
+    err "配置生成失败，已保持原状"
+    return 1
+  fi
+
+  systemctl restart "$SVC_XRAY" 2>/dev/null
+  sleep 2
+  if svc_active "$SVC_XRAY"; then
+    gen_sub >/dev/null 2>&1 || warn "订阅重建失败，运行 check 查看"
+    if [[ "$want" == "on" ]]; then
+      ok "已开启住宅落地"
+      printf '  订阅新增：%s\n' "$(landing_names)"
+    else
+      ok "已关闭住宅落地，订阅回到纯原生出口"
+    fi
+    info "客户端重新拉订阅（旧的 -RH 节点记得删掉）"
+  else
+    err "Xray 启动失败，自动回滚"
+    node_jset landing.enabled "${prev}"
+    write_xray_config "$uuid" "$px" "$pw" >/dev/null 2>&1 || true
+    systemctl restart "$SVC_XRAY" 2>/dev/null
+    journalctl -u "$SVC_XRAY" -n 20 --no-pager
+    return 1
+  fi
+}
+
+landing_set_target() { # $@=h3 h2 ws（支持逗号分隔）
+  local t arr=() json="" i
+  for t in $(printf '%s' "$*" | tr ',' ' '); do
+    case "$t" in
+      h3|h2|ws) arr+=("$t") ;;
+      *) err "未知入口：$t（只支持 h3 h2 ws）"; return 1 ;;
+    esac
+  done
+  [[ ${#arr[@]} -eq 0 ]] && { err "至少选一个入口（h3 h2 ws）"; return 1; }
+  json="["
+  for (( i=0; i<${#arr[@]}; i++ )); do
+    [[ $i -gt 0 ]] && json+=","
+    json+="\"${arr[$i]}\""
+  done
+  json+="]"
+  node_jset landing.target "$json"
+  ok "落地入口：${arr[*]}"
+
+  if landing_on; then
+    local uuid px pw
+    uuid="$(node_get uuid)"; px="$(node_get path_xhttp)"; pw="$(node_get path_ws)"
+    if write_xray_config "$uuid" "$px" "$pw"; then
+      systemctl restart "$SVC_XRAY" 2>/dev/null; sleep 1
+      gen_sub >/dev/null 2>&1 || warn "订阅重建失败"
+      ok "已生效，订阅：$(landing_names)"
+    else
+      err "配置生成失败，入口未改动"
+      return 1
+    fi
+  fi
+}
+
+landing_set_proto() { # $1=socks|http
+  local p="$1"
+  case "$p" in socks|http) : ;; *) err "只支持 socks / http"; return 1 ;; esac
+  node_jset landing.proto "\"${p}\""
+  ok "落地出口协议：${p}"
+  if landing_on; then
+    local uuid px pw
+    uuid="$(node_get uuid)"; px="$(node_get path_xhttp)"; pw="$(node_get path_ws)"
+    write_xray_config "$uuid" "$px" "$pw" && systemctl restart "$SVC_XRAY" 2>/dev/null
+    info "客户端重连一次生效"
+  fi
+}
+
+landing_pick_target() {
+  local t ans cur a=()
+  printf '\n  逐项确认（直接回车 = 保留当前）\n'
+  for t in h3 h2 ws; do
+    if landing_wants "$t"; then cur="${C_GRN}是${C_R}"; else cur="${C_DIM}否${C_R}"; fi
+    read -rp "  $(printf '%-3s' "$(printf '%s' "$t" | tr '[:lower:]' '[:upper:]')") 落地？（当前 ${cur}，y/n/回车）: " ans
+    case "${ans,,}" in
+      y) a+=("$t") ;;
+      n) : ;;
+      *) landing_wants "$t" && a+=("$t") ;;
+    esac
+  done
+  if [[ ${#a[@]} -eq 0 ]]; then
+    warn "至少要保留一个入口，未改动"
+    return 1
+  fi
+  landing_set_target "${a[@]}"
+}
+
+do_landing() {
+  require_root
+  installed || { err "尚未安装，先执行菜单 1"; return 1; }
+  local act="${1:-}"
+
+  case "$act" in
+    on)      landing_set on;  return ;;
+    off)     landing_set off; return ;;
+    status)  landing_show;    return ;;
+    target)  shift; landing_set_target "$@"; return ;;
+    proto)   landing_set_proto "${2:-}"; return ;;
+    ""|menu) : ;;
+    *) err "用法：landing [on|off|status|target h3,h2,ws|proto socks|http]"; return 1 ;;
+  esac
+
+  while true; do
+    printf '\n  住宅落地（Aimili 等本地代理）\n'
+    landing_show
+    printf '\n'
+    printf '  1) 开启落地（订阅多出 -RH 节点）\n'
+    printf '  2) 关闭落地\n'
+    printf '  3) 选择作用入口（H3 / H2 / WS）\n'
+    printf '  4) 出口协议（socks / http，当前 %s）\n' "$(landing_proto)"
+    printf '  5) 改代理地址 / 端口（当前 %s:%s）\n' "$(node_hop_addr)" "$(node_hop_port)"
+    printf '  0) 返回\n'
+    local c; read -rp "  选择: " c
+    case "$c" in
+      1) landing_set on ;;
+      2) landing_set off ;;
+      3) landing_pick_target ;;
+      4) read -rp "  协议（socks/http）: " lp; landing_set_proto "$lp" ;;
+      5) hop_edit_addr ;;
+      0|"") return 0 ;;
+      *) warn "无效选项：${c:-<空>}" ;;
+    esac
+    printf '\n'
+    read -rp "  按回车继续…" _ || true
+  done
+}
+
 do_tunnel_setup() {
   require_root
   local ws_h sub_h mode_v
@@ -2516,9 +2885,10 @@ menu_header() {
 }
 
 menu_main() {
-  local hop_label
+  local hop_label landing_label
   while true; do
     if [[ "$(node_hop_mode)" == "all" ]]; then hop_label="${C_YEL}全部${C_R}"; else hop_label="关闭"; fi
+    if landing_on; then landing_label="${C_GRN}$(landing_names)${C_R}"; else landing_label="关闭"; fi
     menu_header
     cat <<'EOF'
    1) 安装 / 重新部署           9) 系统优化（BBR / 重启 / 日志）
@@ -2531,6 +2901,7 @@ menu_main() {
 EOF
     printf '   8) 更换 UUID（用户名/密码）    16) 出口跳板（%s）\n' "$hop_label"
     printf '  17) 自检 check                18) 升级配置（补字段）\n'
+    printf '  19) 住宅落地（%s）\n' "$landing_label"
     printf '\n    0) 退出\n'
     printf '%s\n' "──────────────────────────────────────────────────"
     read -rp "  请选择: " choice
@@ -2553,6 +2924,7 @@ EOF
       16) do_hop ;;
       17) do_check ;;
       18) do_upgrade ;;
+      19) do_landing ;;
       0|q|Q) printf '\n  再见\n\n'; exit 0 ;;
       *) warn "无效选项：${choice:-<空>}" ;;
     esac
@@ -2577,6 +2949,7 @@ main() {
     nodes|show) show_nodes ;;
     links)     show_links ;;
     hop)       do_hop "${2:-}" "${3:-}" ;;
+    landing)   shift; do_landing "$@" ;;
     diag)      do_diag "${2:-}" ;;
     check)     do_check "${2:-}" ;;
     upgrade)   do_upgrade ;;
@@ -2598,6 +2971,11 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 hop          出口跳板状态（菜单 16）
   bash $0 hop on       全部流量走本地代理（自动探测 socks/http）
   bash $0 hop off      关闭跳板，流量从 VPS 本机出口出去
+  bash $0 landing      住宅落地状态（菜单 19）
+  bash $0 landing on   给 -RH 节点挂住宅落地（需本地代理可用）
+  bash $0 landing off  关闭落地
+  bash $0 landing target h3,h2,ws   选择落地作用入口
+  bash $0 landing proto socks|http  落地出口协议
   bash $0 diag         cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）
   bash $0 diag http2   强制隧道走 TCP（UDP 7844 被封时用）
   bash $0 diag auto    恢复自动选择（默认）
