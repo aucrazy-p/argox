@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.3.1"
+VERSION="2.3.2"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -51,10 +51,10 @@ DEF_PORT_SUB=8099       # 仅本机，订阅服务
 
 # ---- 直连协议（sing-box）默认值 ----------------------------------------------
 # 这两个端口必须开放公网，Hy2 另需整段跳跃端口
-DEF_PORT_HY2=20000      # Hy2 实监听端口（UDP）
+DEF_PORT_HY2=23000      # Hy2 实监听端口（UDP）——取跳跃段首
 DEF_PORT_TUIC=30001     # TUIC 监听端口（UDP）
 DEF_PORT_ANYTLS=8445    # AnyTLS 监听端口（TCP）——UDP 全灭时的唯一出路
-DEF_HOP_RANGE="20000-30000"   # Hy2 端口跳跃段，须含 DEF_PORT_HY2
+DEF_HOP_RANGE="23000-27000"   # Hy2 端口跳跃段，默认不含 RustDesk(21115-21119) 等常用服务段
 SB_VER_DEFAULT="1.12.0"       # sing-box 默认版本
 
 # ---- 节点显示名（只影响客户端里看到的名字，不影响服务/tag/路径）--------------
@@ -441,14 +441,49 @@ vps_ip() {
 # 跳跃段校验：返回 0 通过，否则打印原因
 hop_valid() { # $1=起-止
   local r="$1"
-  [[ "$r" =~ ^([0-9]+)-([0-9]+)$ ]] || { err "格式必须是 起-止，如 20000-30000"; return 1; }
+  [[ "$r" =~ ^([0-9]+)-([0-9]+)$ ]] || { err "格式必须是 起-止，如 23000-27000"; return 1; }
   local s="${BASH_REMATCH[1]}" e="${BASH_REMATCH[2]}"
   (( s < e )) || { err "起始端口必须小于结束端口"; return 1; }
   (( s >= 1024 && e <= 65535 )) || { err "端口必须在 1024-65535 之间"; return 1; }
   (( e - s <= 20000 )) || { err "跨度不能超过 20000（防止误写成 1-65535）"; return 1; }
-  local hp tp; hp="$(hy2_port)"; tp="$(tuic_port)"
-  (( s <= hp && hp <= e )) || { err "跳跃段必须包含 Hy2 监听端口 ${hp}"; return 1; }
+  local tp; tp="$(tuic_port)"
   (( tp < s || tp > e )) || { err "TUIC 端口 ${tp} 落在跳跃段内，会互相抢占"; return 1; }
+  return 0
+}
+
+# 设置跳跃段：监听口不在段内时自动挪到段首（否则 nft redirect 过来的包没人收）
+hy2_hop_set() { # $1=起-止
+  local rng="${1// /}"
+  local s="${rng%%-*}" e="${rng##*-}"
+
+  hop_valid "$rng" || return 1
+
+  # 先确认新监听口可用，再落盘，避免 hop 改了 port 没改的半截状态
+  local old_hp; old_hp="$(hy2_port)"
+  local move_port=0
+  if (( old_hp < s || old_hp > e )); then
+    move_port=1
+    if port_in_use "$s" udp; then
+      err "UDP ${s}（新段首）已被占用，无法把 Hy2 监听口挪过去"
+      info "先停掉占用进程，或先手动换一个空闲监听口再设跳跃段"
+      return 1
+    fi
+  fi
+
+  node_jset hy2.hop "\"$rng\"" || { err "跳跃段写入失败"; return 1; }
+
+  if (( move_port )); then
+    node_jset hy2.port "$s" || { err "监听口写入失败"; return 1; }
+    ok "Hy2 监听口 ${old_hp} → ${s}（跳跃段首）"
+    proto_on hy2 && sb_sync           # 换监听口必须重启 sing-box
+  else
+    info "Hy2 监听口 ${old_hp} 仍在段内，无需改动"
+    proto_on hy2 && sb_hop_apply
+  fi
+
+  gen_sub >/dev/null 2>&1 || true
+  ok "跳跃段已设为 ${rng}"
+  warn "云安全组 / 本机防火墙需同步放行 UDP ${rng}"
   return 0
 }
 
@@ -750,21 +785,24 @@ EOF
 
 # 放行本机防火墙：Oracle 的 Ubuntu 镜像默认在 INPUT 末尾挂 REJECT，
 # 云安全组放行了、实例内还是不通，是这个原因。
+# 注意端口范围写法三家不同：ufw/iptables 用冒号（23000:27000），firewalld 用短横线（23000-27000）
 fw_open() { # $1=tcp|udp  $2=端口 或 起-止
   local pr="$1" p="$2" did=0
+  local p_colon="${p/-/:}"                      # ufw / iptables 要冒号
+  local p_dash="${p/:/-}"                       # firewalld 要短横线
 
   if has ufw && ufw status 2>/dev/null | grep -qi "Status: active"; then
-    ufw allow "${p}/${pr}" >/dev/null 2>&1 && did=1
+    ufw allow "${p_colon}/${pr}" >/dev/null 2>&1 && did=1
   fi
 
   if has firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
-    firewall-cmd --permanent --add-port="${p}/${pr}" >/dev/null 2>&1 \
+    firewall-cmd --permanent --add-port="${p_dash}/${pr}" >/dev/null 2>&1 \
       && firewall-cmd --reload >/dev/null 2>&1 && did=1
   fi
 
   if has iptables; then
-    if ! iptables -C INPUT -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null; then
-      iptables -I INPUT 1 -p "$pr" --dport "$p" -j ACCEPT 2>/dev/null && did=1
+    if ! iptables -C INPUT -p "$pr" --dport "$p_colon" -j ACCEPT 2>/dev/null; then
+      iptables -I INPUT 1 -p "$pr" --dport "$p_colon" -j ACCEPT 2>/dev/null && did=1
     fi
     # 持久化：有 netfilter-persistent 用它，否则写 /etc/iptables/rules.v4
     if has netfilter-persistent; then
@@ -774,7 +812,7 @@ fw_open() { # $1=tcp|udp  $2=端口 或 起-止
     fi
   fi
 
-  [[ $did -eq 1 ]] && ok "本机防火墙已放行 ${pr^^} ${p}"
+  [[ $did -eq 1 ]] && ok "本机防火墙已放行 ${pr^^} ${p_dash}"
   return 0
 }
 
@@ -2248,7 +2286,7 @@ PY
   "install_mode": "A",
   "proto": { "argo": true, "hy2": true, "tuic": true, "reality": false, "anytls": true },
   "landing": { "enabled": false, "uuid": "", "target": ["h3", "h2"] },
-  "hy2":     { "port": 20000, "hop": "20000-30000", "obfs": false, "up": 50, "down": 300 },
+  "hy2":     { "port": ${DEF_PORT_HY2}, "hop": "${DEF_HOP_RANGE}", "obfs": false, "up": 50, "down": 300 },
   "tuic":    { "port": 30001, "password": "", "cc": "bbr" },
   "reality": { "port": 8443, "sni": "www.microsoft.com", "short_id": "" },
   "anytls":  { "port": 8445, "password": "" },
@@ -3074,12 +3112,15 @@ do_upgrade() {
   mkdir -p "$BACKD"
   cp -a "$NODEF" "$bak" && ok "已备份：${bak}"
 
+  local MIG_HY2=0
+
   # 补齐新字段：已存在的绝不覆盖
   local added="-"
   if has python3; then
-    added="$(python3 - "$NODEF" "$VERSION" 2>/dev/null <<'PY'
+    added="$(python3 - "$NODEF" "$VERSION" "$DEF_PORT_HY2" "$DEF_HOP_RANGE" 2>/dev/null <<'PY'
 import json, sys
 p, ver = sys.argv[1], sys.argv[2]
+hp, hop = int(sys.argv[3]), sys.argv[4]
 with open(p) as f:
     d = json.load(f)
 defaults = {
@@ -3087,7 +3128,7 @@ defaults = {
     "proto": {"argo": True, "hy2": True, "tuic": True,
               "reality": False, "anytls": True},
     "landing": {"enabled": False, "uuid": "", "target": ["h3", "h2"]},
-    "hy2":     {"port": 20000, "hop": "20000-30000", "obfs": False,
+    "hy2":     {"port": hp, "hop": hop, "obfs": False,
                 "up": 50, "down": 300},
     "tuic":    {"port": 30001, "password": "", "cc": "bbr"},
     "reality": {"port": 8443, "sni": "www.microsoft.com", "short_id": ""},
@@ -3097,14 +3138,35 @@ defaults = {
 added = [k for k in defaults if k not in d]
 for k in added:
     d[k] = defaults[k]
+
+# 旧默认段 20000-30000 与 RustDesk(21115-21119) / 其他服务冲突，自动迁移到新默认段。
+# 只在「port 与 hop 都还是旧默认值」时动手，用户自己改过的一律不碰。
+mig = "-"
+h = d.get("hy2") or {}
+if str(h.get("port")) == "20000" and str(h.get("hop")) == "20000-30000":
+    h["port"] = hp
+    h["hop"] = hop
+    d["hy2"] = h
+    mig = "%s|%s" % (hp, hop)
+
 d["version"] = ver
 with open(p, "w") as f:
     json.dump(d, f, indent=2, ensure_ascii=False)
-print(",".join(added) if added else "-")
+print(("%s" % (",".join(added) if added else "-")) + ";" + mig)
 PY
 )"
+    local added_s="${added%%;*}" mig="${added##*;}"
+    added="$added_s"
     if [[ "$added" == "-" ]]; then ok "字段已是最新，无需补齐"
     else ok "已补齐字段：${added}"; fi
+    if [[ "$mig" != "-" ]]; then
+      ok "Hy2 已迁移到不冲突端口段：20000-30000 → ${mig//|/-}（监听 20000 → ${mig%%|*}）"
+      MIG_HY2=1
+    elif [[ "$(hy2_hop)" == "20000-30000" ]]; then
+      # 用户自己改过 port，只把段留着 → 不擅自改，给提示
+      warn "Hy2 跳跃段仍是 20000-30000，可能和 RustDesk(21115-21119) 等端口冲突"
+      info "要改运行：bash $0 hy2 hop 23000-27000（监听口会自动跟到段首）"
+    fi
   else
     warn "缺 python3，跳过字段补齐"
   fi
@@ -3127,7 +3189,20 @@ PY
   fi
 
   printf '\n'
-  info "服务未重启，运行中的连接不受影响"
+  if [[ $MIG_HY2 -eq 1 ]]; then
+    # 迁移改了 Hy2 监听口，必须重启 sing-box 并重建 nft 跳跃规则
+    if proto_on hy2; then
+      sb_sync && ok "sing-box 已按新监听口重启（Hy2 UDP $(hy2_port)）"
+    fi
+    warn "Oracle 安全组：请删除旧的 UDP 20000-30000 规则，改为 UDP $(hy2_hop)"
+    warn "本机 iptables 可能残留旧段放行规则，用 iptables -L INPUT -n 自查"
+    if ! proto_on hy2; then
+      info "Hy2 未开启，端口变更待下次 direct on hy2 时生效"
+    fi
+    printf '\n'
+  else
+    info "服务未重启，运行中的连接不受影响"
+  fi
   if ! proto_on hy2 && ! proto_on tuic && ! proto_on anytls; then
     warn "直连协议全部关闭：Argo 走 CF，线路差时会全挂"
     info "开一条 TCP 兜底：bash $0 direct on all（菜单 20）"
@@ -3685,15 +3760,10 @@ EOF
       2) if proto_on hy2; then direct_switch off hy2; else direct_switch on hy2; fi ;;
       3) if proto_on tuic; then direct_switch off tuic; else direct_switch on tuic; fi ;;
       4) if proto_on anytls; then direct_switch off anytls; else direct_switch on anytls; fi ;;
-      5) printf '\n  当前跳跃段：%s\n' "$(hy2_hop)"
+      5) printf '\n  当前跳跃段：%s（监听 %s）\n' "$(hy2_hop)" "$(hy2_port)"
          read -rp "  新的跳跃段（回车保持不变）: " r
          if [[ -n "${r// /}" ]]; then
-           if hop_valid "${r// /}"; then
-             node_jset hy2.hop "\"${r// /}\""
-             proto_on hy2 && sb_hop_apply
-             gen_sub >/dev/null 2>&1 || true
-             ok "已设为 ${r// /}（记得同步云安全组）"
-           fi
+           hy2_hop_set "${r// /}"
          fi ;;
       6) cert_show; printf '\n'
          if [[ -f "${CERTD}/cert.pem" ]]; then
@@ -3728,16 +3798,10 @@ do_hy2() {
   case "${1:-status}" in
     hop)
       local r="${2:-}"
-      [[ -z "$r" ]] && { err "用法：hy2 hop 20000-30000"; return 1; }
-      hop_valid "$r" || return 1
-      node_jset hy2.hop "\"$r\"" || { err "写入失败"; return 1; }
-      proto_on hy2 && sb_hop_apply
-      gen_sub >/dev/null 2>&1 || true
-      ok "跳跃段已设为 ${r}"
-      info "云安全组需同步放行 UDP ${r}"
-      ;;
+      [[ -z "$r" ]] && { err "用法：hy2 hop 23000-27000"; return 1; }
+      hy2_hop_set "$r" ;;
     ""|status) direct_show ;;
-    *) err "用法：hy2 [status|hop 20000-30000]"; return 1 ;;
+    *) err "用法：hy2 [status|hop 23000-27000]"; return 1 ;;
   esac
 }
 
@@ -3872,7 +3936,7 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 direct on all   一次开启 Hy2 + TUIC + AnyTLS（推荐）
   bash $0 direct on hy2    开启 Hy2（自动装 sing-box + 自签证书）
   bash $0 direct off tuic  关闭 TUIC
-  bash $0 hy2 hop 20000-30000  改 Hy2 端口跳跃段
+  bash $0 hy2 hop 23000-27000  改 Hy2 端口跳跃段（监听口自动跟随段首）
   bash $0 cert         查看自签证书
   bash $0 cert gen     重新生成证书（--force 强制）
   bash $0 diag         cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）

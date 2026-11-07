@@ -117,7 +117,7 @@ bash argox.sh direct               # 状态 + 交互菜单（菜单 20）
 bash argox.sh direct on all        # 一次开启 Hy2 + TUIC + AnyTLS（推荐）
 bash argox.sh direct on hy2
 bash argox.sh direct off tuic
-bash argox.sh hy2 hop 20000-30000  # 改 Hy2 端口跳跃段
+bash argox.sh hy2 hop 23000-27000  # 改 Hy2 端口跳跃段
 bash argox.sh cert                 # 查看自签证书
 bash argox.sh cert gen --force     # 重签
 ```
@@ -128,13 +128,18 @@ bash argox.sh cert gen --force     # 重签
 
 | 协议 | 端口 | 类型 |
 |---|---|---|
-| Hy2 | `20000-30000`（整段） | UDP |
+| Hy2 | `23000-27000`（整段） | UDP |
 | TUIC | `30001` | UDP |
 | AnyTLS | `8445` | TCP |
 
-Hy2 的端口跳跃靠 nftables 的 `redirect` 实现，sing-box 实际只监听 `20000` 一个口，
-其余 9999 个端口只是重定向规则，不占进程不占内存。**整段必须放行**——
+Hy2 的端口跳跃靠 nftables 的 `redirect` 实现，sing-box 实际只监听 `23000` 一个口，
+其余 3999 个端口只是重定向规则，不占进程不占内存。**整段必须放行**——
 只放单个端口会导致客户端跳到未放行端口时随机断流，极难排查。
+
+> 默认段 `23000-27000` 是刻意避开 `20000-30000` 的：那一段常被 RustDesk（21115-21119）、
+> 各种自建服务、面板占用。改段用 `hy2 hop <起-止>`，**监听口会自动跟随段首**，
+> 不用手动改端口；段首被占用时直接报错并保持原配置不变。
+> 老版本升级到 v2.3.2 时，若端口和段都还是旧默认值（`20000` / `20000-30000`），`upgrade` 会自动迁移。
 
 自签证书没有受信 CA，客户端要勾「跳过证书验证」，订阅链接里已自动带 `insecure=1`。
 
@@ -222,7 +227,7 @@ bash argox.sh ips <链接|文件>           # 导入本机测速结果（保序�
 bash argox.sh hop on     # 出口跳板（off / on [socks|http]）
 bash argox.sh landing on # 住宅落地（off / status / target h3,h2,ws）
 bash argox.sh direct on all # 直连协议（status / on|off hy2|tuic|anytls|all）
-bash argox.sh hy2 hop 20000-30000 # Hy2 端口跳跃段
+bash argox.sh hy2 hop 23000-27000 # Hy2 端口跳跃段
 bash argox.sh cert       # 自签证书（show / gen [--force]）
 bash argox.sh diag       # cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）
 bash argox.sh diag http2 # UDP 7844 被封时强制走 TCP
