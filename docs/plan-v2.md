@@ -1,7 +1,8 @@
 # argox v2.0 方案（双核合并版 · 决策已定稿）
 
-> 状态：**阶段 1、2 已完成**（v2.0.0 新命名 + `check` + `upgrade`；v2.1.0 住宅落地）。
-> 下一步：阶段 3（sing-box + 自签证书 + Hy2 / TUIC + 端口跳跃）。
+> 状态：**阶段 1、2、3 已完成**（v2.0.0 新命名 + `check` + `upgrade`；v2.1.0 住宅落地；
+> v2.2.0 sing-box 双核 + 自签证书 + Hy2 / TUIC / AnyTLS + 端口跳跃，WS 下线）。
+> 下一步：阶段 4（Reality，默认关）。
 > 原状态记录：5 项决策已拍板（A/B/C/D/E 见第 0 节）。
 > 目标：把现有 `argox.sh`（Argo + Xray XHTTP）与 `install_myproxy.sh`（多协议直连）合并为一套脚本，
 > 双核（Xray + sing-box）各管一半协议，全量使用自签证书。
@@ -14,7 +15,7 @@
 |---|---|---|
 | **A** 目录与命名 | 保持 `/opt/argox` + `argox.sh`，版本号 `2.0.0`；**走隧道的加 `Argo-` 前缀，直连用裸协议名，住宅加 `-RH`** | 见 2.1 节点表 |
 | **B** Hy2 端口段 | **菜单可配置**，默认 `20000-30000` | 见 5.4，含"要不要一万个"的解答 |
-| **C** Reality / AnyTLS | 都**默认关**，菜单可开 | 见 7，端口在未开启时不监听 |
+| **C** Reality / AnyTLS | Reality **默认关**；**AnyTLS 默认开**（唯一 TCP 兜底） | 见 2.1 + 2.3 |
 | **D** Shadowsocks 2022 | **不加** | 从方案中彻底移除 |
 | **E** 默认安装模式 | **模式 B：Argo + Hy2 + TUIC**；`Reality-RH` 暂不开，但**以后菜单可随时加** | 见 2.5 + 7 |
 
@@ -79,17 +80,23 @@ sing-box 官方文档对此有一句直白警告：
 | # | 节点名 | 内核 | 入口 | 出口 | 证书 | 默认 |
 |---|---|---|---|---|---|---|
 | 1 | `Argo-H3` | Xray | CF 隧道（QUIC） | VPS 原生 | CF 托管 | 开 |
-| 2 | `Argo-H3-RH` | Xray | CF 隧道（QUIC，UID②） | Aimili | CF 托管 | 开 |
-| 3 | `Argo-H2` | Xray | CF 隧道（TCP） | VPS 原生 | CF 托管 | 开 |
-| 4 | `Argo-H2-RH` | Xray | CF 隧道（TCP，UID②） | Aimili | CF 托管 | 开 |
-| 5 | `Argo-WS` | Xray | CF 隧道（ws 子域） | VPS 原生 | CF 托管 | 开 |
-| 6 | `Hy2` | sing-box | 直连 UDP + 端口跳跃 | VPS 原生 | 自签 | 开 |
-| 7 | `TUIC` | sing-box | 直连 UDP | VPS 原生 | 自签 | 开 |
+| 2 | `Argo-H2` | Xray | CF 隧道（TCP） | VPS 原生 | CF 托管 | 开 |
+| 3 | `Hy2` | sing-box | 直连 UDP + 端口跳跃 | VPS 原生 | 自签 | 开 |
+| 4 | `TUIC` | sing-box | 直连 UDP | VPS 原生 | 自签 | 开 |
+| 5 | `AnyTLS` | sing-box | 直连 TCP 8445 | VPS 原生 | 自签 | 开 |
+| 6 | `Argo-H3-RH` | Xray | CF 隧道（QUIC，UID②） | Aimili | CF 托管 | 开 |
+| 7 | `Argo-H2-RH` | Xray | CF 隧道（TCP，UID②） | Aimili | CF 托管 | 开 |
 | 8 | `Reality` | Xray | 直连 TCP 8443 | VPS 原生 | 无 | **关** |
 | 9 | `Reality-RH` | Xray | 直连 TCP 8443（UID②） | Aimili | 无 | **关** |
-| 10 | `AnyTLS` | sing-box | 直连 TCP 8445 | VPS 原生 | 自签 | **关** |
 
-**默认开启 7 条**（1–7），即模式 B。Reality 两条 + AnyTLS 默认关，菜单 8 一键开。
+**默认开启 7 条**（1–7）。Reality 两条默认关，菜单 8 一键开。
+
+> **v2.2.0 两处调整**（实测驱动）：
+> - **`Argo-WS` 下线**：与 `Argo-H2` 同为 TCP 443、路径完全重叠，属于下位替代，
+>   留着只增加选择成本。8002 入站保留，避免 CF 侧 ws 子域路由 502。
+> - **`AnyTLS` 改为默认开**：实测本机到 CF 丢包 60% 时 Argo 全灭，
+>   而 Hy2/TUIC 都是 UDP，一旦运营商对 UDP 限速就没有任何 TCP 通路。
+>   AnyTLS 是唯一的 TCP 兜底，必须默认开。
 
 > 命名替换对照（脚本内部 tag 不变，只改客户端显示名，避免配置漂移）：
 > `argox-H3 → Argo-H3`、`argox-H3-住宅 → Argo-H3-RH`、`argox-Hy2 → Hy2`、`argox-Reality → Reality` …
@@ -102,13 +109,14 @@ sing-box 官方文档对此有一句直白警告：
 订阅里的顺序固定为：
 
 ```
-Argo-H3  →  Argo-H2  →  Argo-WS        ← Argo 组，日常主力
-Hy2      →  TUIC                       ← 直连 UDP，要有速度时切
-Reality  →  AnyTLS                     ← 直连 TCP（阶段 4，默认关）
-Argo-H3-RH  →  Argo-H2-RH  →  (WS-RH) → (Reality-RH)   ← 落地家宽，永远排最后
+Argo-H3  →  Argo-H2                    ← 走 CF，备用
+Hy2      →  TUIC  →  AnyTLS            ← 直连 VPS，主力（UDP 两条 + TCP 一条）
+Argo-H3-RH  →  Argo-H2-RH              ← 落地家宽，永远排最后
 ```
 
 原则：**默认出口的节点在前，落地家宽整体垫底**。
+直连组内部维持「UDP 主力 → UDP 备选 → TCP 兜底」的顺序，
+客户端里从上往下试，最后那条 TCP 一定能通。
 `-RH` 是特殊用途（目标站要求住宅 IP 时临时切），放末尾不干扰日常切换。
 
 `build_links()` 顶部有注释固化这条约定，加新协议时按段落插入，不要打乱顺序。
@@ -122,33 +130,36 @@ Argo-H3-RH  →  Argo-H2-RH  →  (WS-RH) → (Reality-RH)   ← 落地家宽，
 | VMess | 去掉 | 多一层无用加密，客户端对它的 XHTTP 支持也弱 |
 | Shadowsocks 2022 | **不加**（D） | 已有 Hy2/TUIC 两条速度快线，SS 定位重复 |
 
-### 2.3 AnyTLS 的定位与限制（为什么默认关）
+### 2.3 AnyTLS 的定位（v2.2.0 起改为默认开）
 
 AnyTLS 解决的是 **TLS-in-TLS 指纹**：代理把用户 TLS 流量装进自己 TLS 里发出去，
 形成"套娃"模式，USENIX Security 2024 有专文用包长/时序统计特征检测它。
 
-在我们的架构里：
+**改成默认开的理由不是防指纹，是保命：**
 
-| 场景 | 需要 AnyTLS 吗 |
-|---|---|
-| Argo 三条（客户端 → CF） | **不需要**。TLS-in-TLS 发生在 CF 覆盖段，DPI 不敢对 CF 大规模深检 |
-| 直连 Reality | 部分需要。Reality 抗主动探测，AnyTLS 是特征完全不同的另一条 TCP 腿 |
+实测沈阳本地到 Cloudflare 丢包 60%、328ms 时，`Argo-H3` / `Argo-H2` 全部 -1，
+而同一时刻到 VPS 直连是 **0% 丢包**。结论：Argo 只能当备用，不能当主力。
 
-**它的真实定位是"Reality 被封时的第三条腿"，不是主力。**
+但 `Hy2` 和 `TUIC` **都是 UDP**。运营商一旦对 UDP 做 QoS（晚高峰很常见），
+两条同时失效，就只剩 Argo 那条已经废掉的 CF 隧道——等于全挂。
 
-真正的限制在客户端：
+**AnyTLS 是唯一既不依赖 UDP、也不依赖 CF 的通路**，所以必须默认开。
+
+客户端支持情况（决定它在你设备上能不能用）：
 
 | 客户端 | AnyTLS |
 |---|---|
 | sing-box 1.12+ | 支持 |
 | mihomo / FlClash | 支持 |
 | Shadowrocket 2.2.65+ | 支持 |
-| **v2rayN（Xray 内核）** | **不支持** |
+| v2rayN 7.x（sing-box 内核） | 支持 |
+| **v2rayN 6.x / 纯 Xray 内核** | **不支持** |
 
-v2rayN 的 Xray 内核没有 AnyTLS 实现，要用得把 VLESS 那行切到 sing-box 内核——
-而那会导致 H3 节点失效（sing-box 不认 XHTTP）。**两者互斥**。
+v2rayN 的 Xray 内核没有 AnyTLS 实现。7.x 可以按节点切 sing-box 内核；
+6.x 无解，那条节点在客户端里点不动。
 
-因此：装、但默认关。
+**客户端不支持 AnyTLS 时的替代方案**：开 `Reality`（Xray 内核原生支持）。
+它同样是直连 TCP，需要额外放行 TCP 8443，用菜单 8 开启，效果等价。
 
 ### 2.4 家宽落地：双 UUID 分流（不占额外端口）
 

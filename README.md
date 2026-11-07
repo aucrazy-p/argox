@@ -42,6 +42,7 @@ bash /root/argox.sh
  8) 更换 UUID             17) 自检 check
  9) 系统优化              18) 升级配置（补字段）
                           19) 住宅落地
+                          20) 直连协议（Hy2 / TUIC / AnyTLS）
 ```
 
 ## 订阅
@@ -52,20 +53,64 @@ bash /root/argox.sh
 https://<订阅子域>/<订阅令牌>
 ```
 
-默认输出 3 个节点（`domain` 模式），节点名与顺序固定：
+默认输出 5 个节点（`domain` 模式），节点名与顺序固定：
 
 ```
-Argo-H3     主力，QUIC 抗丢包
-Argo-H2     同链路的 TCP 对照
-Argo-WS     最后兜底（ws 子域）
+Argo-H3     CF 隧道，QUIC 抗丢包（CF 线路差时就废）
+Argo-H2     CF 隧道，TCP 对照
+Hy2         直连 VPS，UDP，带端口跳跃（速度最快）
+TUIC        直连 VPS，UDP，备选
+AnyTLS      直连 VPS，TCP，UDP 被限速时的唯一出路
 ```
 
-命名约定：走 Cloudflare 隧道的加 `Argo-` 前缀；直连 VPS 公网端口的用裸协议名
-（`Hy2` / `TUIC` / `Reality` / `AnyTLS`）；住宅落地版统一加 `-RH` 后缀，
-且全部排在列表最后。当前版本只启用 Argo 三条，直连协议在后续版本接入。
+命名约定：走 Cloudflare 隧道的加 `Argo-` 前缀；直连 VPS 公网端口的用裸协议名；
+住宅落地版统一加 `-RH` 后缀，且全部排在列表最后。
+
+**WS 已下线**：它和 H2 同为 TCP 443、路径完全重叠，属于下位替代，
+留着只会干扰选择。
 
 地址都写域名，由客户端自行解析到最近的 CF 节点。
 需要按 IP 展开时，菜单 13 → `6) 节点地址模式` 切成 `ip`，再菜单 14 导入优选 IP。
+直连协议（Hy2 / TUIC / AnyTLS）不受地址模式影响，永远写 VPS 公网 IP。
+
+## 直连协议（Hy2 / TUIC / AnyTLS）
+
+不走 Cloudflare，直接连 VPS 公网端口。CF 线路差的时候这是主力。
+
+```bash
+bash argox.sh direct               # 状态 + 交互菜单（菜单 20）
+bash argox.sh direct on all        # 一次开启 Hy2 + TUIC + AnyTLS（推荐）
+bash argox.sh direct on hy2
+bash argox.sh direct off tuic
+bash argox.sh hy2 hop 20000-30000  # 改 Hy2 端口跳跃段
+bash argox.sh cert                 # 查看自签证书
+bash argox.sh cert gen --force     # 重签
+```
+
+首次开启会自动装 sing-box、生成 ECC P-256 自签证书（10 年）、写配置、起服务。
+
+**云安全组必须放行三条**：
+
+| 协议 | 端口 | 类型 |
+|---|---|---|
+| Hy2 | `20000-30000`（整段） | UDP |
+| TUIC | `30001` | UDP |
+| AnyTLS | `8445` | TCP |
+
+Hy2 的端口跳跃靠 nftables 的 `redirect` 实现，sing-box 实际只监听 `20000` 一个口，
+其余 9999 个端口只是重定向规则，不占进程不占内存。**整段必须放行**——
+只放单个端口会导致客户端跳到未放行端口时随机断流，极难排查。
+
+自签证书没有受信 CA，客户端要勾「跳过证书验证」，订阅链接里已自动带 `insecure=1`。
+
+### 协议优先级
+
+```
+Hy2      ← 首选，UDP + BBR，速度最好
+TUIC     ← Hy2 被限速时换它，同样 UDP
+AnyTLS   ← UDP 全被 QoS 时的唯一活路（TCP，靠 TLS 伪装）
+Argo-*   ← 上面全挂才用（走 CF；国内到 CF 丢包严重时不可用）
+```
 
 ## 自检
 
@@ -140,6 +185,9 @@ bash argox.sh sub        # Base64 订阅内容
 bash argox.sh ips
 bash argox.sh hop on     # 出口跳板（off / on [socks|http]）
 bash argox.sh landing on # 住宅落地（off / status / target h3,h2,ws）
+bash argox.sh direct on all # 直连协议（status / on|off hy2|tuic|anytls|all）
+bash argox.sh hy2 hop 20000-30000 # Hy2 端口跳跃段
+bash argox.sh cert       # 自签证书（show / gen [--force]）
 bash argox.sh diag       # cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）
 bash argox.sh diag http2 # UDP 7844 被封时强制走 TCP
 bash argox.sh check      # 自检（-q 静默，只返回退出码）

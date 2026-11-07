@@ -14,12 +14,14 @@
 
 set -uo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
 BASE="/opt/argox"
 CONF="${BASE}/config.json"
+SBCONF="${BASE}/sb.json"        # sing-box 配置（Hy2 / TUIC）
+CERTD="${BASE}/cert"            # 自签证书
 NODEF="${BASE}/node.json"
 LOGD="${BASE}/logs"
 SUBD="${BASE}/sub"
@@ -35,15 +37,25 @@ TOKEN_DIR="/etc/argox"
 
 XRAY_BIN="/usr/local/bin/argox-xray"
 CFD_BIN="/usr/local/bin/cloudflared"
+SB_BIN="/usr/local/bin/argox-sb"
 
 SVC_XRAY="argox-xray"
 SVC_TUN="argox-tunnel"
 SVC_SUB="argox-sub"
+SVC_SB="argox-sb"
 
 # ---- 默认端口（全部仅本机，不开放任何公网端口）-------------------------------
 DEF_PORT_XHTTP=8001     # 仅本机，给 Argo 隧道回源
 DEF_PORT_WS=8002        # 仅本机，给 Argo 隧道回源（WS 兜底）
 DEF_PORT_SUB=8099       # 仅本机，订阅服务
+
+# ---- 直连协议（sing-box）默认值 ----------------------------------------------
+# 这两个端口必须开放公网，Hy2 另需整段跳跃端口
+DEF_PORT_HY2=20000      # Hy2 实监听端口（UDP）
+DEF_PORT_TUIC=30001     # TUIC 监听端口（UDP）
+DEF_PORT_ANYTLS=8445    # AnyTLS 监听端口（TCP）——UDP 全灭时的唯一出路
+DEF_HOP_RANGE="20000-30000"   # Hy2 端口跳跃段，须含 DEF_PORT_HY2
+SB_VER_DEFAULT="1.12.0"       # sing-box 默认版本
 
 # ---- 节点显示名（只影响客户端里看到的名字，不影响服务/tag/路径）--------------
 # 规则：走 CF 隧道的加 Argo- 前缀；直连 VPS 公网端口的用裸协议名；
@@ -388,6 +400,59 @@ landing_wants() { # $1=h3|h2|ws
 }
 
 # ==============================================================================
+#  直连协议（sing-box：Hy2 / TUIC）状态读取
+# ==============================================================================
+sb_installed() { [[ -x "$SB_BIN" ]] && [[ -f "$SBCONF" ]]; }
+
+# proto 开关：proto.hy2 / proto.tuic / proto.argo
+proto_on() { [[ "$(node_jget "proto.$1" 2>/dev/null)" == "true" ]]; }
+
+hy2_port() { local p; p="$(node_jget hy2.port 2>/dev/null)"; printf '%s' "${p:-$DEF_PORT_HY2}"; }
+hy2_hop()  { local h; h="$(node_jget hy2.hop  2>/dev/null)"; printf '%s' "${h:-$DEF_HOP_RANGE}"; }
+tuic_port() { local p; p="$(node_jget tuic.port 2>/dev/null)"; printf '%s' "${p:-$DEF_PORT_TUIC}"; }
+anytls_port() { local p; p="$(node_jget anytls.port 2>/dev/null)"; printf '%s' "${p:-$DEF_PORT_ANYTLS}"; }
+
+# Hy2 / AnyTLS 密码直接复用主 UUID：少一个字段，就少一处漂移
+hy2_pass() { node_get uuid; }
+anytls_pass() { node_get uuid; }
+
+# TUIC 密码：首次读取时生成并落盘，之后固定
+tuic_pass() {
+  local p; p="$(node_jget tuic.password 2>/dev/null)"
+  if [[ -z "$p" ]]; then
+    p="$(rand_hex 16)"
+    node_jset tuic.password "\"$p\"" >/dev/null 2>&1 || true
+  fi
+  printf '%s' "$p"
+}
+
+# VPS 公网 IP（生成直连节点要用），首次探测后缓存进 node.json
+vps_ip() {
+  local ip; ip="$(node_jget vps_ip 2>/dev/null)"
+  if [[ -z "$ip" || "$ip" == "null" ]]; then
+    ip="$(curl -s --max-time 6 https://api.ipify.org 2>/dev/null || true)"
+    [[ -z "$ip" ]] && ip="$(curl -s --max-time 6 https://ifconfig.me 2>/dev/null || true)"
+    [[ -z "$ip" ]] && ip="$(curl -s --max-time 6 https://ipv4.icanhazip.com 2>/dev/null | tr -d '\r\n' || true)"
+    if [[ -n "$ip" ]]; then node_jset vps_ip "\"${ip}\"" >/dev/null 2>&1 || true; fi
+  fi
+  printf '%s' "${ip:-}"
+}
+
+# 跳跃段校验：返回 0 通过，否则打印原因
+hop_valid() { # $1=起-止
+  local r="$1"
+  [[ "$r" =~ ^([0-9]+)-([0-9]+)$ ]] || { err "格式必须是 起-止，如 20000-30000"; return 1; }
+  local s="${BASH_REMATCH[1]}" e="${BASH_REMATCH[2]}"
+  (( s < e )) || { err "起始端口必须小于结束端口"; return 1; }
+  (( s >= 1024 && e <= 65535 )) || { err "端口必须在 1024-65535 之间"; return 1; }
+  (( e - s <= 20000 )) || { err "跨度不能超过 20000（防止误写成 1-65535）"; return 1; }
+  local hp tp; hp="$(hy2_port)"; tp="$(tuic_port)"
+  (( s <= hp && hp <= e )) || { err "跳跃段必须包含 Hy2 监听端口 ${hp}"; return 1; }
+  (( tp < s || tp > e )) || { err "TUIC 端口 ${tp} 落在跳跃段内，会互相抢占"; return 1; }
+  return 0
+}
+
+# ==============================================================================
 #  系统优化
 # ==============================================================================
 apply_sysctl() {
@@ -469,6 +534,276 @@ install_cloudflared() {
   install -m 0755 "$tmp" "$CFD_BIN"
   rm -f "$tmp"
   ok "cloudflared 已安装：$("$CFD_BIN" --version 2>/dev/null | head -1)"
+}
+
+install_singbox() {
+  local arch; arch="$(detect_arch)"
+  [[ "$arch" == "unknown" ]] && die "不支持的架构：$(uname -m)"
+
+  if [[ -x "$SB_BIN" ]]; then
+    info "已安装 sing-box $("$SB_BIN" version 2>/dev/null | head -1 | awk '{print $3}')，跳过下载"
+    return 0
+  fi
+
+  local ver="${SB_VER:-$SB_VER_DEFAULT}"
+  local pkg="sing-box-${ver}-linux-${arch}"
+  local url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${pkg}.tar.gz"
+
+  step "下载 sing-box v${ver}（${arch}）"
+  local tmp; tmp="$(mktemp -d)"
+  fetch "${tmp}/sb.tar.gz" "$url" || die "sing-box 下载失败（版本 ${ver} 可能不适用于 ${arch}）"
+  tar -xzf "${tmp}/sb.tar.gz" -C "$tmp" 2>/dev/null || die "sing-box 解压失败"
+
+  local bin; bin="$(find "$tmp" -type f -name sing-box -perm -u+x 2>/dev/null | head -1)"
+  [[ -n "$bin" ]] || bin="$(find "$tmp" -type f -name sing-box 2>/dev/null | head -1)"
+  [[ -n "$bin" ]] || die "压缩包内未找到 sing-box 二进制"
+
+  install -m 0755 "$bin" "$SB_BIN"
+  rm -rf "$tmp"
+  ok "sing-box 已安装：$("$SB_BIN" version 2>/dev/null | head -1)"
+}
+
+# ==============================================================================
+#  自签证书（Hy2 / TUIC 共用一份 ECC P-256）
+# ==============================================================================
+cert_gen() {
+  local sni; sni="$(node_get tunnel_host 2>/dev/null || true)"
+  [[ -z "$sni" ]] && sni="argox.local"
+  mkdir -p "$CERTD"; chmod 700 "$CERTD"
+
+  if [[ -f "${CERTD}/cert.pem" && -f "${CERTD}/key.pem" && "${1:-}" != "--force" ]]; then
+    info "证书已存在（cert show 查看；cert gen --force 重签）"
+    return 0
+  fi
+
+  step "生成自签证书（ECC P-256 / 3650 天 / SAN=${sni}）"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout "${CERTD}/key.pem" -out "${CERTD}/cert.pem" \
+    -days 3650 -nodes -subj "/CN=${sni}" \
+    -addext "subjectAltName=DNS:${sni}" >/dev/null 2>&1 \
+    || die "证书生成失败（openssl 版本可能过低，需要 1.1.1+）"
+  chmod 600 "${CERTD}/cert.pem" "${CERTD}/key.pem"
+  ok "证书已生成"
+}
+
+cert_show() {
+  if [[ ! -f "${CERTD}/cert.pem" ]]; then
+    warn "尚未生成证书（cert gen 生成）"
+    return 1
+  fi
+  local subj end left fp
+  subj="$(openssl x509 -noout -subject -in "${CERTD}/cert.pem" 2>/dev/null | sed 's/^subject=//')"
+  end="$(openssl x509 -noout -enddate  -in "${CERTD}/cert.pem" 2>/dev/null | sed 's/^notAfter=//')"
+  fp="$(openssl x509 -noout -fingerprint -sha256 -in "${CERTD}/cert.pem" 2>/dev/null | sed 's/^.*=//')"
+  left=$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+  printf '  主体     : %s\n' "$subj"
+  printf '  到期     : %s（剩 %s 天）\n' "$end" "$left"
+  printf '  指纹     : %s\n' "${fp:0:47}..."
+  printf '  客户端   : 一律 skip-cert-verify / insecure=1\n'
+  [[ $left -lt 30 ]] && warn "证书即将过期，执行 cert gen --force 重签"
+  return 0
+}
+
+# ==============================================================================
+#  sing-box 配置（Hy2 / TUIC）
+# ==============================================================================
+sb_inbound_hy2() {
+  local hp; hp="$(hy2_port)"; local pw; pw="$(hy2_pass)"
+  cat <<EOF
+    {
+      "type": "hysteria2",
+      "tag": "hy2-in",
+      "listen": "::",
+      "listen_port": ${hp},
+      "users": [ { "password": "${pw}" } ],
+      "tls": {
+        "enabled": true,
+        "alpn": [ "h3" ],
+        "certificate_path": "${CERTD}/cert.pem",
+        "key_path": "${CERTD}/key.pem"
+      },
+      "masquerade": "https://www.bing.com/"
+    }
+EOF
+}
+
+sb_inbound_tuic() {
+  local tp; tp="$(tuic_port)"; local uuid; uuid="$(node_get uuid)"; local pw; pw="$(tuic_pass)"
+  cat <<EOF
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": ${tp},
+      "users": [ { "uuid": "${uuid}", "password": "${pw}" } ],
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "alpn": [ "h3" ],
+        "certificate_path": "${CERTD}/cert.pem",
+        "key_path": "${CERTD}/key.pem"
+      }
+    }
+EOF
+}
+
+# AnyTLS：TCP + TLS，UDP 全被 QoS 时的唯一活路
+sb_inbound_anytls() {
+  local ap; ap="$(anytls_port)"; local pw; pw="$(anytls_pass)"
+  cat <<EOF
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": ${ap},
+      "users": [ { "password": "${pw}" } ],
+      "tls": {
+        "enabled": true,
+        "alpn": [ "h2", "http/1.1" ],
+        "certificate_path": "${CERTD}/cert.pem",
+        "key_path": "${CERTD}/key.pem"
+      }
+    }
+EOF
+}
+
+write_sb_config() {
+  mkdir -p "$LOGD"
+  local body=""
+  if proto_on hy2; then body="$(sb_inbound_hy2)"; fi
+  if proto_on tuic; then
+    if [[ -n "$body" ]]; then body="${body},"$'\n'; fi
+    body="${body}$(sb_inbound_tuic)"
+  fi
+  if proto_on anytls; then
+    if [[ -n "$body" ]]; then body="${body},"$'\n'; fi
+    body="${body}$(sb_inbound_anytls)"
+  fi
+
+  if [[ -z "$body" ]]; then
+    warn "Hy2 / TUIC / AnyTLS 都未开启，sing-box 不启用"
+    return 1
+  fi
+
+  cat > "$SBCONF" <<EOF
+{
+  "log": {
+    "level": "warn",
+    "output": "${LOGD}/sb.log",
+    "timestamp": true
+  },
+  "inbounds": [
+${body}
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ]
+}
+EOF
+  chmod 600 "$SBCONF"
+
+  "$SB_BIN" check -c "$SBCONF" >/dev/null 2>&1 || {
+    err "sing-box 配置校验失败，输出如下："
+    "$SB_BIN" check -c "$SBCONF" 2>&1 | tail -10
+    return 1
+  }
+}
+
+# 端口跳跃：nftables redirect，只改目的端口，sing-box 实际只监听一个口
+sb_hop_apply() {
+  local hp; hp="$(hy2_port)"; local rng; rng="$(hy2_hop)"
+
+  if ! has nft; then
+    warn "未安装 nftables，端口跳跃不可用（apt install -y nftables）"
+    info "不影响 Hy2 本身：客户端固定用 ${hp} 也能工作"
+    return 1
+  fi
+
+  nft delete table inet argox_hop 2>/dev/null || true
+
+  if [[ -z "$rng" || "$rng" == "$hp" ]]; then
+    info "跳跃段未设置，跳过 nft 规则"
+    return 0
+  fi
+
+  hop_valid "$rng" || return 1
+
+  if nft -f - 2>/dev/null <<EOF
+table inet argox_hop {
+  chain prerouting {
+    type nat hook prerouting priority dstnat - 5; policy accept;
+    udp dport ${rng} redirect to :${hp}
+  }
+}
+EOF
+  then
+    ok "端口跳跃生效：UDP ${rng} → ${hp}"
+    if has docker; then
+      warn "检测到 Docker：它可能接管 nftables，跳跃失效时先看 nft list table inet argox_hop"
+    fi
+    return 0
+  else
+    err "nft 规则写入失败"
+    return 1
+  fi
+}
+
+write_sb_service() {
+  cat > "/etc/systemd/system/${SVC_SB}.service" <<EOF
+[Unit]
+Description=argox sing-box (Hysteria2 / TUIC)
+Documentation=https://sing-box.sagernet.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${SB_BIN} run -c ${SBCONF}
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+# 重建 sing-box 配置 → 起服务 → 应用跳跃规则；失败自动停掉服务，不半死不活
+sb_sync() {
+  if ! proto_on hy2 && ! proto_on tuic && ! proto_on anytls; then
+    systemctl stop "$SVC_SB" 2>/dev/null || true
+    nft delete table inet argox_hop 2>/dev/null || true
+    info "Hy2 / TUIC / AnyTLS 均关闭，sing-box 已停止"
+    return 0
+  fi
+
+  cert_gen || return 1
+  write_sb_config || return 1
+  write_sb_service
+
+  systemctl enable "$SVC_SB" >/dev/null 2>&1 || true
+  systemctl restart "$SVC_SB" 2>/dev/null
+  sleep 2
+  if ! svc_active "$SVC_SB"; then
+    err "sing-box 启动失败："
+    journalctl -u "$SVC_SB" -n 15 --no-pager 2>/dev/null | tail -15
+    return 1
+  fi
+
+  proto_on hy2 && sb_hop_apply
+  ok "sing-box 运行中（$(proto_label)）"
+}
+
+proto_label() {
+  local out=()
+  proto_on hy2    && out+=("Hy2:$(hy2_port)")
+  proto_on tuic   && out+=("TUIC:$(tuic_port)")
+  proto_on anytls && out+=("AnyTLS:$(anytls_port)")
+  local IFS=" "
+  printf '%s' "${out[*]:-无}"
 }
 
 # ==============================================================================
@@ -1165,6 +1500,41 @@ urlenc() { # 简单 URL 编码（path 里的 / 需编码）
   printf '%s' "$out"
 }
 
+# 直连 VPS 节点（Hy2 / TUIC）：不走 CF，地址固定是 VPS 公网 IP。
+# 位置固定：Argo 之后、-RH 之前。拿不到公网 IP 就整体跳过，不生成半坏的链接。
+emit_direct_links() {
+  local ip; ip="$(vps_ip)"
+  if [[ -z "$ip" ]]; then
+    warn "拿不到 VPS 公网 IP，跳过 Hy2 / TUIC 节点（可在菜单 10 手动填）"
+    return 0
+  fi
+  local sni; sni="$(node_get tunnel_host 2>/dev/null || true)"
+  [[ -z "$sni" ]] && sni="$ip"
+
+  if proto_on hy2; then
+    local hp pw hop q
+    hp="$(hy2_port)"; pw="$(hy2_pass)"; hop="$(hy2_hop)"
+    q="sni=${sni}&insecure=1&alpn=h3"
+    [[ -n "$hop" ]] && q="${q}&mport=${hop}"
+    printf 'hysteria2://%s@%s:%s/?%s#%s\n' "$pw" "$ip" "$hp" "$q" "$NAME_HY2"
+  fi
+
+  if proto_on tuic; then
+    local tp uuid tpw
+    tp="$(tuic_port)"; uuid="$(node_get uuid)"; tpw="$(tuic_pass)"
+    printf 'tuic://%s:%s@%s:%s?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=%s&allow_insecure=1#%s\n' \
+      "$uuid" "$tpw" "$ip" "$tp" "$sni" "$NAME_TUIC"
+  fi
+
+  # AnyTLS：TCP 通道，UDP 被限速时唯一能用的
+  if proto_on anytls; then
+    local ap apw
+    ap="$(anytls_port)"; apw="$(anytls_pass)"
+    printf 'anytls://%s@%s:%s?security=tls&sni=%s&insecure=1&allowInsecure=1#%s\n' \
+      "$apw" "$ip" "$ap" "$sni" "$NAME_ANYTLS"
+  fi
+}
+
 # 落地家宽节点（-RH）：地址固定用域名，永远排在订阅最后。
 # 顺序固定 h3 → h2 → ws，与主节点保持一致；IP 模式下也用域名，避免节点数翻倍。
 emit_landing_links() { # $1=host $2=ws_host $3=ex $4=enc_pw
@@ -1202,21 +1572,22 @@ build_links() {
   mode="$(node_mode)"
 
   # ⚠ 节点顺序约定（客户端按订阅里的先后显示，不要随意打乱）：
-  #    1) Argo 三条：H3 → H2 → WS
-  #    2) 直连 UDP：Hy2 → TUIC
+  #    1) Argo 两条：H3 → H2（同一入站，只差 ALPN；UDP 挂时靠 H2 兜底）
+  #    2) 直连 UDP：Hy2 → TUIC（直连 VPS，不经 CF）
   #    3) 直连 TCP：Reality → AnyTLS（阶段 4，默认关）
   #    4) 落地家宽（-RH）全部追加在最后
   # 理由：默认出口的节点排前面，-RH 是特殊用途，放末尾不干扰日常切换。
+  # WS 已下线：它与 H2 同为 TCP 443，路径完全重叠，属于下位替代，留着只会干扰选择。
 
-  # ---------- 域名模式：3 条，地址写域名，由客户端解析到最近的 CF 节点 ----------
+  # ---------- 域名模式：地址写域名，由客户端解析到最近的 CF 节点 ----------
   if [[ "$mode" != "ip" ]]; then
     printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s\n' \
       "$uuid" "$host" "$host" "$ex" "$host" "$NAME_H3"
     printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s\n' \
       "$uuid" "$host" "$host" "$ex" "$host" "$NAME_H2"
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#%s\n' \
-      "$uuid" "$ws_host" "$ws_host" "$enc_pw" "$ws_host" "$NAME_WS"
-    # 4) 落地家宽垫底
+    # 直连 UDP（Hy2 / TUIC）
+    emit_direct_links
+    # 落地家宽垫底
     emit_landing_links "$host" "$ws_host" "$ex" "$enc_pw"
     return 0
   fi
@@ -1255,14 +1626,12 @@ build_links() {
     printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s-%02d-%s\n' \
       "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$NAME_H2" "$n" "${tags[$i]}"
   done
-  # WS 兜底：必须走 ws 子域（ws 子域在 CF 侧指向 8002）
-  for (( i=0; i<${#ips[@]} && i<MAX_WS_NODES; i++ )); do
-    n=$((i+1))
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#%s-%02d-%s\n' \
-      "$uuid" "${ips[$i]}" "$ws_host" "$enc_pw" "$ws_host" "$NAME_WS" "$n" "${tags[$i]}"
-  done
+  # WS 已下线（与 H2 路径重叠），IP 模式下同样不再展开
 
-  # 4) 落地家宽垫底（IP 模式下也用域名，住宅落地是特殊用途，稳定优先）
+  # 直连 UDP（Hy2 / TUIC）：走 VPS 公网 IP，与优选 IP 无关
+  emit_direct_links
+
+  # 落地家宽垫底（IP 模式下也用域名，住宅落地是特殊用途，稳定优先）
   emit_landing_links "$host" "$ws_host" "$ex" "$enc_pw"
 }
 
@@ -1432,14 +1801,16 @@ do_status() {
   printf '%sargox 状态%s\n' "$C_B" "$C_R"
   hr
 
-  local st_x st_t st_s
+  local st_x st_t st_s st_b
   if svc_active "$SVC_XRAY"; then st_x="${C_GRN}● 运行中${C_R}"; else st_x="${C_RED}○ 已停止${C_R}"; fi
   if svc_active "$SVC_TUN";  then st_t="${C_GRN}● 运行中${C_R}"; else st_t="${C_RED}○ 已停止${C_R}"; fi
   if svc_active "$SVC_SUB";  then st_s="${C_GRN}● 运行中${C_R}"; else st_s="${C_RED}○ 已停止${C_R}"; fi
+  if svc_active "$SVC_SB";   then st_b="${C_GRN}● 运行中${C_R}"; else st_b="${C_DIM}○ 未启用${C_R}"; fi
 
   printf '  Xray       : %s\n' "$st_x"
   printf '  Tunnel     : %s\n' "$st_t"
   printf '  订阅服务   : %s\n' "$st_s"
+  printf '  sing-box   : %s\n' "$st_b"
   printf '  版本       : %s\n' "$VERSION"
 
   if installed; then
@@ -1455,6 +1826,11 @@ do_status() {
       printf '  出口跳板   : 全部走 %s:%s (%s)\n' "$(node_hop_addr)" "$(node_hop_port)" "$(node_hop_proto)"
     else
       printf '  出口跳板   : 关闭（VPS 原生出口）\n'
+    fi
+    if proto_on hy2 || proto_on tuic || proto_on anytls; then
+      printf '  直连协议   : %s（公网 %s）\n' "$(proto_label)" "$(vps_ip)"
+    else
+      printf '  直连协议   : 全部关闭（菜单 20 开启）\n'
     fi
   else
     warn "尚未安装"
@@ -1482,14 +1858,16 @@ do_status() {
 }
 
 do_logs() {
-  printf '\n  1) Xray 日志\n  2) 隧道日志\n  3) 订阅服务日志\n  4) 实时跟踪 Xray\n  5) 实时跟踪隧道\n  0) 返回\n'
+  printf '\n  1) Xray 日志\n  2) 隧道日志\n  3) 订阅服务日志\n  4) sing-box 日志\n  5) 实时跟踪 Xray\n  6) 实时跟踪隧道\n  7) 实时跟踪 sing-box\n  0) 返回\n'
   read -rp "  选择: " c
   case "$c" in
     1) journalctl -u "$SVC_XRAY" -n 80 --no-pager ;;
     2) journalctl -u "$SVC_TUN"  -n 80 --no-pager ;;
     3) journalctl -u "$SVC_SUB"  -n 80 --no-pager ;;
-    4) journalctl -u "$SVC_XRAY" -f ;;
-    5) journalctl -u "$SVC_TUN"  -f ;;
+    4) journalctl -u "$SVC_SB"   -n 80 --no-pager; [[ -f "${LOGD}/sb.log" ]] && tail -30 "${LOGD}/sb.log" ;;
+    5) journalctl -u "$SVC_XRAY" -f ;;
+    6) journalctl -u "$SVC_TUN"  -f ;;
+    7) journalctl -u "$SVC_SB"   -f ;;
     *) return 0 ;;
   esac
 }
@@ -1645,7 +2023,7 @@ PY
   "isp_pref": "${isp_prev}",
   "sub_token": "${sub_token}",
   "install_mode": "A",
-  "proto": { "argo": true, "hy2": false, "tuic": false, "reality": false, "anytls": false },
+  "proto": { "argo": true, "hy2": true, "tuic": true, "reality": false, "anytls": true },
   "landing": { "enabled": false, "uuid": "", "target": ["h3", "h2"] },
   "hy2":     { "port": 20000, "hop": "20000-30000", "obfs": false, "up": 50, "down": 300 },
   "tuic":    { "port": 30001, "password": "", "cc": "bbr" },
@@ -1701,6 +2079,25 @@ PY
   write_sub_server
   write_sub_service
   ok "订阅服务已注册：${SVC_SUB}.service（127.0.0.1:${DEF_PORT_SUB}）"
+
+  # ---------- 直连协议（Hy2 / TUIC / AnyTLS）----------
+  if proto_on hy2 || proto_on tuic || proto_on anytls; then
+    step "直连协议（$(proto_label)）"
+    if proto_on hy2 && port_in_use "$(hy2_port)" udp; then
+      warn "UDP $(hy2_port) 已被占用，Hy2 可能起不来（菜单 20 改端口）"
+    fi
+    if proto_on tuic && port_in_use "$(tuic_port)" udp; then
+      warn "UDP $(tuic_port) 已被占用，TUIC 可能起不来"
+    fi
+    if proto_on anytls && port_in_use "$(anytls_port)" tcp; then
+      warn "TCP $(anytls_port) 已被占用，AnyTLS 可能起不来"
+    fi
+    if install_singbox && cert_gen && sb_sync; then
+      ok "直连协议已就绪：$(proto_label)"
+    else
+      warn "直连协议未就绪，稍后执行：bash $0 direct on all"
+    fi
+  fi
 
   # ---------- 系统优化 ----------
   step "系统优化"
@@ -1967,9 +2364,10 @@ do_uninstall() {
   require_root
   installed || { warn "看起来没有安装"; }
   printf '\n  %s将会删除：%s\n' "$C_RED" "$C_R"
-  printf '  · systemd 服务 argox-xray / argox-tunnel / argox-sub\n'
-  printf '  · 二进制 /usr/local/bin/argox-xray\n'
-  printf '  · 配置目录 /opt/argox（含 UUID/Token/日志/订阅）\n'
+  printf '  · systemd 服务 argox-xray / argox-tunnel / argox-sub / argox-sb\n'
+  printf '  · 二进制 /usr/local/bin/argox-xray、argox-sb\n'
+  printf '  · 配置目录 /opt/argox（含 UUID/Token/日志/订阅/自签证书）\n'
+  printf '  · nftables 表 inet argox_hop（Hy2 端口跳跃规则）\n'
   printf '  · /etc/argox/token.env\n'
   printf '  · /etc/sysctl.d/99-argox.conf\n\n'
   printf '  %s不会动的：%s1panel、已有 xray.service、443 端口、cdnx 相关文件\n\n' "$C_GRN" "$C_R"
@@ -1977,17 +2375,22 @@ do_uninstall() {
   [[ "$yn" != "yes" ]] && { info "已取消"; return 0; }
 
   step "卸载"
+  systemctl stop "$SVC_SB" 2>/dev/null
   systemctl stop "$SVC_SUB" 2>/dev/null
   systemctl stop "$SVC_TUN" 2>/dev/null
   systemctl stop "$SVC_XRAY" 2>/dev/null
+  systemctl disable "$SVC_SB" 2>/dev/null
   systemctl disable "$SVC_SUB" 2>/dev/null
   systemctl disable "$SVC_TUN" 2>/dev/null
   systemctl disable "$SVC_XRAY" 2>/dev/null
   rm -f "/etc/systemd/system/${SVC_XRAY}.service" "/etc/systemd/system/${SVC_TUN}.service" \
-        "/etc/systemd/system/${SVC_SUB}.service"
+        "/etc/systemd/system/${SVC_SUB}.service" "/etc/systemd/system/${SVC_SB}.service"
   systemctl daemon-reload
 
+  has nft && nft delete table inet argox_hop 2>/dev/null || true
+
   rm -f "$XRAY_BIN"
+  rm -f "$SB_BIN"
   rm -rf "$BASE"
   rm -rf "$TOKEN_DIR"
   rm -f /etc/sysctl.d/99-argox.conf
@@ -1996,6 +2399,7 @@ do_uninstall() {
 
   ok "已卸载"
   warn "cloudflared 二进制保留在 ${CFD_BIN}（可能被其他服务使用），如需删除：rm -f ${CFD_BIN}"
+  warn "云安全组里为 Hy2/TUIC/AnyTLS 放行的 UDP/TCP 端口可以一并收回"
   warn "记得去 CF Dashboard 删除对应 Tunnel，否则会留下孤儿隧道"
 }
 
@@ -2252,9 +2656,28 @@ PY
     local nlink; nlink="$(printf '%s\n' "$links" | grep -c .)"
     ck_ok "生成 ${nlink} 条链接（模式 $(node_mode)）"
 
-    local bad=0 line sni hostarg pth exp_sni exp_host exp_path
+    local bad=0 line sni hostarg pth exp_sni exp_host exp_path vip dtype dip
+    vip="$(vps_ip)"
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
+
+      # 直连协议（Hy2 / TUIC / AnyTLS）：格式与 vless 不同，单独校验地址
+      if [[ "$line" == hysteria2://* || "$line" == tuic://* || "$line" == anytls://* ]]; then
+        case "$line" in
+          hysteria2://*) dtype="Hy2" ;;
+          tuic://*)      dtype="TUIC" ;;
+          *)             dtype="AnyTLS" ;;
+        esac
+        dip="$(printf '%s' "$line" | sed -n 's#^[a-z0-9]*://[^@]*@\([^:/]*\):.*#\1#p')"
+        if [[ -n "$vip" && "$dip" == "$vip" ]]; then
+          ck_ok "${dtype} 地址正确（${dip}）"
+        else
+          ck_err "${dtype} 地址 ${dip:-空} ≠ 公网 IP ${vip:-未知}"
+          bad=1
+        fi
+        continue
+      fi
+
       sni="$(printf '%s' "$line"     | sed -n 's/.*[?&]sni=\([^&#]*\).*/\1/p')"
       hostarg="$(printf '%s' "$line" | sed -n 's/.*[?&]host=\([^&#]*\).*/\1/p')"
       pth="$(printf '%s' "$line"     | sed -n 's/.*[?&]path=\([^&#]*\).*/\1/p')"
@@ -2267,7 +2690,7 @@ PY
       [[ "$hostarg" == "$exp_host" ]] || { ck_err "Host 不一致：${hostarg} ≠ ${exp_host}"; bad=1; }
       [[ "$pth"     == "$exp_path" ]] || { ck_err "path 不一致：${pth} ≠ ${exp_path}"; bad=1; }
     done <<< "$links"
-    [[ $bad -eq 0 ]] && ck_ok "链接参数与服务端一致（sni / Host / path）"
+    [[ $bad -eq 0 ]] && ck_ok "链接参数与服务端一致（sni / Host / path / 直连地址）"
 
     printf '%s\n' "$links" | grep -q '#argox-' \
       && ck_warn "订阅里还有旧命名 argox-*（客户端需重新导入）" \
@@ -2340,13 +2763,74 @@ PY
     fi
   fi
 
-  # ---------- 证书（阶段 3 之后才有，现在没文件就跳过） ----------
-  if [[ -f "${BASE}/cert/cert.pem" ]]; then
-    [[ $quiet -eq 1 ]] || printf '\n%s[证书]%s\n' "$C_B" "$C_R"
-    if openssl x509 -checkend 2592000 -noout -in "${BASE}/cert/cert.pem" >/dev/null 2>&1; then
-      ck_ok "自签证书 30 天内不会过期"
+  # ---------- 直连协议（Hy2 / TUIC）+ 证书 ----------
+  if proto_on hy2 || proto_on tuic || proto_on anytls || sb_installed; then
+    [[ $quiet -eq 1 ]] || printf '\n%s[直连协议]%s\n' "$C_B" "$C_R"
+
+    if [[ -x "$SB_BIN" ]]; then
+      ck_ok "sing-box 已安装（$("$SB_BIN" version 2>/dev/null | head -1 | awk '{print $3}')）"
     else
-      ck_err "自签证书已过期或 30 天内过期（cert gen 重新生成）"
+      ck_err "sing-box 未安装（direct on hy2 会自动装）"
+    fi
+
+    if proto_on hy2 || proto_on tuic || proto_on anytls; then
+      if svc_active "$SVC_SB"; then
+        ck_ok "${SVC_SB} 运行中（$(proto_label)）"
+      else
+        ck_err "${SVC_SB} 未运行，但协议已开启（journalctl -u ${SVC_SB} 看原因）"
+      fi
+
+      if proto_on hy2; then
+        if listen_on "$(hy2_port)" udp; then
+          ck_ok "UDP $(hy2_port) 在听（Hy2）"
+        else
+          ck_err "UDP $(hy2_port) 没在听（Hy2 不可用）"
+        fi
+        local rng; rng="$(hy2_hop)"
+        if has nft && nft list table inet argox_hop 2>/dev/null | grep -q "udp dport ${rng}"; then
+          ck_ok "端口跳跃规则存在：UDP ${rng} → $(hy2_port)"
+        else
+          ck_warn "端口跳跃规则缺失（hy2 hop 重新应用；不影响连得上，只影响抗限速）"
+        fi
+      fi
+
+      if proto_on tuic; then
+        if listen_on "$(tuic_port)" udp; then
+          ck_ok "UDP $(tuic_port) 在听（TUIC）"
+        else
+          ck_err "UDP $(tuic_port) 没在听（TUIC 不可用）"
+        fi
+      fi
+
+      if proto_on anytls; then
+        if listen_on "$(anytls_port)" tcp; then
+          ck_ok "TCP $(anytls_port) 在听（AnyTLS，UDP 全灭时的出路）"
+        else
+          ck_err "TCP $(anytls_port) 没在听（AnyTLS 不可用）"
+        fi
+      fi
+
+      local dwant dgot
+      dwant=0
+      proto_on hy2    && dwant=$((dwant+1))
+      proto_on tuic   && dwant=$((dwant+1))
+      proto_on anytls && dwant=$((dwant+1))
+      dgot="$(build_links 2>/dev/null | grep -cE '^(hysteria2|tuic|anytls)://')"
+      if [[ "$dwant" == "${dgot:-0}" ]]; then
+        ck_ok "订阅直连节点 ${dgot} 条，与开关一致"
+      else
+        ck_err "订阅直连节点 ${dgot:-0} 条 ≠ 开关 ${dwant} 条（重新生成订阅）"
+      fi
+    fi
+
+    if [[ -f "${CERTD}/cert.pem" ]]; then
+      if openssl x509 -checkend 2592000 -noout -in "${CERTD}/cert.pem" >/dev/null 2>&1; then
+        ck_ok "自签证书 30 天内不会过期"
+      else
+        ck_err "自签证书已过期或 30 天内过期（cert gen --force）"
+      fi
+    elif proto_on hy2 || proto_on tuic || proto_on anytls; then
+      ck_err "协议已开启但证书不存在（cert gen）"
     fi
   fi
 
@@ -2377,8 +2861,8 @@ with open(p) as f:
     d = json.load(f)
 defaults = {
     "install_mode": "A",
-    "proto": {"argo": True, "hy2": False, "tuic": False,
-              "reality": False, "anytls": False},
+    "proto": {"argo": True, "hy2": True, "tuic": True,
+              "reality": False, "anytls": True},
     "landing": {"enabled": False, "uuid": "", "target": ["h3", "h2"]},
     "hy2":     {"port": 20000, "hop": "20000-30000", "obfs": False,
                 "up": 50, "down": 300},
@@ -2410,16 +2894,25 @@ PY
   ok "systemd 单元已对齐当前脚本路径"
 
   if gen_sub >/dev/null 2>&1; then
-    ok "订阅已重建：${NAME_H3} / ${NAME_H2} / ${NAME_WS}"
+    local names="${NAME_H3} / ${NAME_H2}"
+    proto_on hy2    && names="${names} / ${NAME_HY2}"
+    proto_on tuic   && names="${names} / ${NAME_TUIC}"
+    proto_on anytls && names="${names} / ${NAME_ANYTLS}"
+    ok "订阅已重建：${names}"
   else
     warn "订阅重建失败，运行 check 查看原因"
   fi
 
   printf '\n'
   info "服务未重启，运行中的连接不受影响"
-  info "直连协议全部为关闭状态（install_mode=A，与升级前一致）"
+  if ! proto_on hy2 && ! proto_on tuic && ! proto_on anytls; then
+    warn "直连协议全部关闭：Argo 走 CF，线路差时会全挂"
+    info "开一条 TCP 兜底：bash $0 direct on all（菜单 20）"
+  else
+    info "直连协议当前：$(proto_label)"
+  fi
   printf '\n'
-  warn "节点名已改为 Argo-*：客户端里旧的 argox-* 节点请删掉后重新导入订阅"
+  warn "Argo-WS 已下线；节点名有变动，客户端请删掉旧节点后重新导入订阅"
 
   local sh tok
   sh="$(node_sub_host)"; tok="$(node_get sub_token 2>/dev/null || true)"
@@ -2867,6 +3360,176 @@ do_tunnel_setup() {
 # ==============================================================================
 #  菜单
 # ==============================================================================
+# ==============================================================================
+#  直连协议（Hy2 / TUIC）：状态 / 开关 / 端口 / 跳跃段
+# ==============================================================================
+direct_show() {
+  local sbv="未安装" svc="${C_DIM}未运行${C_R}"
+  [[ -x "$SB_BIN" ]] && sbv="$("$SB_BIN" version 2>/dev/null | head -1 | sed 's/^sing-box version //')"
+  svc_active "$SVC_SB" && svc="${C_GRN}运行中${C_R}"
+
+  printf '\n  %s直连协议（sing-box）%s\n' "$C_B" "$C_R"
+  printf '  sing-box  : %s\n' "$sbv"
+  printf '  服务      : %s\n' "$svc"
+  local p on port extra kind
+  for p in hy2 tuic anytls; do
+    proto_on "$p" && on="${C_GRN}开${C_R}" || on="${C_DIM}关${C_R}"
+    case "$p" in
+      hy2)    port="$(hy2_port)";    kind="UDP"; extra="  跳跃 $(hy2_hop)" ;;
+      tuic)   port="$(tuic_port)";   kind="UDP"; extra="" ;;
+      anytls) port="$(anytls_port)"; kind="TCP"; extra="  UDP 全灭时的出路" ;;
+    esac
+    printf '  %-9s : %s   %s %-6s%s\n' "$p" "$on" "$kind" "$port" "$extra"
+  done
+  printf '  公网 IP   : %s\n' "$(vps_ip)"
+  if [[ -f "${CERTD}/cert.pem" ]]; then
+    local end left
+    end="$(openssl x509 -noout -enddate -in "${CERTD}/cert.pem" 2>/dev/null | sed 's/^notAfter=//')"
+    left=$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+    printf '  证书      : 剩 %s 天\n' "$left"
+  else
+    printf '  证书      : %s未生成%s（首次开启时自动生成）\n' "$C_YEL" "$C_R"
+  fi
+  printf '\n  云安全组需放行：UDP %s（Hy2 整段）、UDP %s（TUIC）、TCP %s（AnyTLS）\n' \
+    "$(hy2_hop)" "$(tuic_port)" "$(anytls_port)"
+}
+
+direct_switch() { # $1=on|off  $2=hy2|tuic|anytls|all
+  local act="$1" name="$2" v=false
+  case "$name" in
+    hy2|tuic|anytls) : ;;
+    all)
+      local p rc=0
+      for p in hy2 tuic anytls; do direct_switch "$act" "$p" || rc=1; done
+      return $rc ;;
+    *) err "指定协议：hy2 / tuic / anytls / all"; return 1 ;;
+  esac
+  [[ "$act" == "on" ]] && v=true
+
+  if [[ "$v" == "true" ]]; then
+    install_singbox || return 1
+    cert_gen || return 1
+  elif ! [[ -x "$SB_BIN" ]]; then
+    info "${name} 本来就是关闭状态，无需操作"
+    return 0
+  fi
+
+  node_jset "proto.${name}" "$v" || { err "写入 node.json 失败"; return 1; }
+
+  if ! sb_sync; then
+    if [[ "$v" == "true" ]]; then
+      node_jset "proto.${name}" false >/dev/null 2>&1 || true
+      sb_sync >/dev/null 2>&1 || true
+      err "开启失败，已回滚"
+    else
+      err "关闭时出错，但开关已写入 false，可手动 systemctl stop ${SVC_SB}"
+    fi
+    return 1
+  fi
+
+  gen_sub >/dev/null 2>&1 || warn "订阅重建失败，跑 check 查看"
+  if [[ "$v" == "true" ]]; then
+    ok "${name} 已开启"
+    case "$name" in
+      hy2)    info "云安全组放行 UDP $(hy2_hop)（整段，不只是 $(hy2_port)）" ;;
+      tuic)   info "云安全组放行 UDP $(tuic_port)" ;;
+      anytls) info "云安全组放行 TCP $(anytls_port)" ;;
+    esac
+  else
+    ok "${name} 已关闭"
+  fi
+}
+
+direct_menu() {
+  require_root
+  local c r yn
+  while true; do
+    direct_show
+    cat <<'EOF'
+
+  1) 全部开启（Hy2 + TUIC + AnyTLS，推荐）*
+  2) 开启 / 关闭 Hy2（UDP 主力）
+  3) 开启 / 关闭 TUIC（UDP 备选）
+  4) 开启 / 关闭 AnyTLS（TCP 兜底）
+  5) 改 Hy2 跳跃段
+  6) 查看 / 重签证书
+  7) 重启 sing-box
+  0) 返回
+EOF
+    read -rp "  选择: " c
+    case "${c:-}" in
+      1) direct_switch on all ;;
+      2) if proto_on hy2; then direct_switch off hy2; else direct_switch on hy2; fi ;;
+      3) if proto_on tuic; then direct_switch off tuic; else direct_switch on tuic; fi ;;
+      4) if proto_on anytls; then direct_switch off anytls; else direct_switch on anytls; fi ;;
+      5) printf '\n  当前跳跃段：%s\n' "$(hy2_hop)"
+         read -rp "  新的跳跃段（回车保持不变）: " r
+         if [[ -n "${r// /}" ]]; then
+           if hop_valid "${r// /}"; then
+             node_jset hy2.hop "\"${r// /}\""
+             proto_on hy2 && sb_hop_apply
+             gen_sub >/dev/null 2>&1 || true
+             ok "已设为 ${r// /}（记得同步云安全组）"
+           fi
+         fi ;;
+      6) cert_show; printf '\n'
+         if [[ -f "${CERTD}/cert.pem" ]]; then
+           read -rp "  重新生成证书？（y/N）: " yn
+           if [[ "${yn,,}" == "y" ]]; then
+             cert_gen --force && { if proto_on hy2 || proto_on tuic || proto_on anytls; then sb_sync; fi; }
+           fi
+         else
+           cert_gen
+         fi ;;
+      7) if proto_on hy2 || proto_on tuic || proto_on anytls; then sb_sync; else warn "直连协议都未开启"; fi ;;
+      0|"") return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+    printf '\n'
+    read -rp "  按回车继续…" _ || true
+  done
+}
+
+do_direct() {
+  require_root
+  case "${1:-}" in
+    ""|menu) direct_menu ;;
+    status)  direct_show ;;
+    on|off)  direct_switch "$1" "${2:-}" ;;
+    *) err "用法：direct [status|on <hy2|tuic>|off <hy2|tuic>]"; return 1 ;;
+  esac
+}
+
+do_hy2() {
+  require_root
+  case "${1:-status}" in
+    hop)
+      local r="${2:-}"
+      [[ -z "$r" ]] && { err "用法：hy2 hop 20000-30000"; return 1; }
+      hop_valid "$r" || return 1
+      node_jset hy2.hop "\"$r\"" || { err "写入失败"; return 1; }
+      proto_on hy2 && sb_hop_apply
+      gen_sub >/dev/null 2>&1 || true
+      ok "跳跃段已设为 ${r}"
+      info "云安全组需同步放行 UDP ${r}"
+      ;;
+    ""|status) direct_show ;;
+    *) err "用法：hy2 [status|hop 20000-30000]"; return 1 ;;
+  esac
+}
+
+do_cert() {
+  require_root
+  case "${1:-show}" in
+    gen)
+      cert_gen "${2:-}" || return 1
+      if proto_on hy2 || proto_on tuic || proto_on anytls; then sb_sync; fi
+      ;;
+    show|"") cert_show ;;
+    *) err "用法：cert [show|gen [--force]]"; return 1 ;;
+  esac
+}
+
 menu_header() {
   local st_x st_t host
   if svc_active "$SVC_XRAY"; then st_x="${C_GRN}●运行${C_R}"; else st_x="${C_DIM}○停止${C_R}"; fi
@@ -2902,6 +3565,7 @@ EOF
     printf '   8) 更换 UUID（用户名/密码）    16) 出口跳板（%s）\n' "$hop_label"
     printf '  17) 自检 check                18) 升级配置（补字段）\n'
     printf '  19) 住宅落地（%s）\n' "$landing_label"
+    printf '  20) 直连协议（%s）\n' "$(proto_label)"
     printf '\n    0) 退出\n'
     printf '%s\n' "──────────────────────────────────────────────────"
     read -rp "  请选择: " choice
@@ -2925,6 +3589,7 @@ EOF
       17) do_check ;;
       18) do_upgrade ;;
       19) do_landing ;;
+      20) do_direct ;;
       0|q|Q) printf '\n  再见\n\n'; exit 0 ;;
       *) warn "无效选项：${choice:-<空>}" ;;
     esac
@@ -2950,6 +3615,9 @@ main() {
     links)     show_links ;;
     hop)       do_hop "${2:-}" "${3:-}" ;;
     landing)   shift; do_landing "$@" ;;
+    direct)    do_direct "${2:-}" "${3:-}" ;;
+    hy2)       do_hy2 "${2:-}" "${3:-}" ;;
+    cert)      do_cert "${2:-}" "${3:-}" ;;
     diag)      do_diag "${2:-}" ;;
     check)     do_check "${2:-}" ;;
     upgrade)   do_upgrade ;;
@@ -2976,6 +3644,13 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 landing off  关闭落地
   bash $0 landing target h3,h2,ws   选择落地作用入口
   bash $0 landing proto socks|http  落地出口协议
+  bash $0 direct       直连协议状态（Hy2 / TUIC / AnyTLS，菜单 20）
+  bash $0 direct on all   一次开启 Hy2 + TUIC + AnyTLS（推荐）
+  bash $0 direct on hy2    开启 Hy2（自动装 sing-box + 自签证书）
+  bash $0 direct off tuic  关闭 TUIC
+  bash $0 hy2 hop 20000-30000  改 Hy2 端口跳跃段
+  bash $0 cert         查看自签证书
+  bash $0 cert gen     重新生成证书（--force 强制）
   bash $0 diag         cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）
   bash $0 diag http2   强制隧道走 TCP（UDP 7844 被封时用）
   bash $0 diag auto    恢复自动选择（默认）
