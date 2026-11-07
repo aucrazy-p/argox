@@ -3550,7 +3550,7 @@ do_upgrade() {
   mkdir -p "$BACKD"
   cp -a "$NODEF" "$bak" && ok "已备份：${bak}"
 
-  local MIG_HY2=0
+  local MIG_HY2=0 MIG_RH=0
 
   # 补齐新字段：已存在的绝不覆盖
   local added="-"
@@ -3678,6 +3678,7 @@ PY
       if sb_sync; then
         ok "sing-box 已按新端口重启（TCP ${want_rh}）"
         info "云安全组放行 TCP ${want_rh}；旧的 ${cur_rh} 可以删掉"
+        MIG_RH=1
       else
         warn "sing-box 重建失败，端口仍是 ${cur_rh}"
         info "手动重应用：bash $0 landing off && bash $0 landing on"
@@ -3708,6 +3709,8 @@ PY
       info "Hy2 未开启，端口变更待下次 direct on hy2 时生效"
     fi
     printf '\n'
+  elif [[ $MIG_RH -eq 1 ]]; then
+    info "sing-box 已因落地端口变更重启；客户端需重连并重导订阅（AnyTLS-RH 端口已改变）"
   else
     info "服务未重启，运行中的连接不受影响"
   fi
