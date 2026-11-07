@@ -36,7 +36,7 @@ bash /root/argox.sh
  2) 启动                  11) 备份配置
  3) 停止                  12) 卸载
  4) 重启                  13) 隧道设置
- 5) 查看状态              14) 优选 IP 源（链接 / 运营商）
+ 5) 查看状态              14) 优选 IP（导入本机测速结果）
  6) 查看日志              15) 订阅地址
  7) 更新到最新版          16) 出口跳板
  8) 更换 UUID             17) 自检 check
@@ -70,8 +70,37 @@ AnyTLS      直连 VPS，TCP，UDP 被限速时的唯一出路
 留着只会干扰选择。
 
 地址都写域名，由客户端自行解析到最近的 CF 节点。
-需要按 IP 展开时，菜单 13 → `6) 节点地址模式` 切成 `ip`，再菜单 14 导入优选 IP。
+需要按 IP 展开时，先用下面的「优选 IP」把列表准备好，再菜单 13 → `6) 节点地址模式` 切成 `ip`。
 直连协议（Hy2 / TUIC / AnyTLS）不受地址模式影响，永远写 VPS 公网 IP。
+
+## 优选 IP（两条路，别搞混）
+
+**快慢只有你的网络说了算**。VPS 在大阪，它测 Cloudflare 是毫秒级直连，
+测出来的顺序对你毫无意义。所以这里分工是：
+
+| 谁 | 负责什么 |
+|---|---|
+| 你的电脑 | 哪个 IP 对你快 → 用 cfst 之类工具跑一份结果 |
+| VPS | 这个 IP 能不能到达本隧道（anycast 全局一致，1033 的谁来测都用不了） |
+
+**推荐：从链接导入本机测速结果**（保序，不重排）
+
+```bash
+bash argox.sh ips https://gist.githubusercontent.com/.../raw/result.csv
+bash argox.sh ips /root/result.csv      # 也可以直接给本机路径
+```
+
+或者菜单 14 → `6) 从链接导入`。把 cfst 跑出来的 CSV 传到任意能直链打开的网页
+（Gist 要用 **raw** 地址），脚本会：
+
+1. 只取第一列 IP，兼容 `IP,已发送,已接收,丢包率,平均延迟,下载速度,地区码` 这类 CSV
+2. 剔除非 Cloudflare 段（反代/中转机本方案用不了）
+3. **严格保持你上传的顺序**，取前 12 个
+4. 可选地用 VPS 再验一次「能否路由到本隧道」（默认跳过，直接信任你的结果）
+5. 问你要不要顺手切成 `ip` 模式并重建订阅
+
+**另一条：社区列表**（菜单 14 → 3 拉取校验）。会按源备注里的运营商和 `ms`/`MB·s⁻¹`
+排序——但那些数字是列表作者在自己网络测的，**跟你的线路无关**，仅供兜底。
 
 ## 直连协议（Hy2 / TUIC / AnyTLS）
 
@@ -182,7 +211,8 @@ bash argox.sh status
 bash argox.sh nodes      # 订阅地址 + 二维码
 bash argox.sh links      # 单节点链接
 bash argox.sh sub        # Base64 订阅内容
-bash argox.sh ips
+bash argox.sh ips                      # 从社区源拉取并校验
+bash argox.sh ips <链接|文件>           # 导入本机测速结果（保序，不重排）
 bash argox.sh hop on     # 出口跳板（off / on [socks|http]）
 bash argox.sh landing on # 住宅落地（off / status / target h3,h2,ws）
 bash argox.sh direct on all # 直连协议（status / on|off hy2|tuic|anytls|all）

@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -1445,6 +1445,132 @@ update_ips() {
   gen_sub >/dev/null 2>&1 || true
 }
 
+# 备注文字 → 运营商短标签（用于节点名后缀与列表展示）
+note_isp_label() {
+  case "${1:-}" in
+    *移动*) printf '移动' ;;
+    *联通*) printf '联通' ;;
+    *电信*) printf '电信' ;;
+    *多线*) printf '多线' ;;
+    *)      printf '本机' ;;
+  esac
+}
+
+# 从「你本机测速结果」导入 IP：地址可以是 http(s) 直链，也可以是本地文件路径
+#
+# 与 import_ips 的本质区别：
+#   import_ips       在 VPS 上探测 + 按源备注里的 ms/MB·s⁻¹ 重排 —— 但那是别人网络的数据
+#   import_ips_url   完全不重排，严格保留你上传时的顺序 —— 因为快慢只有你的网络说了算
+#
+# 这样分工才正确：VPS 只负责「这个 IP 能不能到达本隧道」（anycast 全局一致），
+# 「哪个 IP 对你的移动宽带快」由你本机测速决定，脚本不越权猜测。
+import_ips_url() {
+  require_root
+  local src="${1:-}"
+  if [[ -z "$src" ]]; then
+    printf '\n  粘贴本机测速结果地址（http(s) 直链，或本机路径），回车确认：\n  > '
+    read -r src
+  fi
+  src="${src//[[:space:]]/}"
+  [[ -z "$src" ]] && { err "地址为空"; return 1; }
+
+  local tmpd; tmpd="$(mktemp -d)"
+  local rawf="${tmpd}/raw" cand="${tmpd}/cand" keptf="${tmpd}/kept"
+  : > "$cand"; : > "$keptf"
+
+  if [[ -f "$src" ]]; then
+    cp "$src" "$rawf" || { err "读取失败：$src"; rm -rf "$tmpd"; return 1; }
+    info "已读取本地文件：${src}"
+  elif [[ "$src" =~ ^https?:// ]]; then
+    info "拉取：${src}"
+    curl -fsSL --max-time 30 -A "Mozilla/5.0" "$src" -o "$rawf" 2>/dev/null \
+      || { err "拉取失败：链接必须能直链打开纯文本（Gist 用 raw 地址，别填编辑器页面）"; rm -rf "$tmpd"; return 1; }
+  else
+    if [[ "$src" == /* || "$src" == ./* || "$src" == ~* ]]; then
+      err "文件不存在：${src}"
+    else
+      err "既不是存在的文件，也不是 http(s) 链接（Tip：Gist 要填 raw 地址）"
+    fi
+    rm -rf "$tmpd"; return 1
+  fi
+
+  # 解析：兼容 cfst 的 CSV（IP,已发送,已接收,丢包率,平均延迟,下载速度,…）、
+  #       纯 IP 一行一个、IP:443、IP#备注 —— 一律只取第一列，保持原顺序
+  local dropped=0 ip1 note1
+  while IFS=$'\t' read -r ip1 note1; do
+    if is_cf_ip "$ip1"; then
+      printf '%s\t%s\n' "$ip1" "$note1" >> "$cand"
+    else
+      dropped=$((dropped+1))
+    fi
+  done < <(parse_ipfile < "$rawf" | awk -F'\t' '!seen[$1]++')
+
+  local total; total="$(wc -l < "$cand" | tr -d ' ')"
+  if [[ "${total:-0}" -eq 0 ]]; then
+    err "没解析到 Cloudflare 段 IP（文件格式不认识，或内容全是非 CF 段）"
+    rm -rf "$tmpd"; return 1
+  fi
+  [[ "$dropped" -gt 0 ]] && info "已剔除 ${dropped} 个非 Cloudflare 段 IP"
+
+  # 可选：用 VPS 再验一次「能否到达本隧道」。这一步与你在哪测无关，
+  # anycast 全局一致，1033 的 IP 谁来测都用不了，所以值得做但可以跳过。
+  local host; host="$(node_get tunnel_host 2>/dev/null || true)"
+  local verify=0
+  if [[ -n "$host" ]]; then
+    printf '\n  用 VPS 再验一次「能否路由到本隧道」？(%s个，约 %s 秒)\n' "$total" "$(( total * 2 ))"
+    read -rp "  [y/N，默认跳过，直接信任你的结果] " yn
+    [[ "${yn,,}" == "y" ]] && verify=1
+  fi
+
+  if [[ $verify -eq 1 ]]; then
+    local i=0 ip2 note2 code
+    while IFS=$'\t' read -r ip2 note2; do
+      i=$((i+1))
+      printf '\r  校验 %d/%d  %-16s' "$i" "$total" "$ip2"
+      if code="$(ip_alive "$ip2" "$host")"; then
+        printf '%s\t%s\n' "$ip2" "$note2" >> "$keptf"
+      fi
+    done < "$cand"
+    printf '\r%*s\r' 56 ''
+    if [[ ! -s "$keptf" ]]; then
+      err "全部未通过隧道校验（隧道没注册？或用错了域名），保留现有列表"
+      rm -rf "$tmpd"; return 1
+    fi
+  else
+    cp "$cand" "$keptf"
+  fi
+
+  head -n "$MAX_IPS" "$keptf" > "${tmpd}/final"
+  cut -f1 "${tmpd}/final" > "$IPSF"
+  : > "$IPMETA"
+  local ip3 note3
+  while IFS=$'\t' read -r ip3 note3; do
+    printf '%s\t%s\n' "$ip3" "$(note_isp_label "$note3")" >> "$IPMETA"
+  done < "${tmpd}/final"
+  rm -rf "$tmpd"
+
+  local got; got="$(wc -l < "$IPSF" | tr -d ' ')"
+  ok "已导入 ${got} 个 IP（严格保持你上传的顺序，未重排）"
+  awk -F'\t' '{printf "    %-16s %s\n", $1, $2}' "$IPMETA"
+
+  printf '\n'
+  if [[ "$(node_mode)" == "ip" ]]; then
+    gen_sub >/dev/null 2>&1 || true
+    ok "订阅已重建（当前已是 ip 模式）"
+  else
+    read -rp "  切换为 ip 模式并重建订阅？(Y/n) " yn2
+    if [[ "${yn2,,}" != "n" ]]; then
+      node_set node_mode ip
+      gen_sub >/dev/null 2>&1 || true
+      ok "已切换为 ip 模式，订阅已重建"
+      info "客户端里删掉旧订阅重新导入即可（旧的域名节点会消失）"
+    else
+      info "保持 domain 模式，IP 列表已存好，随时切"
+    fi
+  fi
+  info "回退：bash $0 tunnel → 6) 节点地址模式 → domain"
+}
+
 list_ips() {
   [[ -s "$IPSF" ]] || { printf '%s\n' "$DEFAULT_IPS" > "$IPSF"; }
   cat "$IPSF"
@@ -1463,10 +1589,11 @@ menu_ips() {
       "$(wc -l < "$IPSF" 2>/dev/null || echo 0)" "$(isp_label "$cur_isp")"
     cat <<'EOF'
   1) 查看当前 IP 列表
-  2) 编辑 IP 源链接
+  2) 编辑 IP 源链接（社区列表，VPS 校验后按运营商+备注排序）
   3) 立即拉取并校验
   4) 手动粘贴 IP
   5) 运营商偏好（换网络时改这里）
+  6) 从链接导入（本机测速结果，保序不重排）← 推荐
   0) 返回
 EOF
     read -rp "  选择: " c
@@ -1475,6 +1602,7 @@ EOF
            if [[ -s "$IPMETA" ]]; then awk -F'\t' '{printf "    %-16s %s\n",$1,$2}' "$IPMETA"
            else sed 's/^/    /' "$IPSF"; fi
          else warn "还没有 IP 列表"; fi ;;
+      6) import_ips_url ;;
       2) printf '\n  一行一个链接，空行结束（留空=保持不变）：\n'
          local tmpd; tmpd="$(mktemp -d)"; : > "${tmpd}/u"
          while IFS= read -r ln; do [[ -z "${ln//[[:space:]]/}" ]] && break; printf '%s\n' "$ln" >> "${tmpd}/u"; done
@@ -3598,7 +3726,7 @@ menu_main() {
    3) 停止                     11) 备份配置
    4) 重启                     12) 卸载
    5) 查看状态                 13) 隧道设置（Token / 域名 / 测试）
-   6) 查看日志                 14) 优选 IP 源
+   6) 查看日志                 14) 优选 IP（导入本机测速结果）
    7) 更新到最新版             15) 订阅地址 / 二维码
 EOF
     printf '   8) 更换 UUID（用户名/密码）    16) 出口跳板（%s）\n' "$hop_label"
@@ -3649,7 +3777,7 @@ main() {
     status)    do_status ;;
     logs)      do_logs ;;
     update)    do_update ;;
-    ips)       update_ips ;;
+    ips)       if [[ -n "${2:-}" ]]; then import_ips_url "${2:-}"; else update_ips; fi ;;
     nodes|show) show_nodes ;;
     links)     show_links ;;
     hop)       do_hop "${2:-}" "${3:-}" ;;
@@ -3675,6 +3803,7 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 links        打印单节点链接
   bash $0 sub          输出 Base64 订阅内容
   bash $0 ips          从 IP 源拉取并校验（菜单 14）
+  bash $0 ips <链接>   从你本机测速结果导入（保序不重排，也可填本地文件路径）
   bash $0 hop          出口跳板状态（菜单 16）
   bash $0 hop on       全部流量走本地代理（自动探测 socks/http）
   bash $0 hop off      关闭跳板，流量从 VPS 本机出口出去
