@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.9.2"
+VERSION="2.10.0"
 APP="argox"
 
 # 脚本自身地址：从 /dev/fd/* 运行（bash <(curl ...)）且本地还没有副本时，用它把自己落地
@@ -1943,7 +1943,12 @@ note_isp_label() {
   esac
 }
 
-# 从「你本机测速结果」导入 IP：地址可以是 http(s) 直链，也可以是本地文件路径
+# 去掉 URL 里的密码，屏幕输出与日志一律走这里：ftp://u:pass@h → ftp://u:***@h
+mask_url() {
+  printf '%s' "$1" | sed -E 's#(://[^:/@]+:)[^@]*@#\1***@#'
+}
+
+# 从「你本机测速结果」导入 IP：地址可以是 http(s) / ftp(s) 直链，也可以是本地文件路径
 #
 # 与 import_ips 的本质区别：
 #   import_ips       在 VPS 上探测 + 按源备注里的 ms/MB·s⁻¹ 重排 —— 但那是别人网络的数据
@@ -1951,15 +1956,23 @@ note_isp_label() {
 #
 # 这样分工才正确：VPS 只负责「这个 IP 能不能到达本隧道」（anycast 全局一致），
 # 「哪个 IP 对你的移动宽带快」由你本机测速决定，脚本不越权猜测。
+#
+# 地址可以存进 node.json 的 ips_url：Windows 测速 → 传到自己的 FTP / 网站 → 这里填直链，
+# 之后 ips 无参就直接从它拉，不用每次贴地址。见 do_ips_url。
 import_ips_url() {
   require_root
   local src="${1:-}"
   if [[ -z "$src" ]]; then
-    printf '\n  粘贴本机测速结果地址（http(s) 直链，或本机路径），回车确认：\n  > '
-    read -r src
+    src="$(node_get ips_url 2>/dev/null || true)"
+    if [[ -n "$src" ]]; then
+      info "使用自动更新地址：$(mask_url "$src")"
+    else
+      printf '\n  粘贴测速结果地址（http(s) 直链 / ftp(s) / 本机路径），回车确认：\n  > '
+      read -r src
+    fi
   fi
   src="${src//[[:space:]]/}"
-  [[ -z "$src" ]] && { err "地址为空"; return 1; }
+  [[ -z "$src" ]] && { err "地址为空（想固定用一个地址：$(cmd_prefix) ips-url）"; return 1; }
 
   local tmpd; tmpd="$(mktemp -d)"
   local rawf="${tmpd}/raw" cand="${tmpd}/cand" keptf="${tmpd}/kept"
@@ -1968,15 +1981,15 @@ import_ips_url() {
   if [[ -f "$src" ]]; then
     cp "$src" "$rawf" || { err "读取失败：$src"; rm -rf "$tmpd"; return 1; }
     info "已读取本地文件：${src}"
-  elif [[ "$src" =~ ^https?:// ]]; then
-    info "拉取：${src}"
+  elif [[ "$src" =~ ^(https?|ftps?):// ]]; then
+    info "拉取：$(mask_url "$src")"
     curl -fsSL --max-time 30 -A "Mozilla/5.0" "$src" -o "$rawf" 2>/dev/null \
-      || { err "拉取失败：链接必须能直链打开纯文本（Gist 用 raw 地址，别填编辑器页面）"; rm -rf "$tmpd"; return 1; }
+      || { err "拉取失败：$(mask_url "$src")"; info "http(s) 要能直链打开纯文本；ftp(s) 检查主机 / 端口 / 账号 / 文件路径"; rm -rf "$tmpd"; return 1; }
   else
     if [[ "$src" == /* || "$src" == ./* || "$src" == ~* ]]; then
       err "文件不存在：${src}"
     else
-      err "既不是存在的文件，也不是 http(s) 链接（Tip：Gist 要填 raw 地址）"
+      err "既不是存在的文件，也不是 http(s) / ftp(s) 地址"
     fi
     rm -rf "$tmpd"; return 1
   fi
@@ -2055,7 +2068,69 @@ import_ips_url() {
       info "保持 domain 模式，IP 列表已存好，随时切"
     fi
   fi
+  # 一次成功后把地址存下来，之后 ips 无参就直接拉它（闭环的最后一步）
+  if [[ "$src" =~ ^(https?|ftps?):// && -z "$(node_get ips_url 2>/dev/null || true)" ]]; then
+    printf '\n'
+    read -rp "  设为自动更新地址？以后 $(cmd_prefix) ips 直接用它 (Y/n) " ynu
+    if [[ "${ynu,,}" != "n" ]]; then
+      node_set ips_url "$src" && ok "已保存自动更新地址"
+    fi
+  fi
   info "回退：$(cmd_prefix) tunnel → 6) 节点地址模式 → domain"
+}
+
+# 自动更新地址：把「Windows 测速结果上传到 FTP / 网站」的直链存进 node.json，
+# 之后 ips 无参直接从它拉。凭据只落在 node.json（600），不进脚本、不进仓库。
+do_ips_url() {
+  require_root
+  local cur act
+  while true; do
+    cur="$(node_get ips_url 2>/dev/null || true)"
+    printf '\n  %s自动更新地址%s\n' "$C_B" "$C_R"
+    if [[ -n "$cur" ]]; then
+      printf '  当前：%s\n' "$(mask_url "$cur")"
+    else
+      printf '  当前：未设置\n'
+    fi
+    printf '  用途：Windows 上测速 → 把结果传到 FTP / 网站 → 这里填直链，\n'
+    printf '        以后 %s ips 无参就直接从它拉，不用再贴地址。\n\n' "$(cmd_prefix)"
+    cat <<'EOF'
+  1) 设置 / 修改（粘贴 ftp(s) 或 http(s) 直链）
+  2) 立即拉取一次（导入 + 重建订阅）
+  3) 显示完整地址（含账号密码）
+  4) 清除
+  0) 返回
+EOF
+    read -rp "  选择: " act
+    case "${act:-}" in
+      1)
+        printf '\n  粘贴地址，回车确认\n  例：ftp://用户:密码@主机:端口/文件名\n  > '
+        local u k; read -r u; u="${u//[[:space:]]/}"
+        if [[ -z "$u" ]]; then warn "已取消"; continue; fi
+        if [[ ! "$u" =~ ^(https?|ftps?):// ]]; then err "只认 http(s) / ftp(s) 开头的地址"; continue; fi
+        info "验证：$(mask_url "$u")"
+        if curl -fsSL --max-time 20 -A "Mozilla/5.0" "$u" -o /dev/null 2>/dev/null; then
+          ok "地址可读"
+        else
+          warn "暂时读不到（账号错 / 文件名错 / 还没上传）"
+          read -rp "  仍然保存？(y/N) " k
+          [[ "${k,,}" != "y" ]] && { info "未保存"; continue; }
+        fi
+        node_set ips_url "$u" && ok "已保存（只写入 ${NODEF}，权限 600）"
+        ;;
+      2)
+        if [[ -z "$cur" ]]; then warn "还没设置地址"; else import_ips_url "$cur"; fi
+        ;;
+      3)
+        if [[ -n "$cur" ]]; then printf '\n  %s\n\n' "$cur"; else warn "还没设置"; fi
+        ;;
+      4)
+        node_set ips_url "" && ok "已清除"
+        ;;
+      0|"") return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
 }
 
 list_ips() {
@@ -2081,6 +2156,7 @@ menu_ips() {
   4) 手动粘贴 IP
   5) 运营商偏好（换网络时改这里）
   6) 从链接导入（本机测速结果，保序不重排）← 推荐
+  7) 自动更新地址（测速结果传 FTP/网站，以后 ips 无参直接拉）
   0) 返回
 EOF
     read -rp "  选择: " c
@@ -2090,6 +2166,7 @@ EOF
            else sed 's/^/    /' "$IPSF"; fi
          else warn "还没有 IP 列表"; fi ;;
       6) import_ips_url ;;
+      7) do_ips_url ;;
       2) printf '\n  一行一个链接，空行结束（留空=保持不变）：\n'
          local tmpd; tmpd="$(mktemp -d)"; : > "${tmpd}/u"
          while IFS= read -r ln; do [[ -z "${ln//[[:space:]]/}" ]] && break; printf '%s\n' "$ln" >> "${tmpd}/u"; done
@@ -3675,6 +3752,9 @@ PY
         ck_warn "已存 ${nip} 个优选 IP 但模式是 domain（未启用）→ $(cmd_prefix) mode ip"
       fi
     fi
+    # 自动更新地址：设过就说清 ips 无参会从哪拉，密码打码
+    local iu; iu="$(node_get ips_url 2>/dev/null || true)"
+    [[ -n "$iu" ]] && ck_ok "自动更新地址已设置：$(mask_url "$iu")"
 
     local bad=0 line sni hostarg pth exp_sni exp_host exp_path vip dtype dip
     vip="$(vps_ip)"
@@ -3969,6 +4049,7 @@ with open(p) as f:
     d = json.load(f)
 defaults = {
     "install_mode": "A",
+    "ips_url": "",
     "proto": {"argo": True, "hy2": True, "tuic": True,
               "reality": False, "anytls": True},
     "landing": {"enabled": False, "uuid": "", "target": ["h3", "anytls"]},
@@ -5263,7 +5344,10 @@ main() {
     status)    do_status ;;
     logs)      do_logs ;;
     update)    do_update ;;
-    ips)       if [[ -n "${2:-}" ]]; then import_ips_url "${2:-}"; else update_ips; fi ;;
+    ips)       if [[ -n "${2:-}" ]]; then import_ips_url "${2:-}"
+               elif [[ -n "$(node_get ips_url 2>/dev/null || true)" ]]; then import_ips_url
+               else update_ips; fi ;;
+    ips-url)   do_ips_url ;;
     mode)      do_mode "${2:-}" ;;
     nodes|show) show_nodes ;;
     links)     show_links ;;
@@ -5292,8 +5376,9 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   ${B} nodes        打印订阅地址 + 二维码
   ${B} links        打印单节点链接
   ${B} sub          输出 Base64 订阅内容
-  ${B} ips          从 IP 源拉取并校验（菜单 12）
-  ${B} ips <链接>   从你本机测速结果导入（保序不重排，也可填本地文件路径）
+  ${B} ips          从自动更新地址拉取（未设置时走 IP 源，菜单 12）
+  ${B} ips <地址>    从测速结果导入（ftp(s)/http(s) 直链或本地文件路径，保序不重排）
+  ${B} ips-url      设置自动更新地址（测速结果上传后的直链，设好 ips 无参即用它）
   ${B} mode         查看地址模式（domain 域名直连 / ip 优选 IP）
   ${B} mode ip      切到优选 IP 模式并重建订阅（只影响 Argo-H3/H2/H3-RH）
   ${B} mode domain  切回域名直连
