@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.10.0"
+VERSION="2.11.0"
 APP="argox"
 
 # 脚本自身地址：从 /dev/fd/* 运行（bash <(curl ...)）且本地还没有副本时，用它把自己落地
@@ -1611,9 +1611,11 @@ DEFAULT_IPS="104.16.132.229
 172.64.80.1
 172.67.64.1"
 
-MAX_IPS=12          # 校验通过后最多保留多少个
-MAX_H3_NODES=4      # H3 主力（UDP/QUIC，抗丢包）
-MAX_H2_NODES=4      # H2 对照（TCP，H3 被 QoS 时用）
+MAX_IPS=3           # 只留前 3 个当备选池（导入时列 3 行，不啰嗦）
+# 只用排行第一的那个 IP：H3 与 H2 共用同一个 IP，互为备用——
+# 客户端同一时刻只会启用其中一条，不会双开，所以两条不会叠加流量或连接数。
+MAX_H3_NODES=1      # H3 主力（UDP/QUIC，抗丢包）
+MAX_H2_NODES=1      # H2 兜底（TCP，H3 被 QoS 时手动切过去）
 MAX_WS_NODES=2      # WS 兼容兜底
 ISP_PREF_DEFAULT="mobile"   # mobile | unicom | telecom | multi | auto
 
