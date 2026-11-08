@@ -26,6 +26,17 @@
 > ④ **端口管理**：新增 `port` 子命令 + 菜单 17，`sub` 正式纳入 node.json 的 `sub.port`，
 > 安装时可用环境变量预指定（`SUB_PORT=9000 bash argox.sh install`）；
 > ⑤ 安装/升级收尾打印「云安全组要放行的端口」清单。
+
+> **v2.8.0 多格式订阅 + 移除备份**：
+> ① `gen_sub` 新增 Clash Meta YAML 与 sing-box JSON（同一个令牌，`sub` 服务按
+> `User-Agent` 分流，`<token>` 默认仍是 base64，行为对老客户端零变化）；
+> ② sing-box 官方内核不支持 XHTTP，故 `Argo-H3 / Argo-H2 / Argo-H3-RH` 无法写进 JSON
+> （5 条 vs 8 条），Hy2 端口跳跃写作 `server_ports: ["23000:27000"]`，且与 `server_port` 互斥；
+> ③ 重名节点自动加序号（Clash 遇重名会整份配置加载失败）；
+> ④ **移除备份功能**：install 重装本身无损（uuid / sub_token / 端口 / 密钥 / 优选 IP 全保留），
+> upgrade 自动留 `node.json.<ts>.bak`，单独备份既无恢复入口也无实际场景，菜单回到 20 项；
+> ⑤ `check` 增加三格式齐备 + Clash UA 分流自测；`upgrade` 补上订阅服务重启
+> （重写 `sub_server.py` 后不重启，进程仍跑旧代码，UA 分流不会生效）。
 > 变更：**v2.3.2 起 Hy2 默认段 `20000-30000` → `23000-27000`**（用户 VPS 上 RustDesk 与
 > 其他服务占用 20000-30000，实测冲突）。监听口同步改为段首 `23000`；`hy2 hop` 会
 > **自动把监听口对齐到段首**，`upgrade` 对「仍是旧默认值」的实例自动迁移。

@@ -43,13 +43,12 @@ bash /root/argox.sh
    7) 更新到最新版             15) 住宅落地
    8) 自检 check               16) 订阅地址 / 二维码
    17) 端口管理                18) 系统优化
-   19) 清理缓存                20) 备份配置
-   21) 卸载
+   19) 清理缓存                20) 卸载
 ```
 
 > v2.6.0 重排过编号：自检 check 从 17 → **8**，隧道设置 13 → **11**，
 > 直连协议 20 → **14**，住宅落地 19 → **15**，优选 IP 14 → **12**，出口跳板 16 → **13**。
-> v2.7.0 插入 **17) 端口管理**，系统优化起顺移至 18–21。
+> v2.7.0 插入 **17) 端口管理**，系统优化起顺移至 18–20（v2.8.0 移除备份，卸载回到 20）。
 
 ## 订阅
 
@@ -62,6 +61,28 @@ http://<VPS 公网 IP>:<订阅端口>/<订阅令牌>
 这样 CF 侧只需要一条路由，也省掉一条 DNS 和一份 CF 流量。代价是订阅走明文 HTTP
 （内容里是 UUID 和密码，没有 TLS 私钥），且要放行订阅端口（默认 `8099/TCP`）。
 端口可改：`bash argox.sh port sub 9000`。
+
+### 订阅格式：同一个地址，按客户端自动切换
+
+订阅服务按 `User-Agent` 返回对应格式，**地址不变、令牌不变**：
+
+| 客户端 | 拿到的格式 |
+|---|---|
+| Clash Verge / mihomo / FlClash / Stash | Clash Meta YAML（8 个节点） |
+| sing-box 官方客户端（SFA / SFI / Karing） | sing-box JSON（**5 个节点**） |
+| v2rayN / v2rayNG / Shadowrocket / 其他 | base64 链接列表（8 个节点，与旧版完全一致） |
+
+UA 判断偶尔会失灵，也可以显式指定，加后缀即可：
+
+```
+http://<IP>:<port>/<令牌>.yaml      Clash
+http://<IP>:<port>/<令牌>.json      sing-box
+```
+
+**sing-box 少 3 个节点的原因**：官方内核不支持 XHTTP 传输（只有 `tcp / ws / grpc /
+http / httpupgrade / quic`），所以 `Argo-H3`、`Argo-H2`、`Argo-H3-RH` 写不进去。
+Clash Meta（mihomo ≥ 1.19.6）原生支持 `network: xhttp`，八个节点全都在。
+另外 Hy2 端口跳跃在 sing-box 里写成 `server_ports: ["23000:27000"]`（冒号，非短横线）。
 
 默认输出 8 个节点（`domain` 模式；直连协议全开且落地开启时），节点名与顺序固定：
 

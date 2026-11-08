@@ -11,3 +11,6 @@ _t.json
 .idea/
 *.swp
 .DS_Store
+
+# 本地校验用 mihomo 内核（仅测试，不入库）
+mihomo-windows-*

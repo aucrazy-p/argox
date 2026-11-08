@@ -355,7 +355,7 @@ https://<隧道域名>/<sub_token>
 ├── sub_server.py            # 订阅服务（Python 标准库，只读）
 ├── qr/*.png                 # 订阅二维码
 ├── logs/access.log,error.log
-└── backup/argox-*.tar.gz    # 菜单 13 备份
+└── backup/node.json.<ts>.bak  # upgrade 自动留存
 
 /etc/argox/token.env         # TUNNEL_TOKEN（700/600）
 /usr/local/bin/argox-xray    # 独立二进制，不与已有 xray 冲突
@@ -396,18 +396,24 @@ bash argox.sh            → 进入菜单 → 选 1
   └─ 打印订阅地址 / 二维码
 ```
 
-### 菜单（15 项）
+### 菜单（20 项，v2.8.0）
 
 ```
- 1) 安装 / 重新部署           9) 系统优化（BBR / 重启 / 日志）
- 2) 启动                    10) 清理缓存
- 3) 停止                    11) 备份配置
- 4) 重启                    12) 卸载
- 5) 查看状态                13) 隧道设置（Token / 域名 / 测试）
- 6) 查看日志                14) 优选 IP 源
- 7) 更新到最新版            15) 订阅地址 / 二维码
- 8) 更换 UUID
+ 1) 安装 / 重新部署           9) 更换 UUID
+ 2) 启动                     10) 升级配置（补字段）
+ 3) 停止                     11) 隧道设置（Token / 域名 / 测试）
+ 4) 重启                     12) 优选 IP（导入测速结果）
+ 5) 查看状态                 13) 出口跳板
+ 6) 查看日志                 14) 直连协议（Hy2/TUIC/AnyTLS/Reality）
+ 7) 更新到最新版             15) 住宅落地
+ 8) 自检 check               16) 订阅地址 / 二维码
+ 17) 端口管理                18) 系统优化
+ 19) 清理缓存                20) 卸载
 ```
+
+备份入口 v2.8.0 移除：install 重装本身无损（uuid / sub_token / 端口 / 密钥 /
+优选 IP 全部保留），upgrade 会自动留 `node.json.<时间戳>.bak`，单独的手动备份
+既没有恢复入口也没有实际场景。
 
 非交互调用：`argox.sh install|start|stop|restart|status|logs|update|ips|nodes|links|sub|uninstall`。
 

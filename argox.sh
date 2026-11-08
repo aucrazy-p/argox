@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.7.0"
+VERSION="2.8.0"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -32,6 +32,7 @@ IPSRCF="${BASE}/ipsrc.txt"
 BACKD="${BASE}/backup"
 SUBPUB="${BASE}/pub"            # 订阅服务根目录（仅本机 8099）
 PYSRV="${BASE}/sub_server.py"
+SUBGEN="${BASE}/subs_gen.py"    # URI -> Clash YAML / sing-box JSON 转换器
 TOKEN_FILE="/etc/argox/token.env"
 TOKEN_DIR="/etc/argox"
 
@@ -1465,13 +1466,22 @@ write_sub_server() {
 #!/usr/bin/env python3
 """argox 订阅服务：只读、只认白名单文件、不列目录。
 v2.7.0 起订阅不走隧道，监听 0.0.0.0 供客户端直连（内容里只有节点参数，
-无 TLS 私钥；访问靠 32 位 hex 令牌，不列目录、不认子路径穿越）。"""
+无 TLS 私钥；访问靠 32 位 hex 令牌，不列目录、不认子路径穿越）。
+v2.8.0 起同一个令牌按 User-Agent 分流三种格式：
+  <token>        base64（通用，v2rayN / Shadowrocket / 大部分客户端）
+  <token>.yaml   Clash Meta / mihomo（Clash Verge / FlClash / Stash）
+  <token>.json   sing-box（只含直连协议，xhttp 节点官方内核无法表达）
+"""
 import http.server
 import os
 import sys
+import urllib.parse
 
 PORT = int(sys.argv[1])
 ROOT = os.path.abspath(sys.argv[2])
+
+UA_SINGBOX = ("sing-box", "sfa/", "sfi/", "sfm/", "sft/", "karing")
+UA_CLASH = ("clash", "mihomo", "stash", "flclash", "meta/", "clash-verge", "clashx")
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -1479,11 +1489,31 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*args, directory=ROOT, **kwargs)
 
     def guess_type(self, path):
+        p = path.lower()
+        if p.endswith((".yaml", ".yml")):
+            return "text/yaml; charset=utf-8"
+        if p.endswith(".json"):
+            return "application/json; charset=utf-8"
         return "text/plain; charset=utf-8"
 
     def list_directory(self, path):
         self.send_error(404)
         return None
+
+    def do_GET(self):
+        # 令牌裸路径按 UA 分流到 .yaml / .json；显式带后缀则原样返回
+        raw = urllib.parse.unquote(self.path.split("?", 1)[0])
+        name = raw.strip("/")
+        if name and "/" not in name and not name.endswith((".yaml", ".json")):
+            ua = (self.headers.get("User-Agent") or "").lower()
+            ext = None
+            if any(k in ua for k in UA_SINGBOX):
+                ext = ".json"
+            elif any(k in ua for k in UA_CLASH):
+                ext = ".yaml"
+            if ext and os.path.isfile(os.path.join(ROOT, name + ext)):
+                self.path = "/" + urllib.parse.quote(name + ext)
+        return super().do_GET()
 
     def log_message(self, fmt, *args):
         pass
@@ -2225,6 +2255,319 @@ build_links() {
   emit_landing_links "$host" "$ex"
 }
 
+# 生成多格式订阅的转换脚本（幂等覆写）。输入是 build_links 产出的 URI 列表，
+# 因此节点顺序/参数只有一个真相源：链接。以后改链接逻辑，两种格式自动跟上。
+write_subs_gen() {
+  cat > "$SUBGEN" <<'PYEOF'
+#!/usr/bin/env python3
+"""argox 订阅格式转换：URI 列表 -> Clash Meta YAML + sing-box JSON。
+
+只做格式映射，不判断节点该不该存在（那是 build_links 的事）。
+官方 sing-box 没有 XHTTP 传输（xhttp 只在 sing-box-lx 等魔改内核里有），
+所以 Argo-H3 / Argo-H2 这类 xhttp 节点无法写进 sing-box JSON，会被跳过。
+Clash Meta（mihomo 1.19.6+）原生支持 network: xhttp，八条节点全都能表达。
+"""
+import json
+import os
+import sys
+import urllib.parse
+
+UA_SKIP = {"xhttp"}
+
+
+def q(s):
+    """YAML 标量：统一双引号，转义反斜杠与双引号。"""
+    s = str(s)
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def truthy(v):
+    return str(v).lower() in ("1", "true", "yes")
+
+
+def parse(link):
+    u = urllib.parse.urlparse(link)
+    qs = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+
+    def g(k, d=None):
+        v = qs.get(k)
+        return v[0] if v else d
+
+    name = urllib.parse.unquote(u.fragment or "")
+    if not name:
+        name = "%s:%s" % (u.hostname, u.port)
+    return u, g, name
+
+
+def to_clash(link):
+    u, g, name = parse(link)
+    scheme = u.scheme.lower()
+    host = u.hostname
+    port = u.port or 443
+    qs = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    get = lambda k, d=None: (qs[k][0] if qs.get(k) else d)
+    alpn = [a.strip() for a in urllib.parse.unquote(get("alpn", "")).split(",") if a.strip()]
+    sni = get("sni") or get("servername") or get("peer") or host
+    fp = get("fp") or get("client-fingerprint") or "chrome"
+
+    if scheme == "vless":
+        uuid = urllib.parse.unquote(u.username or "")
+        net = get("type") or "tcp"
+        security = get("security") or "none"
+        p = {"name": name, "type": "vless", "server": host, "port": port,
+             "uuid": uuid, "udp": True}
+        if security in ("tls", "reality"):
+            p["tls"] = True
+            p["servername"] = sni
+            p["client-fingerprint"] = fp
+            if alpn:
+                p["alpn"] = alpn
+        if get("flow"):
+            p["flow"] = get("flow")
+        if security == "reality":
+            p["reality-opts"] = {"public-key": get("pbk", ""), "short-id": get("sid", "")}
+        p["network"] = net
+        if net == "xhttp":
+            opts = {"path": get("path", "/") or "/", "host": get("host") or host}
+            if get("mode"):
+                opts["mode"] = get("mode")
+            p["xhttp-opts"] = opts
+        elif net == "ws":
+            p["ws-opts"] = {"path": get("path", "/") or "/",
+                            "headers": {"Host": get("host") or host}}
+        return p
+
+    if scheme == "hysteria2":
+        p = {"name": name, "type": "hysteria2", "server": host, "port": port,
+             "password": urllib.parse.unquote(u.username or ""), "udp": True}
+        if sni:
+            p["sni"] = sni
+        if alpn:
+            p["alpn"] = alpn
+        if truthy(get("insecure", get("allow_insecure", "0"))):
+            p["skip-cert-verify"] = True
+        if get("obfs"):
+            p["obfs"] = get("obfs")
+            if get("obfs-password"):
+                p["obfs-password"] = get("obfs-password")
+        if get("mport"):
+            p["ports"] = get("mport")
+        return p
+
+    if scheme == "tuic":
+        p = {"name": name, "type": "tuic", "server": host, "port": port,
+             "uuid": urllib.parse.unquote(u.username or ""),
+             "password": urllib.parse.unquote(u.password or ""), "udp": True}
+        if sni:
+            p["sni"] = sni
+        if get("congestion_control"):
+            p["congestion-controller"] = get("congestion_control")
+        if get("udp_relay_mode"):
+            p["udp-relay-mode"] = get("udp_relay_mode")
+        if alpn:
+            p["alpn"] = alpn
+        if truthy(get("allow_insecure", get("insecure", "0"))):
+            p["skip-cert-verify"] = True
+        return p
+
+    if scheme == "anytls":
+        p = {"name": name, "type": "anytls", "server": host, "port": port,
+             "password": urllib.parse.unquote(u.username or ""), "udp": True}
+        if sni:
+            p["sni"] = sni
+        if alpn:
+            p["alpn"] = alpn
+        p["client-fingerprint"] = fp
+        if truthy(get("insecure", get("allowInsecure", "0"))):
+            p["skip-cert-verify"] = True
+        return p
+
+    return None
+
+
+def to_singbox(link):
+    """官方 sing-box 无法表达 xhttp，返回 None 让调用方跳过该节点。"""
+    u, g, name = parse(link)
+    scheme = u.scheme.lower()
+    host = u.hostname
+    port = u.port or 443
+    qs = urllib.parse.parse_qs(u.query, keep_blank_values=True)
+    get = lambda k, d=None: (qs[k][0] if qs.get(k) else d)
+    alpn = [a.strip() for a in urllib.parse.unquote(get("alpn", "")).split(",") if a.strip()]
+    sni = get("sni") or get("servername") or host
+
+    def tls(alpn_list=None, insecure=True, reality=None):
+        t = {"enabled": True, "server_name": sni}
+        if alpn_list:
+            t["alpn"] = alpn_list
+        if insecure:
+            t["insecure"] = True
+        t["utls"] = {"enabled": True, "fingerprint": get("fp") or "chrome"}
+        if reality:
+            t["reality"] = reality
+        return t
+
+    if scheme == "vless":
+        net = get("type") or "tcp"
+        if net in UA_SKIP:
+            return None
+        security = get("security") or "none"
+        o = {"type": "vless", "tag": name, "server": host, "server_port": port,
+             "uuid": urllib.parse.unquote(u.username or "")}
+        if get("flow"):
+            o["flow"] = get("flow")
+        if security in ("tls", "reality"):
+            reality = None
+            if security == "reality":
+                reality = {"enabled": True, "public_key": get("pbk", ""),
+                           "short_id": get("sid", "")}
+            o["tls"] = tls(alpn or None, insecure=False, reality=reality)
+        if net == "ws":
+            o["transport"] = {"type": "ws", "path": get("path", "/") or "/",
+                              "headers": {"Host": get("host") or host}}
+        return o
+
+    if scheme == "hysteria2":
+        o = {"type": "hysteria2", "tag": name, "server": host, "server_port": port,
+             "password": urllib.parse.unquote(u.username or "")}
+        o["tls"] = tls(alpn or ["h3"], insecure=truthy(get("insecure", "0")))
+        if get("obfs"):
+            o["obfs"] = {"type": get("obfs"), "password": get("obfs-password", "")}
+        if get("mport"):
+            # sing-box 的端口段写法是冒号，链接里是短横线；
+            # 且 server_port 与 server_ports 互斥，同时出现会被内核判为非法配置
+            o.pop("server_port", None)
+            o["server_ports"] = [get("mport").replace("-", ":")]
+        return o
+
+    if scheme == "tuic":
+        o = {"type": "tuic", "tag": name, "server": host, "server_port": port,
+             "uuid": urllib.parse.unquote(u.username or ""),
+             "password": urllib.parse.unquote(u.password or "")}
+        if get("congestion_control"):
+            o["congestion_control"] = get("congestion_control")
+        if get("udp_relay_mode"):
+            o["udp_relay_mode"] = get("udp_relay_mode")
+        o["tls"] = tls(alpn or ["h3"], insecure=truthy(get("allow_insecure", "0")))
+        return o
+
+    if scheme == "anytls":
+        o = {"type": "anytls", "tag": name, "server": host, "server_port": port,
+             "password": urllib.parse.unquote(u.username or "")}
+        o["tls"] = tls(alpn or ["h2", "http/1.1"],
+                       insecure=truthy(get("insecure", get("allowInsecure", "0"))))
+        return o
+
+    return None
+
+
+def yaml_proxy(p, indent="  "):
+    out = ["%s- name: %s" % (indent, q(p["name"]))]
+    sub = indent + "  "
+    for k, v in p.items():
+        if k == "name":
+            continue
+        if isinstance(v, dict):
+            out.append("%s%s:" % (sub, k))
+            for k2, v2 in v.items():
+                out.append("%s  %s: %s" % (sub, k2, q(v2)))
+        elif isinstance(v, list):
+            out.append("%s%s:" % (sub, k))
+            for item in v:
+                out.append("%s  - %s" % (sub, q(item)))
+        elif isinstance(v, bool):
+            out.append("%s%s: %s" % (sub, k, "true" if v else "false"))
+        elif isinstance(v, int):
+            out.append("%s%s: %d" % (sub, k, v))
+        else:
+            out.append("%s%s: %s" % (sub, k, q(v)))
+    return out
+
+
+def main():
+    if len(sys.argv) < 4:
+        sys.exit("usage: subs_gen.py <links.txt> <out.yaml> <out.json>")
+    src, out_yaml, out_json = sys.argv[1], sys.argv[2], sys.argv[3]
+    links = [l.strip() for l in open(src, encoding="utf-8") if l.strip()]
+
+    clash, sb = [], []
+    for line in links:
+        try:
+            c = to_clash(line)
+        except Exception as e:                      # 单条写坏不影响其它节点，但要留痕
+            sys.stderr.write("skip clash: %s (%s)\n" % (line.split("#")[-1][:24], e))
+            c = None
+        if c:
+            # Clash 不接受重名节点，重名会让整份配置加载失败
+            base, n = c["name"], 1
+            while any(p["name"] == c["name"] for p in clash):
+                n += 1
+                c["name"] = "%s %d" % (base, n)
+            clash.append(c)
+        try:
+            s = to_singbox(line)
+        except Exception as e:
+            sys.stderr.write("skip singbox: %s (%s)\n" % (line.split("#")[-1][:24], e))
+            s = None
+        if s:
+            base, n = s["tag"], 1
+            while any(o["tag"] == s["tag"] for o in sb):
+                n += 1
+                s["tag"] = "%s %d" % (base, n)
+            sb.append(s)
+
+    if not clash:
+        sys.exit("no node parsed")
+
+    # ---------- Clash（mihomo / Clash Verge / FlClash / Stash）----------
+    names = [p["name"] for p in clash]
+    lines = [
+        "# argox 订阅（Clash Meta / mihomo）",
+        "# 服务端生成，改配置请用 bash argox.sh，不要手改此文件",
+        "mixed-port: 7890",
+        "allow-lan: false",
+        "mode: rule",
+        "log-level: info",
+        "proxies:",
+    ]
+    for p in clash:
+        lines += yaml_proxy(p)
+    lines += ["proxy-groups:",
+              "  - name: PROXY",
+              "    type: select",
+              "    proxies:"]
+    lines += ["      - %s" % q(n) for n in names]
+    lines += ["rules:",
+              "  - GEOIP,CN,DIRECT",
+              "  - MATCH,PROXY"]
+    with open(out_yaml, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+
+    # ---------- sing-box（官方内核，xhttp 节点会被跳过）----------
+    if sb:
+        tags = [o["tag"] for o in sb]
+        cfg = {
+            "log": {"level": "info", "timestamp": True},
+            "outbounds": sb + [
+                {"type": "selector", "tag": "PROXY",
+                 "outbounds": tags + ["direct"], "default": tags[0]},
+                {"type": "direct", "tag": "direct"},
+            ],
+            "route": {"final": "PROXY"},
+        }
+        with open(out_json, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+    print("clash=%d singbox=%d skipped=%d" % (len(clash), len(sb), len(links) - len(sb)))
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+  chmod 755 "$SUBGEN"
+}
+
 gen_sub() {
   mkdir -p "$SUBD" "$QDIR"
   local links; links="$(build_links)"
@@ -2234,13 +2577,39 @@ gen_sub() {
   printf '%s\n' "$links" | base64 -w0 > "${SUBD}/argox.b64" 2>/dev/null \
     || printf '%s\n' "$links" | base64 | tr -d '\n' > "${SUBD}/argox.b64"
 
+  # ---------- 多格式订阅：Clash YAML + sing-box JSON ----------
+  # 失败不影响 base64 订阅（它是主格式，客户端兼容性最好）
+  local subnote=""
+  if has python3; then
+    write_subs_gen
+    if python3 "$SUBGEN" "${SUBD}/argox.txt" "${SUBD}/argox.yaml" "${SUBD}/argox.json" \
+         >/dev/null 2>&1; then
+      :
+    else
+      rm -f "${SUBD}/argox.yaml" "${SUBD}/argox.json"
+      subnote="（Clash/sing-box 格式生成失败，只有 base64）"
+    fi
+  else
+    subnote="（缺 python3，只有 base64）"
+  fi
+
   # 发布到订阅服务目录：文件名即 URL 路径，随机不可猜
+  # 三种格式共用同一个令牌，由订阅服务按 UA 分流
   local stoken; stoken="$(node_get sub_token 2>/dev/null || true)"
   if [[ -n "$stoken" ]]; then
     mkdir -p "$SUBPUB"
     cp "${SUBD}/argox.b64" "${SUBPUB}/${stoken}"
     chmod 644 "${SUBPUB}/${stoken}"
+    if [[ -f "${SUBD}/argox.yaml" ]]; then
+      cp "${SUBD}/argox.yaml" "${SUBPUB}/${stoken}.yaml"
+      chmod 644 "${SUBPUB}/${stoken}.yaml"
+    fi
+    if [[ -f "${SUBD}/argox.json" ]]; then
+      cp "${SUBD}/argox.json" "${SUBPUB}/${stoken}.json"
+      chmod 644 "${SUBPUB}/${stoken}.json"
+    fi
   fi
+  [[ -n "$subnote" ]] && warn "多格式订阅${subnote}"
 
   # 每个节点单独一个二维码文件
   local i=0 line name
@@ -2323,6 +2692,8 @@ show_nodes() {
 
   printf '\n'
   hr
+  info "同一个地址按客户端自动换格式：Clash/mihomo→YAML，sing-box→JSON，其余→base64"
+  info "也可显式指定：${url}.yaml / ${url}.json"
   info "karing：添加配置 → 导入配置链接 → 粘贴上面的订阅地址"
   info "文件备用：${SUBD}/argox.b64（Base64 订阅）"
   info "查看单节点链接：bash $0 links"
@@ -2918,31 +3289,9 @@ do_clean() {
   ok "清理完成（${before:-?} MB → ${after:-?} MB）"
 }
 
-do_backup() {
-  require_root
-  installed || { err "尚未安装"; return 1; }
-  mkdir -p "$BACKD"
-  local ts f
-  ts="$(date +%Y%m%d-%H%M%S)"
-  f="${BACKD}/argox-${ts}.tar.gz"
-
-  local items=()
-  [[ -f "$NODEF" ]] && items+=("$NODEF")
-  [[ -f "$CONF" ]]  && items+=("$CONF")
-  [[ -f "$TOKEN_FILE" ]] && items+=("$TOKEN_FILE")
-  [[ -f "$IPSF" ]] && items+=("$IPSF")
-
-  tar -czf "$f" -P "${items[@]}" 2>/dev/null || { err "备份失败"; return 1; }
-  chmod 600 "$f"
-  ok "已备份：$f（$(du -h "$f" | awk '{print $1}')）"
-
-  local n; n="$(ls -1 "${BACKD}"/argox-*.tar.gz 2>/dev/null | wc -l)"
-  if [[ "$n" -gt 5 ]]; then
-    ls -1t "${BACKD}"/argox-*.tar.gz | tail -n +6 | xargs -r rm -f
-    info "已保留最近 5 份备份"
-  fi
-  warn "备份含 Token 与 UUID，注意保管"
-}
+# 备份功能已移除（v2.8.0）：install 重装本身无损（uuid / sub_token / 端口 /
+# proto / landing / Reality 密钥 / 优选 IP 全部通过 ext_json 合并保留），
+# upgrade 也会把 node.json 存成 node.json.<时间戳>.bak，所以不再提供手动备份入口。
 
 do_uninstall() {
   require_root
@@ -3224,6 +3573,26 @@ PY
       "http://127.0.0.1:$(sub_port)/${stok}" 2>/dev/null)"
     [[ "$code" == "200" ]] && ck_ok "订阅本地自测 HTTP 200" \
       || ck_err "订阅本地自测 HTTP ${code:-超时}（服务没起或文件不在）"
+
+    # v2.8.0 多格式：缺文件只影响对应客户端，不算故障
+    local miss=""
+    [[ -f "${SUBPUB}/${stok}.yaml" ]] || miss="${miss} yaml"
+    [[ -f "${SUBPUB}/${stok}.json" ]] || miss="${miss} json"
+    if [[ -z "$miss" ]]; then
+      ck_ok "订阅三格式齐备（base64 / yaml / json）"
+    else
+      ck_warn "缺格式：${miss# }（python3 不可用时属正常，其余客户端不受影响）"
+    fi
+
+    # UA 分流是否真的在跑：订阅服务文件重写后不重启，进程仍是旧代码
+    local yhead
+    yhead="$(curl -s -A 'clash-verge/2.0' --max-time 5 \
+      "http://127.0.0.1:$(sub_port)/${stok}" 2>/dev/null | head -c 120)"
+    if [[ "$yhead" == *proxies:* ]]; then
+      ck_ok "Clash UA 分流生效（返回 YAML）"
+    else
+      ck_warn "Clash UA 没拿到 YAML → 订阅服务还在跑旧代码，执行 systemctl restart ${SVC_SUB}"
+    fi
   fi
 
   # ---------- 节点链接 ----------
@@ -3622,6 +3991,11 @@ PY
   write_sub_service
   systemctl daemon-reload
   ok "systemd 单元已对齐当前脚本路径"
+  # 订阅服务的 Python 文件被重写了，但正在跑的进程仍是旧代码
+  # （v2.8.0 的 UA 分流不重启就不会生效）；重启它不影响客户端连接
+  if [[ -f "$PYSRV" ]] && systemctl is-active --quiet "$SVC_SUB" 2>/dev/null; then
+    systemctl restart "$SVC_SUB" 2>/dev/null && ok "订阅服务已重载（新代码生效）"
+  fi
 
   # v2.7.0 移除 WS 入站：老实例的 config.json 里还有 argo-ws（占着 8002），
   # upgrade 本身不重写 config.json，所以这里显式迁移一次，否则 8002 会一直留着。
@@ -4685,8 +5059,7 @@ menu_main() {
    7) 更新到最新版             15) 住宅落地
    8) 自检 check               16) 订阅地址 / 二维码
    17) 端口管理                18) 系统优化
-   19) 清理缓存                20) 备份配置
-   21) 卸载
+   19) 清理缓存                20) 卸载
 EOF
     printf '\n    0) 退出\n'
     printf '%s\n' "──────────────────────────────────────────────────"
@@ -4712,8 +5085,7 @@ EOF
       17) do_port ;;
       18) do_sysopt ;;
       19) do_clean ;;
-      20) do_backup ;;
-      21) do_uninstall ;;
+      20) do_uninstall ;;
       0|q|Q) printf '\n  再见\n\n'; exit 0 ;;
       *) warn "无效选项：${choice:-<空>}" ;;
     esac
