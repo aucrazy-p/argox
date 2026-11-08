@@ -18,7 +18,7 @@ VERSION="2.9.0"
 APP="argox"
 
 # 脚本自身地址：从 /dev/fd/* 运行（bash <(curl ...)）且本地还没有副本时，用它把自己落地
-RAW_URL="https://raw.githubusercontent.com/aucrazy-p/h3-argo/main/argox.sh"
+RAW_URL="https://raw.githubusercontent.com/aucrazy-p/argox/main/argox.sh"
 SELF_PATH="/root/argox.sh"
 CMDBIN="/usr/local/bin/argox"   # 命令入口：install / upgrade 时自动生成，之后直接敲 argox
 

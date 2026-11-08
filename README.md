@@ -1,17 +1,17 @@
-# h3-argo
+# argox
 
 Cloudflare Argo 隧道 + Xray (XHTTP) + sing-box 双核一键部署，Ubuntu / Debian。
 
 ## 安装
 
 ```bash
-curl -fsSL -o ~/argox.sh https://raw.githubusercontent.com/aucrazy-p/h3-argo/main/argox.sh && bash ~/argox.sh
+curl -fsSL -o ~/argox.sh https://raw.githubusercontent.com/aucrazy-p/argox/main/argox.sh && bash ~/argox.sh
 ```
 
 下载失败换镜像（只替换中间那段地址）：
 
 ```bash
-curl -fsSL -o ~/argox.sh https://ghfast.top/https://raw.githubusercontent.com/aucrazy-p/h3-argo/main/argox.sh && bash ~/argox.sh
+curl -fsSL -o ~/argox.sh https://ghfast.top/https://raw.githubusercontent.com/aucrazy-p/argox/main/argox.sh && bash ~/argox.sh
 ```
 
 ## 注意
