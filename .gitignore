@@ -19,4 +19,6 @@ mihomo-windows-*
 tools/cfst/cfst.exe
 tools/cfst/*.txt
 tools/cfst/result.csv
+tools/cfst/result-full.csv
 tools/cfst/ftp.cfg
+tools/cfst/*.bak
