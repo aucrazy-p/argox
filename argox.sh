@@ -17,6 +17,10 @@ set -uo pipefail
 VERSION="2.8.0"
 APP="argox"
 
+# 脚本自身地址：从 /dev/fd/* 运行（bash <(curl ...)）且本地还没有副本时，用它把自己落地
+RAW_URL="https://raw.githubusercontent.com/aucrazy-p/h3-argo/main/argox.sh"
+SELF_PATH="/root/argox.sh"
+
 # ---- 路径 --------------------------------------------------------------------
 BASE="/opt/argox"
 CONF="${BASE}/config.json"
@@ -5181,5 +5185,41 @@ EOF
   esac
 }
 
+# ==============================================================================
+#  自落地
+#  用 bash <(curl ...) 运行时 $0 是 /dev/fd/NN（一次性管道），脚本里所有
+#  「bash $0 xxx」提示都会指向失效路径，重跑也没有本地副本。这里把自己存成
+#  $SELF_PATH 再重新执行一次，之后的 $0 就是真实文件。
+#  本地副本版本与当前不一致时不复用它，重新取一份，避免跑到旧版。
+#  落地失败不影响任何功能，只是提示里的路径不准。
+# ==============================================================================
+self_relocate() {
+  local src="${BASH_SOURCE[0]:-$0}"
+  case "$src" in
+    /dev/fd/*|/proc/self/fd/*|/dev/stdin|/dev/null|-) ;;
+    *) return 0 ;;                     # 正常文件运行，不用管
+  esac
+  [[ -n "${ARGOX_RELOCATED:-}" ]] && return 0
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || return 0   # 非 root 落地没意义，交给 require_root 报错
+
+  local dst="${ARGOX_DST:-$SELF_PATH}" have=""
+  [[ -s "$dst" ]] && have="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$dst" 2>/dev/null | head -1)"
+  if [[ -n "$have" && "$have" == "$VERSION" ]]; then
+    export ARGOX_RELOCATED=1
+    exec bash "$dst" "$@"
+  fi
+
+  if curl -fsSL --max-time 20 "$RAW_URL" -o "$dst" 2>/dev/null && [[ -s "$dst" ]] \
+     && grep -q '^APP="argox"' "$dst" 2>/dev/null; then
+    chmod 755 "$dst" 2>/dev/null || true
+    export ARGOX_RELOCATED=1
+    exec bash "$dst" "$@"
+  fi
+
+  warn "自身落地失败（网络或权限），本次用临时副本运行：提示里的 bash $0 路径不可用"
+  [[ -n "$have" ]] && info "本地副本 ${dst} 是 v${have}，当前是 v${VERSION}，建议手动更新"
+}
+
+self_relocate "$@"
 main "$@"
 
