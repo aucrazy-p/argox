@@ -121,10 +121,10 @@ sing-box 官方文档对此有一句直白警告：
 | 3 | `Hy2` | sing-box | 直连 UDP + 端口跳跃 | VPS 原生 | 自签 | 开 |
 | 4 | `TUIC` | sing-box | 直连 UDP | VPS 原生 | 自签 | 开 |
 | 5 | `AnyTLS` | sing-box | 直连 TCP 8445 | VPS 原生 | 自签 | 开 |
-| 6 | `Argo-H3-RH` | Xray | CF 隧道（QUIC，UID②） | Aimili | CF 托管 | 开 |
-| 7 | `Argo-H2-RH` | Xray | CF 隧道（TCP，UID②） | Aimili | CF 托管 | 开 |
+| 6 | `Argo-H3-RH` | Xray | CF 隧道（QUIC，UID②） | 住宅代理 | CF 托管 | 开 |
+| 7 | `Argo-H2-RH` | Xray | CF 隧道（TCP，UID②） | 住宅代理 | CF 托管 | 开 |
 | 8 | `Reality` | Xray | 直连 TCP 8443 | VPS 原生 | 无 | **关** |
-| 9 | `Reality-RH` | Xray | 直连 TCP 8443（UID②） | Aimili | 无 | **关** |
+| 9 | `Reality-RH` | Xray | 直连 TCP 8443（UID②） | 住宅代理 | 无 | **关** |
 
 **默认开启 7 条**（1–7）。Reality 两条默认关，菜单 8 一键开。
 
@@ -139,7 +139,7 @@ sing-box 官方文档对此有一句直白警告：
 > `argox-H3 → Argo-H3`、`argox-H3-住宅 → Argo-H3-RH`、`argox-Hy2 → Hy2`、`argox-Reality → Reality` …
 
 **Hy2 / TUIC 不做住宅落地版**：端到端 UDP 经 SOCKS5 的 UDP ASSOCIATE 转发，
-多数商业代理（含 Aimili）只实现 CONNECT，不实现 UDP ASSOCIATE，做了也是坏的。
+多数商业代理只实现 CONNECT，不实现 UDP ASSOCIATE，做了也是坏的。
 
 ### 2.1b 节点排列顺序（已在代码里写死约定）
 
@@ -226,7 +226,7 @@ v2rayN 的 Xray 内核没有 AnyTLS 实现。7.x 可以按节点切 sing-box 内
 "outbounds": [
   { "protocol": "freedom", "tag": "direct" },
   { "protocol": "socks",   "tag": "landing",
-    "settings": { "servers": [{ "address": "127.0.0.1", "port": 7928 }] } }
+    "settings": { "servers": [{ "address": "127.0.0.1", "port": 1080 }] } }
 ],
 "routing": { "rules": [
   { "type": "field", "user": ["landing"], "outboundTag": "landing" },
@@ -239,10 +239,10 @@ v2rayN 的 Xray 内核没有 AnyTLS 实现。7.x 可以按节点切 sing-box 内
 ```
 客户端 ──QUIC/UDP──▶ CF 边缘 ──TCP──▶ cloudflared ──TCP──▶ 127.0.0.1:8001
                                                                   │
-                                                        Xray 出站 ──TCP──▶ 127.0.0.1:7928
+                                                        Xray 出站 ──TCP──▶ 127.0.0.1:1080
 ```
 
-QUIC 在 CF 边缘就终结了，进入 Xray 之后到 Aimili 那段**永远是 TCP**。
+QUIC 在 CF 边缘就终结了，进入 Xray 之后到住宅代理那段**永远是 TCP**。
 所以 UDP 只在第一跳，落地环节纯 TCP，SOCKS5 完全够用。
 
 **与 `hop` 的关系：共存，互不干扰。**
@@ -256,8 +256,8 @@ QUIC 在 CF 边缘就终结了，进入 Xray 之后到 Aimili 那段**永远是 
 
 落地规则的 `user:["landing"]` 排在最前面，所以开了 `hop` 也不会污染落地节点。
 
-**检测**：`check` 会增加一条——Aimili 7928 是否可达。不可达时给警告而不是直接报错
-（Aimili 是临时用的，挂了不该阻塞其他节点）。
+**检测**：`check` 会增加一条——住宅代理 1080 是否可达。不可达时给警告而不是直接报错
+（住宅代理是临时用的，挂了不该阻塞其他节点）。
 
 ### 2.5 落地范围可扩展（E：以后能加）
 
@@ -419,7 +419,7 @@ TUIC 端口若落在 Hy2 跳跃段内，直接拒绝并提示。
 
 - 算法：ECC P-256（ARM 上握手更快，证书体积小）
 - 有效期：3650 天（10 年，避免频繁轮换）
-- SAN：默认填**主域名**（`argo.aucrazy.dpdns.org`），可配置
+- SAN：默认填**主域名**（`argo.example.com`），可配置
 - 生成命令：`openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 ...`
 
 **为什么 SAN 用主域名而不是假域名**：这个域名真实存在（有 DNS 记录指向 CF），
@@ -574,7 +574,7 @@ v2rayN 的 `port hopping` 字段、mihomo 的 `ports` 字段都对应这个值�
    TUIC             [开]      Reality   [关]
    AnyTLS           [关]
 
-── 住宅落地范围（Aimili） ────────────
+── 住宅落地范围（住宅代理） ────────────
    [x] Argo-H3 (Res)   [x] Argo-H2 (Res)
    [ ] Argo-WS (Res)   [ ] Reality (Res)
 ```
@@ -603,7 +603,7 @@ argox.sh cert [show|gen]
 argox.sh hop [on|off|status]
 argox.sh diag [auto|quic|http2]
 argox.sh check
-argox.sh backup|uninstall
+argox.sh uninstall
 ```
 
 ---
@@ -613,18 +613,18 @@ argox.sh backup|uninstall
 ```json
 {
   "uuid": "…",
-  "tunnel_host": "argo.aucrazy.dpdns.org",
-  "ws_host": "ws.aucrazy.dpdns.org",
-  "sub_host": "subx.aucrazy.dpdns.org",
+  "tunnel_host": "argo.example.com",
+  "ws_host": "ws.example.com",
+  "sub_host": "sub.example.com",
   "sub_token": "…",
-  "path_xhttp": "/0730beac6daadf19",
-  "path_ws": "/ws81a35bde768c",
+  "path_xhttp": "/random-path-xhttp",
+  "path_ws": "/ws-random-path",
   "tunnel_proto": "auto",
   "node_mode": "domain",
   "hop_mode": "off",
   "hop_proto": "socks",
   "hop_addr": "127.0.0.1",
-  "hop_port": "7928",
+  "hop_port": "1080",
 
   "install_mode": "B",
   "proto": {
@@ -639,7 +639,7 @@ argox.sh backup|uninstall
   "hy2":     { "port": 23000, "hop": "23000-27000", "obfs": false, "up": 50, "down": 300 },
   "tuic":    { "port": 30001, "password": "…", "cc": "bbr" },
   "reality": { "port": 8443, "sni": "www.microsoft.com", "short_id": "…" },
-  "cert":    { "sni": "argo.aucrazy.dpdns.org", "path": "/opt/argox/cert" }
+  "cert":    { "sni": "argo.example.com", "path": "/opt/argox/cert" }
 }
 ```
 
@@ -710,7 +710,7 @@ bash /root/argox.sh upgrade   # 补字段，不动服务
 | 防火墙规则存在性 | `nft list ruleset` / `iptables -S` | 端口跳跃失效 |
 | 端口段 vs 安全组 | 随机 3 个段内端口外部探测（需确认） | 安全组没放行整段 |
 | 证书有效期 | `openssl x509 -enddate` | 自签过期 |
-| Aimili 7928 可达性 | TCP connect | 落地节点静默失效 |
+| 住宅代理 1080 可达性 | TCP connect | 落地节点静默失效 |
 
 全部只读，不修改任何东西。
 
@@ -759,7 +759,7 @@ bash /root/argox.sh upgrade   # 补字段，不动服务
 2. **UDP 协议特征比 TCP 明显**（sing-box 官方原话），加 Hy2/TUIC 是"拿隐蔽换速度"
 3. **端口跳跃依赖云安全组放行整段**，配错会表现为随机断流，极难查
 4. **自签 + insecure** 降低了中间人门槛（对翻墙场景影响有限，但要知道）
-5. **落地 UUID 依赖 Aimili 存活**，Aimili 挂了那两条节点直接不可用（主节点不受影响）
+5. **落地 UUID 依赖该代理存活**，它挂了那两条节点直接不可用（主节点不受影响）
 6. **AnyTLS 与 H3 在客户端里互斥**——v2rayN 切 sing-box 内核后 H3 失效，要来回切
 7. **双核 = 两个更新源**，将来某次升级可能不兼容；两核独立升级，可只升一个
 8. **Reality 用 8443 非标端口**，本身就是一个特征，效果不如占 443

@@ -74,9 +74,9 @@ argo.example.com     ← 唯一入口，脚本里填这个
 
 **`argo.example.com` 就是脚本里要填的「隧道域名」。**
 
-### 3.1 从旧版本升级的清理动作
+### 3.1 面板里多余的 Public Hostname
 
-旧版本要配三条（`argo` / `ws` / `sub`）。升级到 v2.7.0 后：
+隧道只需要上面这一条。如果面板里还有 `ws` / `sub` 之类的子域路由，删掉：
 
 1. 删掉 `ws` 和 `sub` 两条 **Public Hostname**
 2. 去 **DNS 页面**确认对应的两条 CNAME 也消失了 —— 删路由**不一定**连带删 DNS 记录，

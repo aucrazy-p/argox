@@ -300,7 +300,7 @@ PY
 
 installed() { [[ -x "$XRAY_BIN" ]] && [[ -f "$CONF" ]]; }
 
-# 由主域名推导同级子域：argo.aucrazy.dpdns.org + ws -> ws.aucrazy.dpdns.org
+# 由主域名推导同级子域：argo.example.com + ws -> ws.example.com
 sub_of() { # $1=host $2=prefix
   local host="$1" pre="$2" rest
   [[ -z "$host" || -z "$pre" ]] && return 0
@@ -969,7 +969,7 @@ write_sb_config() {
     if [[ -n "$body" ]]; then body="${body},"$'\n'; fi
     body="${body}$(sb_inbound_anytls)"
     # AnyTLS 落地：独立入站 + socks 出口。sing-box 侧只有它可以走落地，
-    # Hy2 / TUIC 是 UDP，落地代理（Aimili）不支持 UDP ASSOCIATE。
+    # Hy2 / TUIC 是 UDP，落地代理不支持 UDP ASSOCIATE。
     if landing_on && landing_wants anytls && [[ -n "$(landing_uuid)" ]]; then
       body="${body},"$'\n'"$(sb_inbound_anytls rh)"
       need_land=1
@@ -983,7 +983,7 @@ write_sb_config() {
 
   local ob="    { \"type\": \"direct\", \"tag\": \"direct\" }" rt=""
   if [[ $need_land -eq 1 ]]; then
-    # 落地出口：sing-box 直接把该入站的流量交给本机代理（与 Xray 用同一个 Aimili）
+    # 落地出口：sing-box 直接把该入站的流量交给本机代理（与 Xray 用同一个本地代理）
     ob="${ob},"$'\n'"    { \"type\": \"$(landing_proto)\", \"tag\": \"landing\", \"server\": \"$(node_hop_addr)\", \"server_port\": $(node_hop_port) }"
     rt=","$'\n'"  \"route\": {"$'\n'"    \"rules\": ["$'\n'"      { \"inbound\": [ \"anytls-rh-in\" ], \"outbound\": \"landing\" }"$'\n'"    ]"$'\n'"  }"
   fi
@@ -1601,7 +1601,7 @@ DEF_SUB_SUB="sub"   # 订阅子域前缀，实际域名 = sub.<主域名>
 HOP_MODE_DEFAULT="off"
 HOP_PROTO_DEFAULT="socks"    # socks（SOCKS5）| http（HTTP CONNECT）
 HOP_ADDR_DEFAULT="127.0.0.1"
-HOP_PORT_DEFAULT=7928
+HOP_PORT_DEFAULT=1080
 
 # cloudflared 传输协议：auto 让它先试 QUIC(UDP 7844)，不通自动退 http2(TCP 7844)
 TUNNEL_PROTO_DEFAULT="auto"
@@ -2634,7 +2634,7 @@ cf_paths() {
   local host="$1"
   printf '\n  Cloudflare → 该隧道 → Public Hostname，只需要一条（Path 留空）：\n\n'
   printf '    %-30s → 127.0.0.1:%s   H3 / H2 主入口\n' "${host:-argo.<主域名>}" "$DEF_PORT_XHTTP"
-  printf '\n  订阅不走隧道（直连 %s:%s），所以那两条 ws / sub 子域的路由可以删掉了。\n' \
+  printf '\n  订阅不走隧道（直连 %s:%s），CF 里只需保留上面这一条，多余的子域路由可以删掉。\n' \
     "$(vps_ip)" "$(sub_port)"
   local u; u="$(sub_url 2>/dev/null || true)"
   [[ -n "$u" ]] && printf '  订阅地址：%s\n' "$u"
@@ -2670,15 +2670,20 @@ show_nodes() {
   printf '%s\n' "$links" | sed 's/.*#//' | awk '{printf "    %02d  %s\n", NR, $0}'
   printf '\n'
 
-  local code
+  local code lcode
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$url" 2>/dev/null || true)"
+  lcode="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+    "http://127.0.0.1:$(sub_port)/${token}" 2>/dev/null || true)"
   if [[ "$code" == "200" ]]; then
     ok "订阅地址已可访问"
+  elif [[ "$lcode" == "200" ]]; then
+    warn "订阅服务本机正常，但公网地址不通（HTTP ${code:-超时}）"
+    info "云安全组放行 TCP $(sub_port)，并确认公网 IP 正确：$(vps_ip)"
+    info "本机自测：curl -s -o /dev/null -w '%%{http_code}\\n' http://127.0.0.1:$(sub_port)/${token}"
   else
-    warn "订阅地址暂不可访问（HTTP ${code:-超时}）"
-    cf_paths "$host"
-    printf '\n  保存后等 1-2 分钟，本机可验证：\n'
-    printf '    curl -s -o /dev/null -w "%%{http_code}\\n" %s\n' "$url"
+    warn "订阅服务没响应（HTTP ${lcode:-超时}）"
+    info "查看：systemctl status ${SVC_SUB} / journalctl -u ${SVC_SUB} -n 30"
+    info "重建订阅：bash $0 sub"
   fi
 
   if has qrencode; then
@@ -2849,7 +2854,7 @@ do_install() {
 
   # 依赖
   local need=()
-  for b in curl unzip openssl tar; do has "$b" || need+=("$b"); done
+  for b in curl unzip openssl tar python3; do has "$b" || need+=("$b"); done
   has jq || need+=("jq")
   if [[ ${#need[@]} -gt 0 ]]; then
     step "安装依赖：${need[*]}"
@@ -4005,7 +4010,7 @@ PY
     if write_xray_config "$u0" "$px0" "$pw0"; then
       systemctl restart "$SVC_XRAY" 2>/dev/null; sleep 1
       if svc_active "$SVC_XRAY"; then
-        ok "WS 入站已移除（8002 不再监听），Xray 配置已按 v2.7.0 重写"
+        ok "WS 入站已移除（8002 不再监听），Xray 配置已重写"
         MIG_WS=1
       else
         warn "Xray 重启失败，手动看：journalctl -u ${SVC_XRAY} -n 20"
@@ -4073,8 +4078,8 @@ PY
     info "直连协议当前：$(proto_label)"
   fi
   printf '\n'
-  warn "v2.7.0：订阅已改为直连 VPS 的 TCP $(sub_port)，CF 面板只需保留一条路由（$(node_get tunnel_host) → 127.0.0.1:${DEF_PORT_XHTTP}）"
-  info "ws / sub 两条 Public Hostname 及其 DNS 记录可以删掉了"
+  info "订阅直连 VPS 的 TCP $(sub_port)，CF 面板只需保留一条路由（$(node_get tunnel_host) → 127.0.0.1:${DEF_PORT_XHTTP}）"
+  info "多余的 ws / sub Public Hostname 及其 DNS 记录可以删掉"
 
   local su; su="$(sub_url 2>/dev/null || true)"
   if [[ -n "$su" ]]; then
@@ -4232,7 +4237,7 @@ landing_show() {
       printf '  代理探测 : %s端口开着但代理不通%s（换个协议试试 http）\n' "$C_YEL" "$C_R"
     fi
   else
-    printf '  代理探测 : %s不可达%s（Aimili 没启动 / 端口不对）\n' "$C_YEL" "$C_R"
+    printf '  代理探测 : %s不可达%s（住宅代理没启动 / 端口不对）\n' "$C_YEL" "$C_R"
   fi
 }
 
@@ -4250,7 +4255,7 @@ landing_set() { # $1=on|off
     pr="$(hop_probe || true)"
     if [[ -z "$pr" ]]; then
       err "本地代理 $(node_hop_addr):$(node_hop_port) 不通，未开启"
-      info "Aimili 没启动或端口变了；地址端口在菜单 13 → 3 里改"
+      info "住宅代理没启动或端口变了；地址端口在菜单 13 → 3 里改"
       return 1
     fi
     lu="$(landing_uuid)"
@@ -4399,7 +4404,7 @@ do_landing() {
   esac
 
   while true; do
-    printf '\n  住宅落地（Aimili 等本地代理）\n'
+    printf '\n  住宅落地（本地 SOCKS / HTTP 代理）\n'
     landing_show
     printf '\n'
     printf '  1) 开启落地（订阅多出 -RH 节点）\n'
@@ -4467,6 +4472,7 @@ do_tunnel_setup() {
       node_set tunnel_host "$h"
       ok "隧道域名已设为 ${h}"
       gen_sub >/dev/null 2>&1 || true
+      cf_paths "$h"
       show_nodes
       ;;
     3)
@@ -4963,7 +4969,7 @@ port_firewall_hint() {
     printf '  %-16s %-4s %s\n' "$(reality_port)" "TCP" "Reality"
     any=1
   fi
-  printf '  %-16s %-4s %s\n' "$(sub_port)" "TCP" "订阅服务（v2.7.0 起直连，不走隧道）"
+  printf '  %-16s %-4s %s\n' "$(sub_port)" "TCP" "订阅服务（客户端直连，不走隧道）"
   [[ $any -eq 0 ]] && printf '  （直连协议全关，只有订阅端口需要放行）\n'
 
   printf '\n'
@@ -5063,7 +5069,7 @@ menu_main() {
 EOF
     printf '\n    0) 退出\n'
     printf '%s\n' "──────────────────────────────────────────────────"
-    printf '  %s左列＝常用动作，右列＝配置项；菜单已重排（自检→8 隧道→11 直连→14 落地→15）%s\n' "$C_DIM" "$C_R"
+    printf '  %s左列＝常用动作，右列＝配置项%s\n' "$C_DIM" "$C_R"
     read -rp "  请选择: " choice
     case "${choice:-}" in
       1)  do_install ;;
@@ -5165,7 +5171,7 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 diag auto    恢复自动选择（默认）
   bash $0 check        自检：配置 / 端口 / 订阅 / 链接 / 隧道（只读）
   bash $0 check -q     静默自检，只返回退出码（0=全通过）
-  bash $0 upgrade      对老版本补齐字段 + 对齐单元 + 重建订阅（不重启服务）
+  bash $0 upgrade      补齐配置字段 + 对齐单元 + 重建订阅（不重启服务）
   bash $0 uninstall    卸载
 
   curl -fsSL <地址> | bash     ← 不推荐，请先 curl -o 下来看一眼
