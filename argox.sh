@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.9.1"
+VERSION="2.9.2"
 APP="argox"
 
 # 脚本自身地址：从 /dev/fd/* 运行（bash <(curl ...)）且本地还没有副本时，用它把自己落地
@@ -1902,6 +1902,24 @@ EOF
 
   ok "已保存 ${n} 个 IP（未校验，保持粘贴顺序）"
   awk -F'\t' '{printf "    %-16s %s\n", $1, $2}' "$IPMETA"
+
+  # 存 IP 和「用不用 IP」是两件事：模式仍是 domain 时订阅一个 IP 都不会展开。
+  # 手动粘贴这条路径以前不问，导致「贴完发现订阅没变」。
+  printf '\n'
+  if [[ "$(node_mode)" == "ip" ]]; then
+    gen_sub >/dev/null 2>&1 || true
+    ok "订阅已重建（当前已是 ip 模式）"
+  else
+    read -rp "  切换为 ip 模式并重建订阅？(Y/n) " yn2
+    if [[ "${yn2,,}" != "n" ]]; then
+      node_set node_mode ip
+      gen_sub >/dev/null 2>&1 || true
+      ok "已切换为 ip 模式，订阅已重建"
+      info "客户端里删掉旧订阅重新导入即可（旧的域名节点会消失）"
+    else
+      info "保持 domain 模式，IP 列表已存好，随时切：$(cmd_prefix) mode ip"
+    fi
+  fi
 }
 
 update_ips() {
@@ -3650,6 +3668,13 @@ PY
   else
     local nlink; nlink="$(printf '%s\n' "$links" | grep -c .)"
     ck_ok "生成 ${nlink} 条链接（模式 $(node_mode)）"
+    # 有 IP 却仍是 domain：这是「导入完订阅没变化」最常见的成因，直接点出来
+    if [[ "$(node_mode)" != "ip" && -s "$IPSF" ]]; then
+      local nip; nip="$(wc -l < "$IPSF" | tr -d ' ')"
+      if [[ "${nip:-0}" -gt 0 ]]; then
+        ck_warn "已存 ${nip} 个优选 IP 但模式是 domain（未启用）→ $(cmd_prefix) mode ip"
+      fi
+    fi
 
     local bad=0 line sni hostarg pth exp_sni exp_host exp_path vip dtype dip
     vip="$(vps_ip)"
@@ -4506,6 +4531,53 @@ do_landing() {
   done
 }
 
+# 节点地址模式：domain=域名直连，ip=展开优选 IP。
+# 单独做成子命令是因为它藏在「隧道配置」子菜单里 —— 刚导入完优选 IP 时
+# 很难联想到还要去那儿切一下，订阅没变化就成了悬案。
+do_mode() {
+  require_root
+  local m="${1:-}" cur n
+  cur="$(node_mode)"
+  n=0
+  [[ -s "$IPSF" ]] && n="$(wc -l < "$IPSF" | tr -d ' ')"
+
+  if [[ -z "$m" ]]; then
+    printf '\n  当前地址模式：%s\n' "$cur"
+    printf '  · domain  域名直连（客户端自行解析到最近的 CF 节点）\n'
+    printf '  · ip      展开优选 IP（IP 列表 %s 个）\n' "${n:-0}"
+    if [[ -s "$IPSF" ]]; then
+      printf '\n  当前 IP：\n'
+      head -8 "$IPSF" | sed 's/^/    /'
+      [[ "${n:-0}" -gt 8 ]] && printf '    … 共 %s 个\n' "$n"
+    fi
+    printf '\n  切换：%s mode ip    /    %s mode domain\n\n' "$(cmd_prefix)" "$(cmd_prefix)"
+    return 0
+  fi
+
+  case "$m" in
+    domain|ip) ;;
+    *) err "用法：$(cmd_prefix) mode [domain|ip]"; return 1 ;;
+  esac
+
+  if [[ "$m" == "ip" ]]; then
+    if [[ ! -s "$IPSF" ]]; then
+      err "IP 列表为空，先导入再切：$(cmd_prefix) ips"
+      return 1
+    fi
+    info "ip 模式只影响 Argo-H3 / Argo-H2 / Argo-H3-RH 三条；Hy2、TUIC、AnyTLS、Reality 直连 VPS 公网 IP"
+  fi
+
+  if [[ "$m" == "$cur" ]]; then
+    ok "地址模式已是 ${m}"
+  else
+    node_set node_mode "$m"
+    ok "地址模式已设为 ${m}"
+  fi
+
+  gen_sub >/dev/null 2>&1 && ok "订阅已重建" || warn "订阅重建失败，跑 check 查看"
+  show_nodes
+}
+
 do_tunnel_setup() {
   require_root
   local mode_v
@@ -5192,6 +5264,7 @@ main() {
     logs)      do_logs ;;
     update)    do_update ;;
     ips)       if [[ -n "${2:-}" ]]; then import_ips_url "${2:-}"; else update_ips; fi ;;
+    mode)      do_mode "${2:-}" ;;
     nodes|show) show_nodes ;;
     links)     show_links ;;
     hop)       do_hop "${2:-}" "${3:-}" ;;
@@ -5221,6 +5294,9 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   ${B} sub          输出 Base64 订阅内容
   ${B} ips          从 IP 源拉取并校验（菜单 12）
   ${B} ips <链接>   从你本机测速结果导入（保序不重排，也可填本地文件路径）
+  ${B} mode         查看地址模式（domain 域名直连 / ip 优选 IP）
+  ${B} mode ip      切到优选 IP 模式并重建订阅（只影响 Argo-H3/H2/H3-RH）
+  ${B} mode domain  切回域名直连
   ${B} hop          出口跳板状态（菜单 13）
   ${B} hop on       全部流量走本地代理（自动探测 socks/http）
   ${B} hop off      关闭跳板，流量从 VPS 本机出口出去
