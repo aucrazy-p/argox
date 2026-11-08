@@ -14,12 +14,13 @@
 
 set -uo pipefail
 
-VERSION="2.8.0"
+VERSION="2.9.0"
 APP="argox"
 
 # 脚本自身地址：从 /dev/fd/* 运行（bash <(curl ...)）且本地还没有副本时，用它把自己落地
 RAW_URL="https://raw.githubusercontent.com/aucrazy-p/h3-argo/main/argox.sh"
 SELF_PATH="/root/argox.sh"
+CMDBIN="/usr/local/bin/argox"   # 命令入口：install / upgrade 时自动生成，之后直接敲 argox
 
 # ---- 路径 --------------------------------------------------------------------
 BASE="/opt/argox"
@@ -653,7 +654,7 @@ reality_sni_set() { # $1=域名
   ok "伪装目标：${old} → ${s}"
 
   if proto_on reality; then
-    reality_apply || { err "应用失败，手动重开：bash $0 direct off reality && bash $0 direct on reality"; return 1; }
+    reality_apply || { err "应用失败，手动重开：$(cmd_prefix) direct off reality && $(cmd_prefix) direct on reality"; return 1; }
     ok "已重写 Xray 配置并重启 argox-xray"
   else
     gen_sub >/dev/null 2>&1 || warn "订阅重建失败"
@@ -2013,7 +2014,7 @@ import_ips_url() {
       info "保持 domain 模式，IP 列表已存好，随时切"
     fi
   fi
-  info "回退：bash $0 tunnel → 6) 节点地址模式 → domain"
+  info "回退：$(cmd_prefix) tunnel → 6) 节点地址模式 → domain"
 }
 
 list_ips() {
@@ -2687,7 +2688,7 @@ show_nodes() {
   else
     warn "订阅服务没响应（HTTP ${lcode:-超时}）"
     info "查看：systemctl status ${SVC_SUB} / journalctl -u ${SVC_SUB} -n 30"
-    info "重建订阅：bash $0 sub"
+    info "重建订阅：$(cmd_prefix) sub"
   fi
 
   if has qrencode; then
@@ -2705,7 +2706,7 @@ show_nodes() {
   info "也可显式指定：${url}.yaml / ${url}.json"
   info "karing：添加配置 → 导入配置链接 → 粘贴上面的订阅地址"
   info "文件备用：${SUBD}/argox.b64（Base64 订阅）"
-  info "查看单节点链接：bash $0 links"
+  info "查看单节点链接：$(cmd_prefix) links"
 }
 
 show_links() {
@@ -2811,7 +2812,7 @@ do_status() {
       if [[ "$pb" == ok:* ]]; then
         ok "隧道在线（实测 HTTP ${pb#ok:}，日志窗口内暂无注册记录属正常）"
       else
-        info "隧道进程在跑，但未确认在线（bash $0 diag 可查）"
+        info "隧道进程在跑，但未确认在线（$(cmd_prefix) diag 可查）"
       fi
     fi
   fi
@@ -3048,7 +3049,7 @@ PY
     if install_singbox && cert_gen && sb_sync; then
       ok "直连协议已就绪：$(proto_label)"
     else
-      warn "直连协议未就绪，稍后执行：bash $0 direct on all"
+      warn "直连协议未就绪，稍后执行：$(cmd_prefix) direct on all"
     fi
   fi
 
@@ -3139,6 +3140,7 @@ PY
 
   # ---------- 收尾 ----------
   gen_sub >/dev/null 2>&1 || true
+  install_cmd || true
 
   printf '\n'
   hr
@@ -3152,6 +3154,11 @@ PY
   printf '  XHTTP 路径  : %s\n' "$px"
   printf '  配置目录    : %s\n' "$BASE"
   printf '  Token 文件  : %s（600）\n' "$TOKEN_FILE"
+  if [[ -x "${ARGOX_BIN:-$CMDBIN}" ]]; then
+    printf '  管理命令    : %sargox%s（直接敲，或 argox check / argox port）\n' "$C_B" "$C_R"
+  else
+    printf '  管理命令    : bash %s\n' "$SELF_PATH"
+  fi
   hr
 
   if [[ -z "$host" ]]; then
@@ -3311,6 +3318,7 @@ do_uninstall() {
   printf '  · 配置目录 /opt/argox（含 UUID/Token/日志/订阅/自签证书）\n'
   printf '  · nftables 表 inet argox_hop（Hy2 端口跳跃规则）\n'
   printf '  · /etc/argox/token.env\n'
+  printf '  · /usr/local/bin/argox（命令入口）\n'
   printf '  · /etc/sysctl.d/99-argox.conf\n\n'
   printf '  %s不会动的：%s1panel、已有 xray.service、443 端口、cdnx 相关文件\n\n' "$C_GRN" "$C_R"
   local yn; read -rp "  确认卸载？(输入 yes 继续): " yn
@@ -3337,6 +3345,7 @@ do_uninstall() {
   rm -rf "$TOKEN_DIR"
   rm -f /etc/sysctl.d/99-argox.conf
   rm -f /etc/logrotate.d/argox
+  remove_cmd
   sysctl --system >/dev/null 2>&1 || true
 
   ok "已卸载"
@@ -3974,13 +3983,13 @@ PY
     elif [[ "$(hy2_hop)" == "20000-30000" ]]; then
       # 用户自己改过 port，只把段留着 → 不擅自改，给提示
       warn "Hy2 跳跃段仍是 20000-30000，可能和 RustDesk(21115-21119) 等端口冲突"
-      info "要改运行：bash $0 hy2 hop 23000-27000（监听口会自动跟到段首）"
+      info "要改运行：$(cmd_prefix) hy2 hop 23000-27000（监听口会自动跟到段首）"
     fi
     if [[ "$mig_land" != "-" ]]; then
       ok "落地默认入口已迁移：h3,h2 → ${mig_land}（H2 与 H3 同走 CF，重复；AnyTLS 是 TCP 兜底）"
       if landing_on; then
         info "落地已开启，正在应用新入口（会重启 Xray / sing-box）"
-        landing_set_target "h3" "anytls" || warn "应用失败，手动跑：bash $0 landing target h3,anytls"
+        landing_set_target "h3" "anytls" || warn "应用失败，手动跑：$(cmd_prefix) landing target h3,anytls"
       fi
     fi
     if [[ "$mig_sni" != "-" ]]; then
@@ -3988,7 +3997,7 @@ PY
       info "依据：微软证书链 5902 字节（余量仅 39%），且 Xray 作者不建议用微软做目标"
     elif [[ "$(reality_sni)" == "www.microsoft.com" ]]; then
       warn "Reality 伪装目标仍是 www.microsoft.com（已启用过，故未自动改）"
-      info "换目标：bash $0 reality sni www.lovelive-anime.jp（会先体检，客户端需重拉订阅）"
+      info "换目标：$(cmd_prefix) reality sni www.lovelive-anime.jp（会先体检，客户端需重拉订阅）"
     fi
   else
     warn "缺 python3，跳过字段补齐"
@@ -4000,6 +4009,7 @@ PY
   write_sub_service
   systemctl daemon-reload
   ok "systemd 单元已对齐当前脚本路径"
+  install_cmd && ok "命令入口已就绪：argox（以后直接敲 argox 进菜单）"
   # 订阅服务的 Python 文件被重写了，但正在跑的进程仍是旧代码
   # （v2.8.0 的 UA 分流不重启就不会生效）；重启它不影响客户端连接
   if [[ -f "$PYSRV" ]] && systemctl is-active --quiet "$SVC_SUB" 2>/dev/null; then
@@ -4040,7 +4050,7 @@ PY
         MIG_RH=1
       else
         warn "sing-box 重建失败，端口仍是 ${cur_rh}"
-        info "手动重应用：bash $0 landing off && bash $0 landing on"
+        info "手动重应用：$(cmd_prefix) landing off && $(cmd_prefix) landing on"
       fi
     fi
   fi
@@ -4077,7 +4087,7 @@ PY
   fi
   if ! proto_on hy2 && ! proto_on tuic && ! proto_on anytls; then
     warn "直连协议全部关闭：Argo 走 CF，线路差时会全挂"
-    info "开一条 TCP 兜底：bash $0 direct on all（菜单 14）"
+    info "开一条 TCP 兜底：$(cmd_prefix) direct on all（菜单 14）"
   else
     info "直连协议当前：$(proto_label)"
   fi
@@ -4978,7 +4988,7 @@ port_firewall_hint() {
 
   printf '\n'
   info "本机 iptables / ufw 脚本已自动放行，只剩云安全组要手动加"
-  info "端口要改：bash $0 port <sub|hy2|tuic|anytls|reality> <端口>"
+  info "端口要改：$(cmd_prefix) port <sub|hy2|tuic|anytls|reality> <端口>"
   info "CF 隧道只需一条公共主机名：$(node_get tunnel_host) → http://127.0.0.1:${DEF_PORT_XHTTP}"
 }
 
@@ -5108,6 +5118,7 @@ EOF
 #  入口
 # ==============================================================================
 main() {
+  local B
   case "${1:-}" in
     install)   do_install ;;
     start)     do_start ;;
@@ -5133,56 +5144,117 @@ main() {
     uninstall) do_uninstall ;;
     ""|menu)   require_root; menu_main ;;
     -h|--help|help)
+      B="$(cmd_prefix)"
       cat <<EOF
 argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
 
 用法：
-  bash $0              进入交互菜单（推荐）
-  bash $0 install      直接部署
-  bash $0 status       查看状态
-  bash $0 nodes        打印订阅地址 + 二维码
-  bash $0 links        打印单节点链接
-  bash $0 sub          输出 Base64 订阅内容
-  bash $0 ips          从 IP 源拉取并校验（菜单 12）
-  bash $0 ips <链接>   从你本机测速结果导入（保序不重排，也可填本地文件路径）
-  bash $0 hop          出口跳板状态（菜单 13）
-  bash $0 hop on       全部流量走本地代理（自动探测 socks/http）
-  bash $0 hop off      关闭跳板，流量从 VPS 本机出口出去
-  bash $0 landing      住宅落地状态（菜单 15）
-  bash $0 landing on   给 -RH 节点挂住宅落地（需本地代理可用）
-  bash $0 landing off  关闭落地
-  bash $0 landing target h3,anytls,reality  选择落地作用入口
-  bash $0 landing proto socks|http  落地出口协议
-  bash $0 direct       直连协议状态（Hy2 / TUIC / AnyTLS / Reality，菜单 14）
-  bash $0 direct on all   一次开启 Hy2 + TUIC + AnyTLS + Reality（推荐）
-  bash $0 direct on hy2    开启 Hy2（自动装 sing-box + 自签证书）
-  bash $0 direct off tuic  关闭 TUIC
-  bash $0 port         端口一览（菜单 17）
-  bash $0 port sub 9000     改订阅端口（自动重建服务 + 订阅）
-  bash $0 port hy2 24000    改 Hy2 监听口（跳跃段另用 hy2 hop）
-  bash $0 port tuic 30001   改 TUIC 端口
-  bash $0 port anytls 8445  改 AnyTLS 端口（落地口自动跟随 −1）
-  bash $0 port reality 8443 改 Reality 端口
-  bash $0 reality       Reality 状态（伪装目标 / 端口 / 密钥）
-  bash $0 reality probe    体检当前伪装目标 + 内置候选（证书大小 / 握手 / 跳转）
-  bash $0 reality probe www.intel.com   只测指定域名，可一次给多个
-  bash $0 reality sni www.lovelive-anime.jp   换伪装目标（先体检，不合格拒绝写入）
-  bash $0 hy2 hop 23000-27000  改 Hy2 端口跳跃段（监听口自动跟随段首）
-  bash $0 cert         查看自签证书
-  bash $0 cert gen     重新生成证书（--force 强制）
-  bash $0 diag         cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）
-  bash $0 diag http2   强制隧道走 TCP（UDP 7844 被封时用）
-  bash $0 diag auto    恢复自动选择（默认）
-  bash $0 check        自检：配置 / 端口 / 订阅 / 链接 / 隧道（只读）
-  bash $0 check -q     静默自检，只返回退出码（0=全通过）
-  bash $0 upgrade      补齐配置字段 + 对齐单元 + 重建订阅（不重启服务）
-  bash $0 uninstall    卸载
+  ${B}              进入交互菜单（推荐）
+  ${B} install      直接部署
+  ${B} status       查看状态
+  ${B} nodes        打印订阅地址 + 二维码
+  ${B} links        打印单节点链接
+  ${B} sub          输出 Base64 订阅内容
+  ${B} ips          从 IP 源拉取并校验（菜单 12）
+  ${B} ips <链接>   从你本机测速结果导入（保序不重排，也可填本地文件路径）
+  ${B} hop          出口跳板状态（菜单 13）
+  ${B} hop on       全部流量走本地代理（自动探测 socks/http）
+  ${B} hop off      关闭跳板，流量从 VPS 本机出口出去
+  ${B} landing      住宅落地状态（菜单 15）
+  ${B} landing on   给 -RH 节点挂住宅落地（需本地代理可用）
+  ${B} landing off  关闭落地
+  ${B} landing target h3,anytls,reality  选择落地作用入口
+  ${B} landing proto socks|http  落地出口协议
+  ${B} direct       直连协议状态（Hy2 / TUIC / AnyTLS / Reality，菜单 14）
+  ${B} direct on all   一次开启 Hy2 + TUIC + AnyTLS + Reality（推荐）
+  ${B} direct on hy2    开启 Hy2（自动装 sing-box + 自签证书）
+  ${B} direct off tuic  关闭 TUIC
+  ${B} port         端口一览（菜单 17）
+  ${B} port sub 9000     改订阅端口（自动重建服务 + 订阅）
+  ${B} port hy2 24000    改 Hy2 监听口（跳跃段另用 hy2 hop）
+  ${B} port tuic 30001   改 TUIC 端口
+  ${B} port anytls 8445  改 AnyTLS 端口（落地口自动跟随 −1）
+  ${B} port reality 8443 改 Reality 端口
+  ${B} reality       Reality 状态（伪装目标 / 端口 / 密钥）
+  ${B} reality probe    体检当前伪装目标 + 内置候选（证书大小 / 握手 / 跳转）
+  ${B} reality probe www.intel.com   只测指定域名，可一次给多个
+  ${B} reality sni www.lovelive-anime.jp   换伪装目标（先体检，不合格拒绝写入）
+  ${B} hy2 hop 23000-27000  改 Hy2 端口跳跃段（监听口自动跟随段首）
+  ${B} cert         查看自签证书
+  ${B} cert gen     重新生成证书（--force 强制）
+  ${B} diag         cloudflared 出站诊断（DNS / TCP 7844 / 注册情况）
+  ${B} diag http2   强制隧道走 TCP（UDP 7844 被封时用）
+  ${B} diag auto    恢复自动选择（默认）
+  ${B} check        自检：配置 / 端口 / 订阅 / 链接 / 隧道（只读）
+  ${B} check -q     静默自检，只返回退出码（0=全通过）
+  ${B} upgrade      补齐配置字段 + 对齐单元 + 重建订阅（不重启服务）
+  ${B} uninstall    卸载
 
   curl -fsSL <地址> | bash     ← 不推荐，请先 curl -o 下来看一眼
 EOF
       ;;
     *) err "未知命令：$1（用 --help 查看）"; exit 1 ;;
   esac
+}
+
+# ==============================================================================
+#  命令入口
+#  装一个 /usr/local/bin/argox 的壳，内容是 exec bash <脚本本体> "$@"。
+#  这样装完只需敲 argox（或 argox check / argox port sub 9000），不用记路径。
+#  用壳而不是副本：脚本更新后命令自动跟着新，不会出现两份代码不一致。
+#  失败一律静默降级 —— 命令入口只是便利，不影响任何功能。
+# ==============================================================================
+
+# 提示里该显示哪个命令：装了入口显示 argox，没装则回退到 bash <脚本>
+cmd_prefix() {
+  if [[ -x "${ARGOX_BIN:-$CMDBIN}" ]]; then
+    printf 'argox'
+  else
+    printf 'bash %s' "${0:-argox.sh}"
+  fi
+}
+
+install_cmd() {
+  local src="${1:-${BASH_SOURCE[0]:-$0}}"
+  case "$src" in
+    /dev/fd/*|/proc/self/fd/*|/dev/stdin|-) return 1 ;;
+  esac
+  [[ -f "$src" ]] || return 1
+
+  local tgt="${ARGOX_DST:-$SELF_PATH}"
+  local bin="${ARGOX_BIN:-$CMDBIN}"
+
+  # 脚本本体放在别处时（手动下载到 /tmp 之类）先落到固定位置，
+  # 否则命令入口指向一个随时会被清理的路径。
+  if [[ "$src" != "$tgt" ]]; then
+    if ! install -m 0755 "$src" "$tgt" 2>/dev/null; then
+      warn "无法写入 ${tgt}，命令入口未安装"
+      return 1
+    fi
+  fi
+
+  local tmp; tmp="$(mktemp)" || return 1
+  {
+    printf '#!/bin/sh\n'
+    printf '# argox 命令入口（由 argox.sh 自动生成，请勿手工编辑）\n'
+    printf 'exec bash "%s" "$@"\n' "$tgt"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+
+  chmod 0755 "$tmp" 2>/dev/null
+  mkdir -p "$(dirname "$bin")" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  if mv -f "$tmp" "$bin" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp"
+  warn "命令入口写入失败（${bin}），仍可用 bash ${tgt}"
+  return 1
+}
+
+remove_cmd() {
+  local bin="${ARGOX_BIN:-$CMDBIN}"
+  [[ -f "$bin" ]] || return 0
+  grep -q 'argox 命令入口' "$bin" 2>/dev/null || return 0   # 不是我们生成的，不碰
+  rm -f "$bin" 2>/dev/null
 }
 
 # ==============================================================================
@@ -5206,6 +5278,7 @@ self_relocate() {
   [[ -s "$dst" ]] && have="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$dst" 2>/dev/null | head -1)"
   if [[ -n "$have" && "$have" == "$VERSION" ]]; then
     export ARGOX_RELOCATED=1
+    ARGOX_DST="$dst" install_cmd "$dst" >/dev/null 2>&1 || true
     exec bash "$dst" "$@"
   fi
 
@@ -5213,6 +5286,7 @@ self_relocate() {
      && grep -q '^APP="argox"' "$dst" 2>/dev/null; then
     chmod 755 "$dst" 2>/dev/null || true
     export ARGOX_RELOCATED=1
+    ARGOX_DST="$dst" install_cmd "$dst" >/dev/null 2>&1 || true   # 顺手装好 argox 命令
     exec bash "$dst" "$@"
   fi
 

@@ -19,4 +19,4 @@ curl -fsSL -o ~/argox.sh https://ghfast.top/https://raw.githubusercontent.com/au
 - root 运行，Ubuntu / Debian，ARM64 / AMD64
 - 需要已托管到 Cloudflare 的域名和隧道，见 [docs/cloudflare-setup.md](docs/cloudflare-setup.md)
 - 装完按脚本提示走：订阅地址、要放行的端口都会打印出来
-- 以后进菜单就一条：`bash ~/argox.sh`
+- 以后进菜单直接敲 `argox`（装完自动生成，不用记路径）
