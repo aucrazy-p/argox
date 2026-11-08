@@ -47,43 +47,43 @@ sudo cloudflared service install eyJhIjoiXXXXXXXXXXXXXXXX...
 
 ## 3. 配 Public Hostname（决定流量往哪走）
 
-**三条路由，三个不同子域，Path 全部留空。**
-
-> ⚠️ 不要用「同一个域名 + Path 分流」。cloudflared 的路由是**按顺序命中第一条**，不是最长匹配；Path 留空那条排在最前面会把所有请求吃掉，表现为订阅 404、WS 连不通。这是实测踩过的坑。
-
-### 3.1 加三条
-
-路径：该隧道页面 → **Public Hostname** 标签（新版叫 **Published application routes** / **Routes**）→ **Add a public hostname**，重复三次。
+**v2.7.0 起只需要一条路由。** 订阅已经改成直连 VPS 的 TCP 端口，不再经过隧道；
+WS 入站也已删除（H2 节点走 `XHTTP + ALPN=h2`，和 H3 共用同一个回源）。
 
 | # | Subdomain | Path | Service → Type | Service → URL | 用途 |
 |---|---|---|---|---|---|
 | 1 | `argo` | **留空** | `HTTP` | `127.0.0.1:8001` | H3 / H2 主入口 |
-| 2 | `ws` | **留空** | `HTTP` | `127.0.0.1:8002` | WS 兜底 |
-| 3 | `sub` | **留空** | `HTTP` | `127.0.0.1:8099` | 订阅 |
 
-三次的 **Domain 填同一个**（如 `example.com`），Subdomain 各不相同。
+路径：该隧道页面 → **Public Hostname** 标签（新版叫 **Published application routes** / **Routes**）→ **Add a public hostname**，加一条就够。
 
 单条的填写模板：
 
 | 表单字段 | 填什么 |
 |---|---|
-| Subdomain | `argo` / `ws` / `sub`（按上表） |
-| Domain | 你的域名，三次相同 |
+| Subdomain | `argo` |
+| Domain | 你的域名 |
 | Path | **什么都不填** |
 | Service → Type | `HTTP` |
-| Service → URL | 按上表，只填 `host:port` |
+| Service → URL | `127.0.0.1:8001` |
 
-保存后，**DNS 页面**应自动出现三条「隧道」类型记录（橙色云，目标指向你的隧道）。
-
-保存后得到三个域名：
+保存后，**DNS 页面**应自动出现一条「隧道」类型记录（橙色云，目标指向你的隧道）。
 
 ```
-argo.example.com     ← 主入口，脚本里填这个
-ws.example.com       ← WS 兜底
-sub.example.com      ← 订阅
+argo.example.com     ← 唯一入口，脚本里填这个
 ```
 
 **`argo.example.com` 就是脚本里要填的「隧道域名」。**
+
+### 3.1 从旧版本升级的清理动作
+
+旧版本要配三条（`argo` / `ws` / `sub`）。升级到 v2.7.0 后：
+
+1. 删掉 `ws` 和 `sub` 两条 **Public Hostname**
+2. 去 **DNS 页面**确认对应的两条 CNAME 也消失了 —— 删路由**不一定**连带删 DNS 记录，
+   残留的记录会让域名继续解析到隧道，访问得到 1033 而不是干净地 NXDOMAIN
+3. `sub` 这条尤其要确认，否则你可能以为订阅还在走隧道
+
+删不干净不会导致节点不可用（只是留了个 1033 的空壳域名），但排查问题时容易误判。
 
 ### 3.2 订阅地址与令牌
 
@@ -93,28 +93,30 @@ sub.example.com      ← 订阅
 grep -o '"sub_token": *"[^"]*"' /opt/argox/node.json
 ```
 
-订阅地址固定为：
+订阅地址固定为（**直连，不经隧道**）：
 
 ```
-https://sub.example.com/<你的32位令牌>
+http://<VPS 公网 IP>:<订阅端口>/<你的32位令牌>
 ```
+
+端口默认 `8099`。直接打印，不用自己拼：
+
+```bash
+bash /root/argox.sh nodes      # 菜单 16 也会显示
+```
+
+两个前提：
+
+- Oracle 安全组放行 **TCP 8099**（本机防火墙脚本会自动放行）
+- 想换端口：`bash argox.sh port sub 9000`，改完记得同步放行新端口
 
 令牌**每人每台机都不一样**，复制命令输出，不要照抄文档里的任何示例串（照抄必 404）。
 
-脚本默认把主域名第一段换成 `sub` 来推导订阅子域。如果 CF 里 `sub` 被占用（换成 `subx` 之类），在 VPS 上改一次即可：
-
-```bash
-bash /root/argox.sh      # 菜单 13 → 5) 订阅子域
-```
-
-WS 子域同理（菜单 13 → 4）。
-
-### 3.3 某个子域解析不到（NXDOMAIN）
+### 3.3 主域名解析不到（NXDOMAIN）
 
 **面板里有记录 ≠ 权威服务器上有记录。** 用命令行验证，别信页面：
 
 ```bash
-# VPS 或本机都行，把 hal.ns.cloudflare.com 换成你的 NS 也行
 dig +short argo.example.com @8.8.8.8
 ```
 
@@ -128,15 +130,11 @@ dig +short argo.example.com @8.8.8.8
 
 隧道 UUID 在隧道详情页顶部或地址栏 `.../networks/tunnels/<UUID>`，**不是副本 ID**。
 
-### 3.4 三个必须注意的点
+### 3.4 必须注意的点
 
-1. **Path 三条全部留空**。填了具体 Path 也不会更安全，只会引入匹配歧义。
-2. **Subdomain 三条不能重复**。重复就是回到「Path 抢占」的老问题。
-3. **URL 只填 `host:port`**，不要带 `http://`；协议由 Type 下拉框决定。选 `HTTP`（源站是明文监听），选 HTTPS 会握手失败。
-
-> 只用节点、不要订阅的话，第 3 条（`sub`）可以不配，脚本仍会生成 Base64 订阅文件（菜单 15 里有本地路径）。
-
----
+1. **Path 留空**。填了具体 Path 不会更安全，只会引入匹配歧义（cloudflared 是按顺序命中第一条，不是最长匹配）。
+2. **URL 只填 `host:port`**，不要带 `http://`；协议由 Type 下拉框决定。选 `HTTP`（源站是明文监听），选 HTTPS 会握手失败。
+3. **不需要再配多条子域**。想用自定义域名当 SNI，可以给同一条隧道再加 Public Hostname 指向 `127.0.0.1:8001`，那是「优选域名」玩法，不是必需的。
 
 ## 4. 开启 HTTP/3（用 H3 节点必须）
 
@@ -183,15 +181,15 @@ Cloudflare 官方明确：`This setting is for connection between the user and C
 
 **② 开了不代表一定更快**
 
-有些运营商对 UDP 的 QoS 比 TCP 更狠，或者客户端内核不支持 XHTTP over QUIC，这时 H3 会连不上。所以订阅默认给三条：
+有些运营商对 UDP 的 QoS 比 TCP 更狠，或者客户端内核不支持 XHTTP over QUIC，这时 H3 会连不上。所以订阅默认给两条走 CF 的：
 
-- `argox-H3`（UDP/QUIC）— 实测通常最快，抗丢包
-- `argox-H2`（TCP）— UDP 被限速时切过去
-- `argox-WS`（TCP，走 `ws` 子域）— 最后的兜底
+- `Argo-H3`（UDP/QUIC）— 实测通常最快，抗丢包
+- `Argo-H2`（TCP，同一个回源、只换 ALPN）— UDP 被限速时切过去
 
 用数据决定主用哪条，别只看名字。
 
-不开 HTTP/3 也不影响主流程：H2 和 WS 照常工作，只是 H3 节点会握手失败。
+不开 HTTP/3 也不影响主流程：H2 照常工作，只是 H3 节点会握手失败。
+CF 侧路不理想时，直接切直连那几条（Hy2 / TUIC / AnyTLS / Reality），它们不经过 CF。
 
 > 实测提醒：客户端内核要支持 XHTTP over QUIC 才能用 H3。**v2rayN（Xray 内核）可以，karing（sing-box 内核）不行**——后者表现是 H3 全部 ×，且服务端 `access.log` 里一条请求都收不到。
 
@@ -227,11 +225,11 @@ curl -sI http://127.0.0.1:8001/<path_xhttp>
 # 从外部访问隧道域名，应该不是 1033 / 502
 curl -sI https://argo.你的域名.com
 
-# 订阅地址（应返回一屏 Base64 文本）
-curl -s https://sub.你的域名.com/<订阅令牌> | head -c 120
+# 订阅地址（直连 VPS，应返回一屏 Base64 文本）
+curl -s http://<VPS公网IP>:8099/<订阅令牌> | head -c 120
 
-# 三条子域都解析到了 CF 才算配齐
-for h in argo ws sub; do printf '%s -> ' "$h.你的域名.com"; dig +short "$h.你的域名.com" @8.8.8.8 | head -2 | tr '\n' ' '; echo; done
+# 主域名解析到了 CF 才算配齐（订阅不吃 DNS，走 IP）
+dig +short argo.你的域名.com @8.8.8.8
 ```
 
 或者直接用菜单 `15 → 3` 测试，脚本会翻译错误码。

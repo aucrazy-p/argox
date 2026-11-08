@@ -416,7 +416,8 @@ bash argox.sh            → 进入菜单 → 选 1
 ## 11. 需要你手动完成的（脚本无法代做）
 
 1. **CF Dashboard 建隧道**：Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared → 复制 token。
-2. **配 Public Hostname**：子域名 → 服务 `http://127.0.0.1:8001`（XHTTP）。若要用 WS 兜底节点，再加一条 `http://127.0.0.1:8002`。
+2. **配 Public Hostname**：子域名 → 服务 `http://127.0.0.1:8001`（XHTTP）。
+   v2.7.0 起只需这一条：WS 入站与 8002 已删除，订阅改为直连 VPS 端口，不再需要 `ws` / `sub` 子域。
 3. **开启 HTTP/3**：Speed → Optimization → Protocol Optimization → HTTP/3 打开（用 H3 节点必须开）。
 4. **SSL/TLS 模式**：隧道模式不涉及；若同时保留 cdnx 橙云回源，设 Full。
 5. 把 token 粘贴给脚本（安装时，或菜单 15）。

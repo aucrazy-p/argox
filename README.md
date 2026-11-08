@@ -26,7 +26,7 @@ bash /root/argox.sh
 - root 权限，Ubuntu / Debian 系
 - ARM64 或 AMD64（自动识别）
 - 域名已托管 Cloudflare，并已创建隧道，见 [docs/cloudflare-setup.md](docs/cloudflare-setup.md)
-- 8001 / 8002 / 8099 端口空闲；仅监听本机，不开放任何公网端口，不占用 443
+- 8001 端口空闲（隧道回源，仅本机）；8099 端口空闲且**对外开放**（订阅直连）
 - VPS 能**出站**访问 `7844`（cloudflared 隧道端口，UDP + TCP）；出站被封时隧道进程在跑但永远注册不上
 
 ## 菜单
@@ -42,22 +42,28 @@ bash /root/argox.sh
    6) 查看日志                 14) 直连协议（Hy2/TUIC/AnyTLS/Reality）
    7) 更新到最新版             15) 住宅落地
    8) 自检 check               16) 订阅地址 / 二维码
-   17) 系统优化                18) 清理缓存
-   19) 备份配置                20) 卸载
+   17) 端口管理                18) 系统优化
+   19) 清理缓存                20) 备份配置
+   21) 卸载
 ```
 
 > v2.6.0 重排过编号：自检 check 从 17 → **8**，隧道设置 13 → **11**，
 > 直连协议 20 → **14**，住宅落地 19 → **15**，优选 IP 14 → **12**，出口跳板 16 → **13**。
+> v2.7.0 插入 **17) 端口管理**，系统优化起顺移至 18–21。
 
 ## 订阅
 
-安装后菜单 16 输出订阅地址：
+安装后菜单 16 输出订阅地址。**v2.7.0 起订阅直连 VPS，不再走 Cloudflare 隧道**：
 
 ```
-https://<订阅子域>/<订阅令牌>
+http://<VPS 公网 IP>:<订阅端口>/<订阅令牌>
 ```
 
-默认输出 5 个节点（`domain` 模式），节点名与顺序固定：
+这样 CF 侧只需要一条路由，也省掉一条 DNS 和一份 CF 流量。代价是订阅走明文 HTTP
+（内容里是 UUID 和密码，没有 TLS 私钥），且要放行订阅端口（默认 `8099/TCP`）。
+端口可改：`bash argox.sh port sub 9000`。
+
+默认输出 8 个节点（`domain` 模式；直连协议全开且落地开启时），节点名与顺序固定：
 
 ```
 Argo-H3     CF 隧道，QUIC 抗丢包（CF 线路差时就废）
@@ -66,13 +72,15 @@ Hy2         直连 VPS，UDP，带端口跳跃（速度最快）
 TUIC        直连 VPS，UDP，备选
 AnyTLS      直连 VPS，TCP，UDP 被限速时的唯一出路
 Reality     直连 VPS，TCP，Xray 内核（默认关，纯 Xray 客户端用）
+Argo-H3-RH  走隧道，出口走家里（落地）
+AnyTLS-RH   直连 VPS，出口走家里（落地）
 ```
 
 命名约定：走 Cloudflare 隧道的加 `Argo-` 前缀；直连 VPS 公网端口的用裸协议名；
 住宅落地版统一加 `-RH` 后缀，且全部排在列表最后。
 
-**WS 已下线**：它和 H2 同为 TCP 443、路径完全重叠，属于下位替代，
-留着只会干扰选择。
+**WS 已在 v2.7.0 彻底移除**（入站、子域、8xxx 回源端口全部删除）。H2 节点走的是
+`XHTTP + ALPN=h2`，和 H3 共用同一个回源端口，只是 ALPN 不同——所以删掉 WS 不影响任何节点。
 
 地址都写域名，由客户端自行解析到最近的 CF 节点。
 需要按 IP 展开时，先用下面的「优选 IP」把列表准备好，再菜单 11 → `6) 节点地址模式` 切成 `ip`。
@@ -142,6 +150,29 @@ bash argox.sh cert gen --force     # 重签
 | AnyTLS | `8445` | TCP |
 | AnyTLS-RH | `8444` | TCP（落地开启时才有，与 8445 连号，可一次放行 `8444-8445`） |
 | Reality | `8443` | TCP（默认关，不开不监听） |
+| 订阅服务 | `8099` | TCP（v2.7.0 起直连，必须放行） |
+
+装完脚本会自动打印这张清单（含你改过的端口值），照抄到 Oracle 控制台即可：
+
+```bash
+bash argox.sh port        # 端口一览（菜单 17）
+```
+
+所有端口都能改，改完自动重建服务与订阅，并提示要放行哪个新端口：
+
+```bash
+bash argox.sh port sub 9000      # 订阅
+bash argox.sh port hy2 24000     # Hy2 监听口（跳跃段另用 hy2 hop）
+bash argox.sh port tuic 30001
+bash argox.sh port anytls 8445   # 落地口自动跟随（−1）
+bash argox.sh port reality 8443
+```
+
+安装时想直接指定，用环境变量（不用交互）：
+
+```bash
+SUB_PORT=9000 ANYTLS_PORT=9443 bash argox.sh install
+```
 
 Hy2 的端口跳跃靠 nftables 的 `redirect` 实现，sing-box 实际只监听 `23000` 一个口，
 其余 3999 个端口只是重定向规则，不占进程不占内存。**整段必须放行**——

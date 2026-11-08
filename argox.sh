@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  argox — Cloudflare Argo 隧道 + Xray (XHTTP / WS) 一键部署管理脚本
+#  argox — Cloudflare Argo 隧道 + Xray (XHTTP) + sing-box 双核部署管理脚本
 #
 #  目标：用 Cloudflare Anycast 就近接入，绕开「移动 CMI → 美国 PCCW → 大阪」
 #        的绕美路由（250ms）与晚高峰丢包（24%）。
@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.6.2"
+VERSION="2.7.0"
 APP="argox"
 
 # ---- 路径 --------------------------------------------------------------------
@@ -44,17 +44,20 @@ SVC_TUN="argox-tunnel"
 SVC_SUB="argox-sub"
 SVC_SB="argox-sb"
 
-# ---- 默认端口（全部仅本机，不开放任何公网端口）-------------------------------
-DEF_PORT_XHTTP=8001     # 仅本机，给 Argo 隧道回源
-DEF_PORT_WS=8002        # 仅本机，给 Argo 隧道回源（WS 兜底）
-DEF_PORT_SUB=8099       # 仅本机，订阅服务
+# ---- 端口默认值 --------------------------------------------------------------
+# 全部可覆盖：安装时用环境变量（如 SUB_PORT=9000 bash argox.sh install），
+# 装完用 `bash argox.sh port <协议> <端口>`，都会写进 node.json 持久化。
+# 回源端口（XHTTP）只在 127.0.0.1 上，不对外，一般不用改。
+DEF_PORT_XHTTP="${XHTTP_PORT:-8001}"   # 仅本机，给 Argo 隧道回源（H3/H2 共用）
+DEF_PORT_SUB="${SUB_PORT:-8099}"       # 订阅服务，v2.7.0 起对外监听（直连，不走隧道）
 
 # ---- 直连协议（sing-box）默认值 ----------------------------------------------
-# 这两个端口必须开放公网，Hy2 另需整段跳跃端口
-DEF_PORT_HY2=23000      # Hy2 实监听端口（UDP）——取跳跃段首
-DEF_PORT_TUIC=30001     # TUIC 监听端口（UDP）
-DEF_PORT_ANYTLS=8445    # AnyTLS 监听端口（TCP）——UDP 全灭时的唯一出路
-DEF_PORT_REALITY=8443   # Reality 监听端口（TCP）——Xray 内核，默认关
+# 这几个必须开放公网，Hy2 另需整段跳跃端口
+DEF_PORT_HY2="${HY2_PORT:-23000}"          # Hy2 实监听端口（UDP）——取跳跃段首
+DEF_PORT_TUIC="${TUIC_PORT:-30001}"        # TUIC 监听端口（UDP）
+DEF_PORT_ANYTLS="${ANYTLS_PORT:-8445}"     # AnyTLS 监听端口（TCP）——UDP 全灭时的唯一出路
+DEF_PORT_REALITY="${REALITY_PORT:-8443}"   # Reality 监听端口（TCP）——Xray 内核，默认关
+DEF_PORT_WS=8002        # 已废弃（v2.7.0 删除 WS 入站），保留常量只为老脚本兼容
 # Reality 伪装目标（dest / serverNames）。选型依据见 docs/plan-v2.md 2.6：
 #   - 必须 TLS1.3 + ALPN h2，且从 VPS 可直连 443
 #   - 证书 TLS 记录须 ≤ 8192 字节（Xray 硬编码上限，超了直接握手失败且不报错）
@@ -311,21 +314,10 @@ sub_of() { # $1=host $2=prefix
   printf '%s.%s' "$pre" "$rest"
 }
 
-# WS 兜底子域（配置优先，缺省由主域名推导）
-node_ws_host() {
-  local h
-  h="$(node_get ws_host 2>/dev/null || true)"
-  [[ -z "$h" ]] && h="$(sub_of "$(node_get tunnel_host 2>/dev/null || true)" "$DEF_WS_SUB")"
-  printf '%s' "$h"
-}
-
-# 订阅子域（配置优先，缺省由主域名推导）
-node_sub_host() {
-  local h
-  h="$(node_get sub_host 2>/dev/null || true)"
-  [[ -z "$h" ]] && h="$(sub_of "$(node_get tunnel_host 2>/dev/null || true)" "$DEF_SUB_SUB")"
-  printf '%s' "$h"
-}
+# v2.7.0 起：WS 子域 / 订阅子域两个概念都废弃了。
+#   - WS 入站已删除，H2 节点走 XHTTP + ALPN，与 H3 共用 8001 回源
+#   - 订阅改为直连 VPS 公网端口，不经隧道
+# sub_of / DEF_WS_SUB / DEF_SUB_SUB 保留仅供老配置推导参考，不再参与节点生成。
 
 # 节点地址模式：domain（域名直连）| ip（展开优选 IP）
 node_mode() {
@@ -435,6 +427,15 @@ anytls_port() { local p; p="$(node_jget anytls.port 2>/dev/null)"; printf '%s' "
 
 # ---- Reality（Xray 内核）参数 ------------------------------------------------
 reality_port() { local p; p="$(node_jget reality.port 2>/dev/null)"; printf '%s' "${p:-$DEF_PORT_REALITY}"; }
+# 订阅端口：v2.7.0 起订阅不再走隧道，改为公网直连，所以端口要可配、要放行
+sub_port()    { local p; p="$(node_jget sub.port 2>/dev/null)";    printf '%s' "${p:-$DEF_PORT_SUB}"; }
+
+# 订阅地址：直连 VPS 公网 IP，不经隧道（省掉一条 CF 路由 + 一条 DNS + 一份 CF 流量）
+sub_url() {
+  local tok; tok="$(node_get sub_token 2>/dev/null || true)"
+  [[ -z "$tok" ]] && return 1
+  printf 'http://%s:%s/%s' "$(vps_ip)" "$(sub_port)" "$tok"
+}
 reality_sni()  { local s; s="$(node_jget reality.sni 2>/dev/null)";  printf '%s' "${s:-$REALITY_SNI}"; }
 reality_sid()  { node_jget reality.short_id 2>/dev/null; }
 reality_pk()   { node_jget reality.private_key 2>/dev/null; }
@@ -1182,29 +1183,25 @@ write_xray_config() {
   local uuid="$1" px="$2" pw="$3"
 
   # ---- 住宅落地：各入站按 target 决定是否挂第二个 UUID ----
-  local use_landing=0 luuid="" x_land=0 w_land=0 r_land=0
+  # v2.7.0 起 WS 入站已彻底移除（订阅里 H2 走的是 XHTTP + ALPN，不占 8002），
+  # 所以落地只剩 H3/H2 共用入站、Reality 两种挂法。
+  local use_landing=0 luuid="" x_land=0 r_land=0
   if landing_on; then
     luuid="$(landing_uuid)"
     if [[ -n "$luuid" ]]; then
       use_landing=1
       landing_wants h3 && x_land=1
       landing_wants h2 && x_land=1
-      landing_wants ws && w_land=1
       # Reality-RH 还要求 Reality 本身开着，否则入站不存在
       proto_on reality && landing_wants reality && r_land=1
     fi
   fi
 
-  local xclients wclients
+  local xclients
   if [[ $x_land -eq 1 ]]; then
     xclients="[{ \"id\": \"${uuid}\" }, { \"id\": \"${luuid}\", \"email\": \"landing\" }]"
   else
     xclients="[{ \"id\": \"${uuid}\" }]"
-  fi
-  if [[ $w_land -eq 1 ]]; then
-    wclients="[{ \"id\": \"${uuid}\" }, { \"id\": \"${luuid}\", \"email\": \"landing\" }]"
-  else
-    wclients="[{ \"id\": \"${uuid}\" }]"
   fi
 
   # ---- Reality 入站（Xray 内核，默认关；与 sing-box 无关）----
@@ -1260,7 +1257,7 @@ write_xray_config() {
 
   # 落地出站追加在最后：不改变 outbounds[0]，默认出口仍然是 direct / hop
   # 落地路由插在最前：确保比 hop 的兜底规则先匹配，跳板开着也不污染落地节点
-  if [[ $use_landing -eq 1 && ( $x_land -eq 1 || $w_land -eq 1 || $r_land -eq 1 ) ]]; then
+  if [[ $use_landing -eq 1 && ( $x_land -eq 1 || $r_land -eq 1 ) ]]; then
     local lp la lport
     lp="$(landing_proto)"; la="$(node_hop_addr)"; lport="$(node_hop_port)"
     ob_json="${ob_json},
@@ -1289,19 +1286,6 @@ ${rt_json}"
         "xhttpSettings": { "path": "${px}", "mode": "auto" }
       },
       "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"], "routeOnly": true }
-    },
-    {
-      "tag": "argo-ws",
-      "listen": "127.0.0.1",
-      "port": ${DEF_PORT_WS},
-      "protocol": "vless",
-      "settings": { "clients": ${wclients}, "decryption": "none" },
-      "streamSettings": {
-        "network": "ws",
-        "security": "none",
-        "wsSettings": { "path": "${pw}" }
-      },
-      "sniffing": { "enabled": true, "destOverride": ["http","tls"], "routeOnly": true }
     }${reality_in}
   ],
   "outbounds": [
@@ -1325,7 +1309,7 @@ EOF
 write_xray_service() {
   cat > "/etc/systemd/system/${SVC_XRAY}.service" <<EOF
 [Unit]
-Description=argox Xray (XHTTP/WS)
+Description=argox Xray (XHTTP)
 Documentation=https://github.com/XTLS/Xray-core
 After=network-online.target
 Wants=network-online.target
@@ -1479,7 +1463,9 @@ write_sub_server() {
   mkdir -p "$SUBPUB"
   cat > "$PYSRV" <<'PYEOF'
 #!/usr/bin/env python3
-"""argox 订阅服务：只读、只认白名单文件、不列目录。"""
+"""argox 订阅服务：只读、只认白名单文件、不列目录。
+v2.7.0 起订阅不走隧道，监听 0.0.0.0 供客户端直连（内容里只有节点参数，
+无 TLS 私钥；访问靠 32 位 hex 令牌，不列目录、不认子路径穿越）。"""
 import http.server
 import os
 import sys
@@ -1504,7 +1490,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.serve_forever()
 PYEOF
   chmod 755 "$PYSRV"
@@ -1521,7 +1507,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/python3 ${PYSRV} ${DEF_PORT_SUB} ${SUBPUB}
+ExecStart=/usr/bin/python3 ${PYSRV} $(sub_port) ${SUBPUB}
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -2134,22 +2120,21 @@ emit_direct_links() {
 }
 
 # 落地家宽节点（-RH）：地址固定用域名，永远排在订阅最后。
-# 顺序固定 h3 → h2 → ws，与主节点保持一致；IP 模式下也用域名，避免节点数翻倍。
-emit_landing_links() { # $1=host $2=ws_host $3=ex $4=enc_pw
-  local host="$1" ws_host="$2" ex="$3" enc_pw="$4"
+# 顺序固定 h3 → h2 → anytls → reality，与主节点保持一致；IP 模式下也用域名，避免节点数翻倍。
+# v2.7.0：ws 分支已移除（WS 入站不存在了），target 里若残留 ws 会被忽略。
+emit_landing_links() { # $1=host $2=ex
+  local host="$1" ex="$2"
   landing_on || return 0
   local lu; lu="$(landing_uuid)"
   [[ -z "$lu" ]] && return 0
   local t
-  for t in h3 h2 ws anytls reality; do
+  for t in h3 h2 anytls reality; do
     landing_wants "$t" || continue
     case "$t" in
       h3) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s%s\n' \
             "$lu" "$host" "$host" "$ex" "$host" "$NAME_H3" "$NAME_RH" ;;
       h2) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s%s\n' \
             "$lu" "$host" "$host" "$ex" "$host" "$NAME_H2" "$NAME_RH" ;;
-      ws) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&path=%s&host=%s#%s%s\n' \
-            "$lu" "$ws_host" "$ws_host" "$enc_pw" "$ws_host" "$NAME_WS" "$NAME_RH" ;;
       anytls)
         # AnyTLS 落地：走 VPS 公网 IP 的独立端口，直连协议没开就没有这条
         proto_on anytls || continue
@@ -2166,18 +2151,14 @@ emit_landing_links() { # $1=host $2=ws_host $3=ex $4=enc_pw
 }
 
 build_links() {
-  local uuid host px pw
+  local uuid host px
   uuid="$(node_get uuid)"
   host="$(node_get tunnel_host)"
   px="$(node_get path_xhttp)"
-  pw="$(node_get path_ws)"
   [[ -z "$uuid" || -z "$host" ]] && return 1
 
-  local ex enc_pw ws_host mode
+  local ex mode
   ex="$(urlenc "$px")"
-  enc_pw="$(urlenc "$pw")"
-  ws_host="$(node_ws_host)"
-  [[ -z "$ws_host" ]] && ws_host="$host"
   mode="$(node_mode)"
 
   # ⚠ 节点顺序约定（客户端按订阅里的先后显示，不要随意打乱）：
@@ -2197,7 +2178,7 @@ build_links() {
     # 直连 UDP（Hy2 / TUIC）
     emit_direct_links
     # 落地家宽垫底
-    emit_landing_links "$host" "$ws_host" "$ex" "$enc_pw"
+    emit_landing_links "$host" "$ex"
     return 0
   fi
 
@@ -2241,7 +2222,7 @@ build_links() {
   emit_direct_links
 
   # 落地家宽垫底（IP 模式下也用域名，住宅落地是特殊用途，稳定优先）
-  emit_landing_links "$host" "$ws_host" "$ex" "$enc_pw"
+  emit_landing_links "$host" "$ex"
 }
 
 gen_sub() {
@@ -2279,26 +2260,21 @@ gen_sub() {
   NODE_LINKS=("${QRLINES[@]}")
 }
 
-# 打印 Cloudflare 侧需要的三条路由（三条独立子域，Path 全留空）
+# 打印 Cloudflare 侧需要的路由：v2.7.0 起只有一条
 cf_paths() {
-  local host="$1" token ws_host sub_host
-  token="$(node_get sub_token 2>/dev/null || true)"
-  ws_host="$(node_ws_host)"
-  sub_host="$(node_sub_host)"
-  printf '\n  Cloudflare → 该隧道 → Public Hostname，需要三条（Path 全部留空）：\n\n'
-  printf '    %-30s → 127.0.0.1:%s   H3/H2 主入口\n' "${host:-argo.<主域名>}" "$DEF_PORT_XHTTP"
-  printf '    %-30s → 127.0.0.1:%s   WS 兜底\n'    "${ws_host:-ws.<主域名>}"  "$DEF_PORT_WS"
-  printf '    %-30s → 127.0.0.1:%s   订阅\n'       "${sub_host:-sub.<主域名>}" "$DEF_PORT_SUB"
-  printf '\n  Service 全选 HTTP；三条必须是不同子域，Path 留空，否则会互相抢占。\n'
-  if [[ -n "$token" && -n "$sub_host" ]]; then
-    printf '  订阅地址：https://%s/%s\n' "$sub_host" "$token"
-  fi
+  local host="$1"
+  printf '\n  Cloudflare → 该隧道 → Public Hostname，只需要一条（Path 留空）：\n\n'
+  printf '    %-30s → 127.0.0.1:%s   H3 / H2 主入口\n' "${host:-argo.<主域名>}" "$DEF_PORT_XHTTP"
+  printf '\n  订阅不走隧道（直连 %s:%s），所以那两条 ws / sub 子域的路由可以删掉了。\n' \
+    "$(vps_ip)" "$(sub_port)"
+  local u; u="$(sub_url 2>/dev/null || true)"
+  [[ -n "$u" ]] && printf '  订阅地址：%s\n' "$u"
   printf '\n'
 }
 
 show_nodes() {
   require_root
-  local host token sub_host
+  local host token
   host="$(node_get tunnel_host 2>/dev/null || true)"
   token="$(node_get sub_token 2>/dev/null || true)"
 
@@ -2312,16 +2288,13 @@ show_nodes() {
     return 1
   fi
 
-  sub_host="$(node_sub_host)"
-  [[ -z "$sub_host" ]] && sub_host="$host"
-
   local n; n="$(printf '%s\n' "$links" | wc -l | tr -d ' ')"
   step "订阅"
   printf '  节点数    : %s\n' "$n"
   printf '  地址模式  : %s\n' "$(node_mode)"
   printf '  隧道域名  : %s\n' "$host"
 
-  local url="https://${sub_host}/${token}"
+  local url; url="$(sub_url)"
   printf '  订阅地址  : %s%s%s\n\n' "$C_B" "$url" "$C_R"
 
   info "包含节点："
@@ -2427,10 +2400,9 @@ do_status() {
     printf '  隧道域名   : %s\n' "$(node_get tunnel_host)"
     printf '  Token      : %s\n' "$([[ -s "$TOKEN_FILE" ]] && echo '已配置' || echo '未配置')"
     printf '  XHTTP 路径 : %s  (127.0.0.1:%s)\n' "$(node_get path_xhttp)" "$DEF_PORT_XHTTP"
-    printf '  WS 路径    : %s  (127.0.0.1:%s)\n' "$(node_get path_ws)" "$DEF_PORT_WS"
     printf '  优选 IP    : %s 个（%s）\n' "$(wc -l < "$IPSF" 2>/dev/null || echo 0)" "$IPSF"
-    local st sh; st="$(node_get sub_token 2>/dev/null || true)"; sh="$(node_sub_host)"
-    [[ -n "$st" ]] && printf '  订阅地址   : https://%s/%s\n' "${sh:-$(node_get tunnel_host)}" "$st"
+    local su; su="$(sub_url 2>/dev/null || true)"
+    [[ -n "$su" ]] && printf '  订阅地址   : %s\n' "$su"
     if [[ "$(node_hop_mode)" == "all" ]]; then
       printf '  出口跳板   : 全部走 %s:%s (%s)\n' "$(node_hop_addr)" "$(node_hop_port)" "$(node_hop_proto)"
     else
@@ -2516,11 +2488,9 @@ do_install() {
 
   # 端口检测
   step "端口检测"
-  local p
-  for p in "$DEF_PORT_XHTTP" "$DEF_PORT_WS"; do
-    if port_in_use "$p" tcp; then die "端口 ${p} 已被占用（Argo 回源端口需要空闲）"; fi
-  done
-  ok "Argo 回源端口 ${DEF_PORT_XHTTP}/${DEF_PORT_WS} 空闲"
+  if port_in_use "$DEF_PORT_XHTTP" tcp; then die "端口 ${DEF_PORT_XHTTP} 已被占用（Argo 回源端口需要空闲）"; fi
+  if port_in_use "$(sub_port)" tcp; then die "端口 $(sub_port) 已被占用（订阅服务端口，可用 SUB_PORT 环境变量预指定）"; fi
+  ok "回源端口 ${DEF_PORT_XHTTP} / 订阅端口 $(sub_port) 空闲"
 
   # ---------- 交互参数 ----------
   step "隧道参数"
@@ -2566,7 +2536,7 @@ do_install() {
   fi
   [[ -z "${uuid:-}" ]] && uuid="$(gen_uuid)"
   [[ -z "${px:-}"   ]] && px="/$(rand_hex 8)"
-  # WS 路径固定 /ws 前缀，便于识别；CF 侧靠 ws 子域转发到 8002
+  # path_ws 自 v2.7.0 起已无入站使用，仅保留字段兼容老配置（不再参与节点生成）
   [[ -z "${pw:-}"   ]] && pw="/ws$(rand_hex 6)"
 
   # 新旧路径不能相同
@@ -2579,13 +2549,9 @@ do_install() {
   local sub_token; sub_token="$(node_get sub_token 2>/dev/null || true)"
   [[ -z "$sub_token" ]] && sub_token="$(rand_hex 16)"
 
-  # 子域与地址模式：重装时沿用已有设置
-  local ws_prev sub_prev mode_prev
-  ws_prev="$(node_get ws_host 2>/dev/null || true)"
-  sub_prev="$(node_get sub_host 2>/dev/null || true)"
+  # 地址模式：重装时沿用已有设置（ws_host / sub_host 两个子域字段 v2.7.0 起废弃，不再写入）
+  local mode_prev
   mode_prev="$(node_get node_mode 2>/dev/null || true)"
-  [[ -z "$ws_prev"   ]] && ws_prev="$(sub_of "$host" "$DEF_WS_SUB")"
-  [[ -z "$sub_prev"  ]] && sub_prev="$(sub_of "$host" "$DEF_SUB_SUB")"
   [[ -z "$mode_prev" ]] && mode_prev="$NODE_MODE_DEFAULT"
 
   # 出口跳板：重装时沿用
@@ -2607,7 +2573,7 @@ try:
 except Exception:
     sys.exit(0)
 keep = {k: d[k] for k in
-        ("install_mode", "proto", "landing", "hy2", "tuic", "reality", "anytls", "cert")
+        ("install_mode", "proto", "landing", "hy2", "tuic", "reality", "anytls", "sub", "cert")
         if k in d}
 if keep:
     print(json.dumps(keep, ensure_ascii=False))
@@ -2619,8 +2585,6 @@ PY
 {
   "uuid": "${uuid}",
   "tunnel_host": "${host}",
-  "ws_host": "${ws_prev}",
-  "sub_host": "${sub_prev}",
   "node_mode": "${mode_prev}",
   "hop_mode": "${hop_prev}",
   "hop_proto": "${hop_proto_prev}",
@@ -2635,9 +2599,10 @@ PY
   "proto": { "argo": true, "hy2": true, "tuic": true, "reality": false, "anytls": true },
   "landing": { "enabled": false, "uuid": "", "target": ["h3", "anytls"] },
   "hy2":     { "port": ${DEF_PORT_HY2}, "hop": "${DEF_HOP_RANGE}", "obfs": false, "up": 50, "down": 300 },
-  "tuic":    { "port": 30001, "password": "", "cc": "bbr" },
+  "tuic":    { "port": ${DEF_PORT_TUIC}, "password": "", "cc": "bbr" },
   "reality": { "port": ${DEF_PORT_REALITY}, "sni": "${REALITY_SNI}", "short_id": "", "private_key": "", "public_key": "" },
-  "anytls":  { "port": 8445, "password": "" },
+  "anytls":  { "port": ${DEF_PORT_ANYTLS}, "password": "" },
+  "sub":     { "port": ${DEF_PORT_SUB} },
   "cert":    { "sni": "${host}", "path": "${BASE}/cert" },
   "installed_at": "$(date -Iseconds)",
   "version": "${VERSION}"
@@ -2661,7 +2626,6 @@ PY
 
   ok "UUID: ${uuid}"
   ok "XHTTP 路径: ${px}"
-  ok "WS 路径: ${pw}"
   ok "节点地址模式: ${mode_prev}（domain=域名直连 / ip=优选IP）"
 
   # ---------- 安装二进制 ----------
@@ -2687,7 +2651,7 @@ PY
   # 订阅服务（仅监听 127.0.0.1）
   write_sub_server
   write_sub_service
-  ok "订阅服务已注册：${SVC_SUB}.service（127.0.0.1:${DEF_PORT_SUB}）"
+  ok "订阅服务已注册：${SVC_SUB}.service（0.0.0.0:$(sub_port)，客户端直连）"
 
   # ---------- 直连协议（Hy2 / TUIC / AnyTLS）----------
   if proto_on hy2 || proto_on tuic || proto_on anytls; then
@@ -2802,12 +2766,10 @@ PY
   hr
   printf '  UUID        : %s\n' "$uuid"
   printf '  隧道域名    : %s\n' "${host:-（未填写）}"
-  printf '  WS 子域     : %s\n' "${ws_prev:-（未设置）}"
-  printf '  订阅子域    : %s\n' "${sub_prev:-（未设置）}"
+  printf '  订阅地址    : %s\n' "$(sub_url 2>/dev/null || echo 未配置)"
   printf '  地址模式    : %s\n' "$mode_prev"
   printf '  Token       : %s\n' "$([[ -s "$TOKEN_FILE" ]] && echo 已配置 || echo 未配置)"
   printf '  XHTTP 路径  : %s\n' "$px"
-  printf '  WS 路径     : %s\n' "$pw"
   printf '  配置目录    : %s\n' "$BASE"
   printf '  Token 文件  : %s（600）\n' "$TOKEN_FILE"
   hr
@@ -2815,6 +2777,9 @@ PY
   if [[ -z "$host" ]]; then
     warn "还需在 CF Dashboard 配置 Public Hostname，然后回到菜单 11 填域名"
   fi
+
+  # 要放行的端口一次列全（云安全组只能手动配）
+  port_firewall_hint
 
   printf '\n'
   show_nodes
@@ -3176,12 +3141,10 @@ do_check() {
     return 1
   fi
 
-  local uuid host px pw ws_host
+  local uuid host px
   uuid="$(node_get uuid)"
   host="$(node_get tunnel_host)"
   px="$(node_get path_xhttp)"
-  pw="$(node_get path_ws)"
-  ws_host="$(node_ws_host)"
 
   # ---------- 配置 ----------
   [[ $quiet -eq 1 ]] || printf '\n%s[配置]%s\n' "$C_B" "$C_R"
@@ -3241,12 +3204,9 @@ PY
   listen_on "$DEF_PORT_XHTTP" tcp \
     && ck_ok "${DEF_PORT_XHTTP}/tcp 在听（XHTTP 回源）" \
     || ck_err "${DEF_PORT_XHTTP}/tcp 没在听 → H3/H2 全部不可用"
-  listen_on "$DEF_PORT_WS" tcp \
-    && ck_ok "${DEF_PORT_WS}/tcp 在听（WS 回源）" \
-    || ck_err "${DEF_PORT_WS}/tcp 没在听 → WS 不可用"
-  listen_on "$DEF_PORT_SUB" tcp \
-    && ck_ok "${DEF_PORT_SUB}/tcp 在听（订阅服务）" \
-    || ck_err "${DEF_PORT_SUB}/tcp 没在听 → 订阅 404"
+  listen_on "$(sub_port)" tcp \
+    && ck_ok "$(sub_port)/tcp 在听（订阅服务）" \
+    || ck_err "$(sub_port)/tcp 没在听 → 订阅 404"
 
   # ---------- 订阅 ----------
   [[ $quiet -eq 1 ]] || printf '\n%s[订阅]%s\n' "$C_B" "$C_R"
@@ -3261,7 +3221,7 @@ PY
     fi
     local code
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-      "http://127.0.0.1:${DEF_PORT_SUB}/${stok}" 2>/dev/null)"
+      "http://127.0.0.1:$(sub_port)/${stok}" 2>/dev/null)"
     [[ "$code" == "200" ]] && ck_ok "订阅本地自测 HTTP 200" \
       || ck_err "订阅本地自测 HTTP ${code:-超时}（服务没起或文件不在）"
   fi
@@ -3315,11 +3275,7 @@ PY
       sni="$(printf '%s' "$line"     | sed -n 's/.*[?&]sni=\([^&#]*\).*/\1/p')"
       hostarg="$(printf '%s' "$line" | sed -n 's/.*[?&]host=\([^&#]*\).*/\1/p')"
       pth="$(printf '%s' "$line"     | sed -n 's/.*[?&]path=\([^&#]*\).*/\1/p')"
-      if [[ "$line" == *"type=ws"* ]]; then
-        exp_sni="$ws_host"; exp_host="$ws_host"; exp_path="$(urlenc "$pw")"
-      else
-        exp_sni="$host";    exp_host="$host";    exp_path="$(urlenc "$px")"
-      fi
+      exp_sni="$host"; exp_host="$host"; exp_path="$(urlenc "$px")"
       [[ "$sni"     == "$exp_sni"  ]] || { ck_err "sni 不一致：${sni} ≠ ${exp_sni}";  bad=1; }
       [[ "$hostarg" == "$exp_host" ]] || { ck_err "Host 不一致：${hostarg} ≠ ${exp_host}"; bad=1; }
       [[ "$pth"     == "$exp_path" ]] || { ck_err "path 不一致：${pth} ≠ ${exp_path}"; bad=1; }
@@ -3338,7 +3294,7 @@ PY
   # ---------- DNS ----------
   [[ $quiet -eq 1 ]] || printf '\n%s[DNS]%s\n' "$C_B" "$C_R"
   local h
-  for h in "$host" "$ws_host" "$(node_sub_host)"; do
+  for h in "$host"; do
     [[ -z "$h" ]] && continue
     if dns_has "$h"; then ck_ok "${h} 有解析"; else ck_err "${h} 无解析（NXDOMAIN，客户端连不上）"; fi
   done
@@ -3550,16 +3506,17 @@ do_upgrade() {
   mkdir -p "$BACKD"
   cp -a "$NODEF" "$bak" && ok "已备份：${bak}"
 
-  local MIG_HY2=0 MIG_RH=0
+  local MIG_HY2=0 MIG_RH=0 MIG_WS=0
 
   # 补齐新字段：已存在的绝不覆盖
   local added="-"
   if has python3; then
-    added="$(python3 - "$NODEF" "$VERSION" "$DEF_PORT_HY2" "$DEF_HOP_RANGE" "$REALITY_SNI" 2>/dev/null <<'PY'
+    added="$(python3 - "$NODEF" "$VERSION" "$DEF_PORT_HY2" "$DEF_HOP_RANGE" "$REALITY_SNI" "$DEF_PORT_SUB" 2>/dev/null <<'PY'
 import json, sys
 p, ver = sys.argv[1], sys.argv[2]
 hp, hop = int(sys.argv[3]), sys.argv[4]
 rsni = sys.argv[5]
+sp = int(sys.argv[6])
 with open(p) as f:
     d = json.load(f)
 defaults = {
@@ -3573,6 +3530,7 @@ defaults = {
     "reality": {"port": 8443, "sni": rsni, "short_id": "",
                 "private_key": "", "public_key": ""},
     "anytls":  {"port": 8445, "password": ""},
+    "sub":     {"port": sp},
     "cert":    {"sni": d.get("tunnel_host", ""), "path": "/opt/argox/cert"},
 }
 added = [k for k in defaults if k not in d]
@@ -3665,6 +3623,24 @@ PY
   systemctl daemon-reload
   ok "systemd 单元已对齐当前脚本路径"
 
+  # v2.7.0 移除 WS 入站：老实例的 config.json 里还有 argo-ws（占着 8002），
+  # upgrade 本身不重写 config.json，所以这里显式迁移一次，否则 8002 会一直留着。
+  if [[ -f "$CONF" ]] && grep -q '"argo-ws"' "$CONF"; then
+    local u0 px0 pw0
+    u0="$(node_get uuid)"; px0="$(node_get path_xhttp)"; pw0="$(node_get path_ws)"
+    if write_xray_config "$u0" "$px0" "$pw0"; then
+      systemctl restart "$SVC_XRAY" 2>/dev/null; sleep 1
+      if svc_active "$SVC_XRAY"; then
+        ok "WS 入站已移除（8002 不再监听），Xray 配置已按 v2.7.0 重写"
+        MIG_WS=1
+      else
+        warn "Xray 重启失败，手动看：journalctl -u ${SVC_XRAY} -n 20"
+      fi
+    else
+      warn "Xray 配置重写失败，WS 入站保留原样（不影响使用）"
+    fi
+  fi
+
   # 落地 AnyTLS 入站端口随版本变过（v2.6.2：主口 +1 → 主口 -1，8446 → 8444）。
   # 配置里的 listen_port 跟当前计算值不一致就重建 sing-box，否则客户端会连到一个
   # 已不存在的端口（check 会报「TCP 8444 没在听」）。
@@ -3709,8 +3685,10 @@ PY
       info "Hy2 未开启，端口变更待下次 direct on hy2 时生效"
     fi
     printf '\n'
-  elif [[ $MIG_RH -eq 1 ]]; then
-    info "sing-box 已因落地端口变更重启；客户端需重连并重导订阅（AnyTLS-RH 端口已改变）"
+  elif [[ $MIG_RH -eq 1 || $MIG_WS -eq 1 ]]; then
+    if [[ $MIG_RH -eq 1 ]]; then info "AnyTLS-RH 端口已改变，客户端需重连并重导订阅"; fi
+    if [[ $MIG_WS -eq 1 ]]; then info "WS 入站已移除；H2 节点不受影响（走同一个回源，只差 ALPN）"; fi
+    info "服务已因配置结构变更重启过"
   else
     info "服务未重启，运行中的连接不受影响"
   fi
@@ -3721,13 +3699,15 @@ PY
     info "直连协议当前：$(proto_label)"
   fi
   printf '\n'
-  warn "Argo-WS 已下线；节点名有变动，客户端请删掉旧节点后重新导入订阅"
+  warn "v2.7.0：订阅已改为直连 VPS 的 TCP $(sub_port)，CF 面板只需保留一条路由（$(node_get tunnel_host) → 127.0.0.1:${DEF_PORT_XHTTP}）"
+  info "ws / sub 两条 Public Hostname 及其 DNS 记录可以删掉了"
 
-  local sh tok
-  sh="$(node_sub_host)"; tok="$(node_get sub_token 2>/dev/null || true)"
-  if [[ -n "$sh" && -n "$tok" ]]; then
-    printf '\n  订阅地址：%shttps://%s/%s%s\n\n' "$C_B" "$sh" "$tok" "$C_R"
+  local su; su="$(sub_url 2>/dev/null || true)"
+  if [[ -n "$su" ]]; then
+    printf '\n  订阅地址：%s%s%s\n\n' "$C_B" "$su" "$C_R"
   fi
+
+  port_firewall_hint
 }
 
 # ==============================================================================
@@ -3845,7 +3825,6 @@ landing_names() {
     case "$t" in
       h3) out+="${NAME_H3}${NAME_RH} " ;;
       h2) out+="${NAME_H2}${NAME_RH} " ;;
-      ws) out+="${NAME_WS}${NAME_RH} " ;;
       anytls) proto_on anytls && out+="${NAME_ANYTLS}${NAME_RH} " ;;
       reality) proto_on reality && out+="${NAME_REALITY}${NAME_RH} " ;;
     esac
@@ -4010,7 +3989,7 @@ landing_set_proto() { # $1=socks|http
 landing_pick_target() {
   local t ans cur a=()
   printf '\n  逐项确认（直接回车 = 保留当前）\n'
-  for t in h3 h2 ws anytls reality; do
+  for t in h3 h2 anytls reality; do
     if landing_wants "$t"; then cur="${C_GRN}是${C_R}"; else cur="${C_DIM}否${C_R}"; fi
     case "$t" in
       anytls)  proto_on anytls  || printf '  %s（AnyTLS 未开启，选了暂不生效）%s\n' "$C_YEL" "$C_R" ;;
@@ -4042,7 +4021,7 @@ do_landing() {
     target)  shift; landing_set_target "$@"; return ;;
     proto)   landing_set_proto "${2:-}"; return ;;
     ""|menu) : ;;
-    *) err "用法：landing [on|off|status|target h3,h2,ws|proto socks|http]"; return 1 ;;
+    *) err "用法：landing [on|off|status|target h3,h2,anytls,reality|proto socks|http]"; return 1 ;;
   esac
 
   while true; do
@@ -4051,7 +4030,7 @@ do_landing() {
     printf '\n'
     printf '  1) 开启落地（订阅多出 -RH 节点）\n'
     printf '  2) 关闭落地\n'
-    printf '  3) 选择作用入口（H3 / H2 / WS）\n'
+    printf '  3) 选择作用入口（H3 / H2 / AnyTLS / Reality）\n'
     printf '  4) 出口协议（socks / http，当前 %s）\n' "$(landing_proto)"
     printf '  5) 改代理地址 / 端口（当前 %s:%s）\n' "$(node_hop_addr)" "$(node_hop_port)"
     printf '  0) 返回\n'
@@ -4072,16 +4051,14 @@ do_landing() {
 
 do_tunnel_setup() {
   require_root
-  local ws_h sub_h mode_v
-  ws_h="$(node_ws_host)"; sub_h="$(node_sub_host)"; mode_v="$(node_mode)"
+  local mode_v
+  mode_v="$(node_mode)"
   printf '\n  隧道配置\n'
   printf '  1) 填写 / 更换 Tunnel Token\n'
   printf '  2) 设置 / 更换隧道域名（主入口，用于生成节点）\n'
-  printf '  3) 测试三条子域连通性\n'
-  printf '  4) WS 兜底子域（当前：%s）\n' "${ws_h:-未设置}"
-  printf '  5) 订阅子域（当前：%s）\n' "${sub_h:-未设置}"
-  printf '  6) 节点地址模式（当前：%s）\n' "$mode_v"
-  printf '  7) cloudflared 出站诊断（7844 通不通）\n'
+  printf '  3) 测试主入口 + 订阅连通性\n'
+  printf '  4) 节点地址模式（当前：%s）\n' "$mode_v"
+  printf '  5) cloudflared 出站诊断（7844 通不通）\n'
   printf '  0) 返回\n'
   local c; read -rp "  选择: " c
   case "$c" in
@@ -4121,15 +4098,13 @@ do_tunnel_setup() {
     3)
       local h; h="$(node_get tunnel_host)"
       [[ -z "$h" ]] && { err "先设置隧道域名"; return 1; }
-      local w s t r1 r2 r3
-      w="$(node_ws_host)"; s="$(node_sub_host)"; t="$(node_get sub_token 2>/dev/null || true)"
-      step "测试三条子域"
+      local r1 r2 u
+      step "测试主入口 + 订阅"
       r1="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${h}/" 2>/dev/null || echo 000)"
-      [[ -n "$w" ]] && r2="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${w}/" 2>/dev/null || echo 000)"
-      [[ -n "$s" && -n "$t" ]] && r3="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${s}/${t}" 2>/dev/null || echo 000)"
+      u="$(sub_url 2>/dev/null || true)"
+      [[ -n "$u" ]] && r2="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u" 2>/dev/null || echo 000)"
       printf '  主入口  %-34s HTTP %s\n' "$h" "${r1:-—}"
-      printf '  WS      %-34s HTTP %s\n' "${w:-未设置}" "${r2:-—}"
-      printf '  订阅    %-34s HTTP %s\n\n' "${s:-未设置}" "${r3:-—}"
+      printf '  订阅    %-34s HTTP %s\n\n' "${u:-未配置}" "${r2:-—}"
 
       case "${r1:-000}" in
         000)     err "主入口不通：DNS 未解析 / 证书异常 / 隧道离线" ;;
@@ -4137,43 +4112,15 @@ do_tunnel_setup() {
         502|503) err "主入口 HTTP ${r1}：CF 到了但回源失败（确认 127.0.0.1:${DEF_PORT_XHTTP} 在监听）" ;;
         *)       ok "主入口 HTTP ${r1}" ;;
       esac
-      if [[ -n "$r2" ]]; then
-        case "$r2" in
-          000|530|1033|502|503) err "WS 子域异常：HTTP ${r2}（应指向 127.0.0.1:${DEF_PORT_WS}）" ;;
-          *) ok "WS 子域 HTTP ${r2}" ;;
+      if [[ -n "${u:-}" ]]; then
+        case "${r2:-000}" in
+          200) ok "订阅可访问（HTTP 200，直连 $(sub_port)）" ;;
+          000) err "订阅不通：云安全组未放行 TCP $(sub_port) / 防火墙拦截 / 服务没起" ;;
+          *)   err "订阅 HTTP ${r2}（正常只有 200；服务日志看 journalctl -u ${SVC_SUB}）" ;;
         esac
-      fi
-      if [[ -n "$r3" ]]; then
-        [[ "$r3" == "200" ]] && ok "订阅可访问（HTTP 200）" \
-          || err "订阅 HTTP ${r3}（应指向 127.0.0.1:${DEF_PORT_SUB}，正常只有 200）"
       fi
       ;;
     4)
-      local w; w="$(node_ws_host)"
-      read -rp "  WS 子域（当前：${w:-未设置}，如 ws.example.com）: " w
-      [[ -z "$w" ]] && return 0
-      if [[ ! "$w" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
-        err "域名格式不合法"; return 1
-      fi
-      node_set ws_host "$w"
-      ok "WS 子域已设为 ${w}"
-      info "CF 侧需有同名路由 → 127.0.0.1:${DEF_PORT_WS}"
-      gen_sub >/dev/null 2>&1 || true
-      show_nodes
-      ;;
-    5)
-      local s; s="$(node_sub_host)"
-      read -rp "  订阅子域（当前：${s:-未设置}，如 sub.example.com）: " s
-      [[ -z "$s" ]] && return 0
-      if [[ ! "$s" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
-        err "域名格式不合法"; return 1
-      fi
-      node_set sub_host "$s"
-      ok "订阅子域已设为 ${s}"
-      info "CF 侧需有同名路由 → 127.0.0.1:${DEF_PORT_SUB}"
-      show_nodes
-      ;;
-    6)
       printf '\n  当前：%s\n' "$(node_mode)"
       printf '  1) domain  域名直连（推荐：客户端自行解析到最近的 CF 节点）\n'
       printf '  2) ip      展开优选 IP（需自己测速筛选，否则多半更慢）\n'
@@ -4187,7 +4134,7 @@ do_tunnel_setup() {
       gen_sub >/dev/null 2>&1 || true
       show_nodes
       ;;
-    7)
+    5)
       do_diag
       ;;
     *) return 0 ;;
@@ -4450,6 +4397,207 @@ do_direct() {
   esac
 }
 
+# ==============================================================================
+#  端口管理（v2.7.0）
+#
+#  所有端口都持久化在 node.json，改完要重建对应服务 + 重建订阅（客户端得重导）。
+#  Oracle 安全组脚本改不了，只能提示。安装时也可用环境变量预指定：
+#    SUB_PORT=9000 ANYTLS_PORT=9443 bash argox.sh install
+# ==============================================================================
+PORT_ITEMS="sub hy2 tuic anytls reality"
+
+port_label() {
+  case "$1" in
+    sub)     printf '订阅服务' ;;
+    hy2)     printf 'Hy2' ;;
+    tuic)    printf 'TUIC' ;;
+    anytls)  printf 'AnyTLS' ;;
+    reality) printf 'Reality' ;;
+    *)       printf '%s' "$1" ;;
+  esac
+}
+
+port_kind() { # tcp | udp
+  case "$1" in
+    hy2|tuic) printf 'udp' ;;
+    *)        printf 'tcp' ;;
+  esac
+}
+
+port_cur() {
+  case "$1" in
+    sub)     sub_port ;;
+    hy2)     hy2_port ;;
+    tuic)    tuic_port ;;
+    anytls)  anytls_port ;;
+    reality) reality_port ;;
+  esac
+}
+
+port_show() {
+  printf '\n  %s端口%s（改完需重导订阅；云安全组要同步放行）\n' "$C_B" "$C_R"
+  # 表头用硬编码空格：printf %-Ns 按字节算，中文表头跟 ASCII 数据行对不齐
+  printf '  项目       协议 端口    说明\n'
+  printf '  %-10s %-4s %-7s %s\n' "xhttp"      "TCP" "$DEF_PORT_XHTTP" "隧道回源，仅本机（不建议改）"
+  printf '  %-10s %-4s %-7s %s\n' "sub"        "TCP" "$(sub_port)"     "订阅服务，公网直连"
+  printf '  %-10s %-4s %-7s %s\n' "hy2"        "UDP" "$(hy2_port)"     "跳跃段 $(hy2_hop)"
+  printf '  %-10s %-4s %-7s %s\n' "tuic"       "UDP" "$(tuic_port)"    ""
+  printf '  %-10s %-4s %-7s %s\n' "anytls"     "TCP" "$(anytls_port)"  ""
+  printf '  %-10s %-4s %-7s %s\n' "anytls-rh"  "TCP" "$(anytls_rh_port)" "落地口（跟随 anytls −1，不单独设）"
+  printf '  %-10s %-4s %-7s %s\n' "reality"    "TCP" "$(reality_port)" "Xray 内核"
+  printf '\n'
+}
+
+# 新端口能不能用：$1=项目（排除自己）$2=端口
+port_check_free() {
+  local me="$1" p="$2" it cur rng a b
+  for it in $PORT_ITEMS; do
+    [[ "$it" == "$me" ]] && continue
+    cur="$(port_cur "$it")"
+    [[ "$cur" == "$p" ]] && { err "端口 ${p} 已被 $(port_label "$it") 占用"; return 1; }
+  done
+
+  # AnyTLS 会按主口 −1 算出落地口，改别的协议时要避开它
+  if [[ "$me" != "anytls" && "$(anytls_rh_port)" == "$p" ]]; then
+    err "端口 ${p} 是 AnyTLS 落地口（$(anytls_port) − 1），换一个"; return 1
+  fi
+
+  # 落在 Hy2 跳跃段内的 UDP 端口会被 nft redirect 劫持到 Hy2
+  rng="$(hy2_hop)"
+  if [[ "$(port_kind "$me")" == "udp" && "$me" != "hy2" && "$rng" == *-* ]]; then
+    a="${rng%%-*}"; b="${rng#*-}"
+    if (( p >= a && p <= b )); then
+      err "端口 ${p} 落在 Hy2 跳跃段 ${rng} 内，UDP 会被 nft 劫持到 Hy2"; return 1
+    fi
+  fi
+
+  if port_in_use "$p" "$(port_kind "$me")" 2>/dev/null && [[ "$(port_cur "$me")" != "$p" ]]; then
+    err "端口 ${p} 已被系统里其它进程占用（ss -lnup / -lntp 自查）"; return 1
+  fi
+  return 0
+}
+
+# 应用配置：sub 走订阅服务，hy2/tuic/anytls 走 sing-box，reality 走 Xray
+port_apply() {
+  local it="$1"
+  case "$it" in
+    sub)
+      write_sub_server && write_sub_service || return 1
+      systemctl daemon-reload
+      systemctl restart "$SVC_SUB" 2>/dev/null
+      sleep 1
+      svc_active "$SVC_SUB" || { err "订阅服务起不来：journalctl -u ${SVC_SUB} -n 20"; return 1; }
+      fw_open tcp "$(sub_port)"
+      ;;
+    hy2|tuic|anytls) sb_sync ;;
+    reality)         reality_apply ;;
+    *) return 1 ;;
+  esac
+}
+
+port_set() { # $1=项目 $2=端口
+  local it="$1" newp="${2:-}" oldp
+  case "$it" in
+    sub|hy2|tuic|anytls|reality) : ;;
+    *) err "可改的项目：sub / hy2 / tuic / anytls / reality"; return 1 ;;
+  esac
+  [[ "$newp" =~ ^[0-9]+$ ]] || { err "端口必须是数字：${newp:-<空>}"; return 1; }
+  (( newp >= 1024 && newp <= 65535 )) || { err "端口范围 1024-65535（1024 以下要 root 且易撞系统服务）"; return 1; }
+
+  oldp="$(port_cur "$it")"
+  if [[ "$oldp" == "$newp" ]]; then info "$(port_label "$it") 已经是 ${newp}，无需改动"; return 0; fi
+  port_check_free "$it" "$newp" || return 1
+
+  node_jset "${it}.port" "$newp" || { err "写入 node.json 失败"; return 1; }
+
+  if ! port_apply "$it"; then
+    err "应用失败，已回滚到 ${oldp}"
+    node_jset "${it}.port" "$oldp" >/dev/null 2>&1 || true
+    port_apply "$it" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  gen_sub >/dev/null 2>&1 || warn "订阅重建失败，跑 check 查看"
+
+  ok "$(port_label "$it") 端口 ${oldp} → ${newp}"
+  printf '  云安全组：放行 %s %s（旧端口 %s 可删）\n' \
+    "$(port_kind "$it" | tr '[:lower:]' '[:upper:]')" "$newp" "$oldp"
+  if [[ "$it" == "anytls" ]]; then
+    printf '  落地口自动跟随：TCP %s（一并放行）\n' "$(anytls_rh_port)"
+  fi
+  if [[ "$it" == "hy2" ]]; then
+    printf '  跳跃段仍是 %s，nft 会重定向到新监听口 %s\n' "$(hy2_hop)" "$newp"
+  fi
+  info "客户端重新导入订阅才生效"
+  return 0
+}
+
+port_menu() {
+  require_root
+  local c it p
+  while true; do
+    port_show
+    cat <<'EOF'
+  1) 改订阅端口     2) 改 Hy2      3) 改 TUIC
+  4) 改 AnyTLS      5) 改 Reality  0) 返回
+EOF
+    read -rp "  选择: " c
+    case "${c:-}" in
+      1) it="sub" ;; 2) it="hy2" ;; 3) it="tuic" ;; 4) it="anytls" ;; 5) it="reality" ;;
+      0|"") return 0 ;;
+      *) warn "无效选项"; printf '\n'; continue ;;
+    esac
+    read -rp "  $(port_label "$it") 新端口（当前 $(port_cur "$it")）: " p
+    [[ -z "${p// /}" ]] || port_set "$it" "${p// /}"
+    printf '\n'
+    read -rp "  按回车继续…" _ || true
+  done
+}
+
+do_port() {
+  require_root
+  installed || { err "尚未安装，先执行菜单 1"; return 1; }
+  case "${1:-}" in
+    ""|menu)  port_menu ;;
+    status|show|ls) port_show ;;
+    *)        port_set "$1" "${2:-}" ;;
+  esac
+}
+
+# 收尾提示：把要放行的端口一次列全。云安全组脚本改不了，只能人肉在控制台配。
+port_firewall_hint() {
+  local any=0
+  printf '\n'
+  step "云安全组（Oracle 控制台）需要放行"
+  printf '  端口             协议 用途\n'
+  if proto_on hy2; then
+    printf '  %-16s %-4s %s\n' "$(hy2_hop)" "UDP" "Hy2 含端口跳跃（必须整段，不能只开 $(hy2_port)）"
+    any=1
+  fi
+  if proto_on tuic; then
+    printf '  %-16s %-4s %s\n' "$(tuic_port)" "UDP" "TUIC"
+    any=1
+  fi
+  if proto_on anytls; then
+    printf '  %-16s %-4s %s\n' "$(anytls_port)" "TCP" "AnyTLS"
+    if landing_on && landing_wants anytls; then
+      printf '  %-16s %-4s %s\n' "$(anytls_rh_port)" "TCP" "AnyTLS 落地（与上面连号，可合并放行 $(anytls_rh_port)-$(anytls_port)）"
+    fi
+    any=1
+  fi
+  if proto_on reality; then
+    printf '  %-16s %-4s %s\n' "$(reality_port)" "TCP" "Reality"
+    any=1
+  fi
+  printf '  %-16s %-4s %s\n' "$(sub_port)" "TCP" "订阅服务（v2.7.0 起直连，不走隧道）"
+  [[ $any -eq 0 ]] && printf '  （直连协议全关，只有订阅端口需要放行）\n'
+
+  printf '\n'
+  info "本机 iptables / ufw 脚本已自动放行，只剩云安全组要手动加"
+  info "端口要改：bash $0 port <sub|hy2|tuic|anytls|reality> <端口>"
+  info "CF 隧道只需一条公共主机名：$(node_get tunnel_host) → http://127.0.0.1:${DEF_PORT_XHTTP}"
+}
+
 do_reality() {
   require_root
   case "${1:-status}" in
@@ -4517,7 +4665,7 @@ menu_header() {
   fi
   printf '\n'
   printf '%s╔══════════════════════════════════════════════════╗%s\n' "$C_B$C_BLU" "$C_R"
-  printf '%s║%s  argox  ·  Argo 隧道 + Xray(XHTTP/WS)  %s%-8s%s%s║%s\n' "$C_B$C_BLU" "$C_R$C_B" "$C_DIM" "v${VERSION}" "$C_R" "$C_B$C_BLU" "$C_R"
+  printf '%s║%s  argox  ·  Argo 隧道 + Xray(XHTTP) + sing-box  %s%-8s%s%s║%s\n' "$C_B$C_BLU" "$C_R$C_B" "$C_DIM" "v${VERSION}" "$C_R" "$C_B$C_BLU" "$C_R"
   printf '%s╚══════════════════════════════════════════════════╝%s\n' "$C_B$C_BLU" "$C_R"
   printf '  Xray %s   Tunnel %s   域名 %s\n' "$st_x" "$st_t" "${host:-${C_DIM}未设置${C_R}}"
   printf '  直连 %s   跳板 %s   落地 %s\n' "$(proto_label_short)" "$hop_l" "$land_l"
@@ -4536,8 +4684,9 @@ menu_main() {
    6) 查看日志                 14) 直连协议（Hy2/TUIC/AnyTLS/Reality）
    7) 更新到最新版             15) 住宅落地
    8) 自检 check               16) 订阅地址 / 二维码
-   17) 系统优化                18) 清理缓存
-   19) 备份配置                20) 卸载
+   17) 端口管理                18) 系统优化
+   19) 清理缓存                20) 备份配置
+   21) 卸载
 EOF
     printf '\n    0) 退出\n'
     printf '%s\n' "──────────────────────────────────────────────────"
@@ -4560,10 +4709,11 @@ EOF
       14) do_direct ;;
       15) do_landing ;;
       16) show_nodes ;;
-      17) do_sysopt ;;
-      18) do_clean ;;
-      19) do_backup ;;
-      20) do_uninstall ;;
+      17) do_port ;;
+      18) do_sysopt ;;
+      19) do_clean ;;
+      20) do_backup ;;
+      21) do_uninstall ;;
       0|q|Q) printf '\n  再见\n\n'; exit 0 ;;
       *) warn "无效选项：${choice:-<空>}" ;;
     esac
@@ -4590,6 +4740,7 @@ main() {
     hop)       do_hop "${2:-}" "${3:-}" ;;
     landing)   shift; do_landing "$@" ;;
     direct)    do_direct "${2:-}" "${3:-}" ;;
+    port)      do_port "${2:-}" "${3:-}" ;;
     reality)   shift; do_reality "$@" ;;
     hy2)       do_hy2 "${2:-}" "${3:-}" ;;
     cert)      do_cert "${2:-}" "${3:-}" ;;
@@ -4624,6 +4775,12 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   bash $0 direct on all   一次开启 Hy2 + TUIC + AnyTLS + Reality（推荐）
   bash $0 direct on hy2    开启 Hy2（自动装 sing-box + 自签证书）
   bash $0 direct off tuic  关闭 TUIC
+  bash $0 port         端口一览（菜单 17）
+  bash $0 port sub 9000     改订阅端口（自动重建服务 + 订阅）
+  bash $0 port hy2 24000    改 Hy2 监听口（跳跃段另用 hy2 hop）
+  bash $0 port tuic 30001   改 TUIC 端口
+  bash $0 port anytls 8445  改 AnyTLS 端口（落地口自动跟随 −1）
+  bash $0 port reality 8443 改 Reality 端口
   bash $0 reality       Reality 状态（伪装目标 / 端口 / 密钥）
   bash $0 reality probe    体检当前伪装目标 + 内置候选（证书大小 / 握手 / 跳转）
   bash $0 reality probe www.intel.com   只测指定域名，可一次给多个
