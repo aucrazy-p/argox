@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-VERSION="2.9.0"
+VERSION="2.9.1"
 APP="argox"
 
 # 脚本自身地址：从 /dev/fd/* 运行（bash <(curl ...)）且本地还没有副本时，用它把自己落地
@@ -381,6 +381,29 @@ hop_probe() {
   out="$(curl -s --max-time 8 -x "http://${ha}:${hp}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
         | sed -n 's/^ip=//p' | head -1)"
   [[ -n "$out" ]] && { printf 'http %s' "$out"; return 0; }
+  return 1
+}
+
+# 探测本机常见代理端口。仅用于「node.json 缺 hop_port」时补齐真实值：
+# 默认值只是兜底，缺字段的机器会误判成默认端口连不上。
+# 本机地址优先读 ss 监听表（零连接开销），其他地址才逐个试连。
+hop_detect_local() {
+  local ha p
+  ha="$(node_hop_addr)"
+  if [[ "$ha" == "127.0.0.1" || "$ha" == "localhost" ]] && has ss; then
+    local listen
+    listen="$(ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*[:.]//' | sort -u)"
+    for p in 7890 7891 1080 1081 7928 2080 8889 6152; do
+      printf '%s\n' "$listen" | grep -qx "$p" && { printf '%s' "$p"; return 0; }
+    done
+    return 1
+  fi
+  for p in 7890 7891 1080 1081 7928 2080 8889 6152; do
+    if timeout 1 bash -c ">/dev/tcp/${ha}/${p}" 2>/dev/null; then
+      printf '%s' "$p"
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -3602,14 +3625,20 @@ PY
       ck_warn "缺格式：${miss# }（python3 不可用时属正常，其余客户端不受影响）"
     fi
 
-    # UA 分流是否真的在跑：订阅服务文件重写后不重启，进程仍是旧代码
-    local yhead
-    yhead="$(curl -s -A 'clash-verge/2.0' --max-time 5 \
-      "http://127.0.0.1:$(sub_port)/${stok}" 2>/dev/null | head -c 120)"
-    if [[ "$yhead" == *proxies:* ]]; then
-      ck_ok "Clash UA 分流生效（返回 YAML）"
+    # UA 分流是否真的在跑：看响应的 Content-Type 最可靠。
+    # 别拿 body 前 N 字节找 "proxies:" —— YAML 头两行注释就能占满采样窗口，
+    # 会误报成"订阅服务还在跑旧代码"。
+    local yct jct
+    yct="$(curl -s -o /dev/null -w '%{content_type}' -A 'clash-verge/2.0' --max-time 5 \
+      "http://127.0.0.1:$(sub_port)/${stok}" 2>/dev/null)"
+    jct="$(curl -s -o /dev/null -w '%{content_type}' -A 'sing-box 1.12' --max-time 5 \
+      "http://127.0.0.1:$(sub_port)/${stok}" 2>/dev/null)"
+    if [[ "$yct" == *yaml* && "$jct" == *json* ]]; then
+      ck_ok "UA 分流生效（Clash → YAML，sing-box → JSON）"
+    elif [[ "$yct" == *yaml* || "$jct" == *json* ]]; then
+      ck_warn "UA 分流只生效一半（yaml: ${yct:-空} / json: ${jct:-空}）→ 重启订阅服务"
     else
-      ck_warn "Clash UA 没拿到 YAML → 订阅服务还在跑旧代码，执行 systemctl restart ${SVC_SUB}"
+      ck_warn "UA 分流未生效（yaml: ${yct:-空} / json: ${jct:-空}）→ systemctl restart ${SVC_SUB}"
     fi
   fi
 
@@ -3720,6 +3749,13 @@ PY
                      || ck_warn "代理端口开着但不通（协议可能选错，试试 http）"
     else
       ck_err "代理 ${ha}:${hp} 连不上 → 跳板 / 落地节点都会失效"
+      local dp
+      if dp="$(hop_detect_local)"; then
+        printf '      %s本机 %s 端口在听，代理可能在这个端口：%s hop（菜单 13 → 3）改一下%s\n' \
+          "$C_DIM" "$dp" "$(cmd_prefix)" "$C_R"
+      else
+        printf '      %s本机常见代理端口都没在听，先确认代理客户端是否启动%s\n' "$C_DIM" "$C_R"
+      fi
     fi
   fi
 
@@ -3893,7 +3929,7 @@ do_upgrade() {
   mkdir -p "$BACKD"
   cp -a "$NODEF" "$bak" && ok "已备份：${bak}"
 
-  local MIG_HY2=0 MIG_RH=0 MIG_WS=0
+  local MIG_HY2=0 MIG_RH=0 MIG_WS=0 MIG_HOP=0
 
   # 补齐新字段：已存在的绝不覆盖
   local added="-"
@@ -4003,6 +4039,33 @@ PY
     warn "缺 python3，跳过字段补齐"
   fi
 
+  # hop_port 缺失：早期 node.json 没有这个字段，一直靠默认值兜底。
+  # 默认值换过一次，缺字段的机器就突然报「代理连不上」——实际是探测端口错了，
+  # 代理本身好好的。这里探测本机真实监听端口补上，探不到才写默认值。
+  # 写完必须重建 Xray / sing-box，否则落地出口仍指着旧端口。
+  if [[ -z "$(node_get hop_port 2>/dev/null)" ]]; then
+    local dp
+    if dp="$(hop_detect_local)"; then
+      node_set hop_port "$dp"
+      ok "hop_port 缺失，已按本机监听识别为 ${dp}"
+    else
+      node_set hop_port "$HOP_PORT_DEFAULT"
+      warn "hop_port 缺失，按默认 ${HOP_PORT_DEFAULT} 写入"
+      info "代理在别的端口就运行：$(cmd_prefix) hop（菜单 13 → 3）"
+    fi
+    if landing_on || [[ "$(node_hop_mode)" == "all" ]]; then
+      local u1 p1 w1
+      u1="$(node_get uuid)"; p1="$(node_get path_xhttp)"; w1="$(node_get path_ws)"
+      if write_xray_config "$u1" "$p1" "$w1"; then
+        systemctl restart "$SVC_XRAY" 2>/dev/null; sleep 1
+        svc_active "$SVC_XRAY" && { ok "Xray 已按新代理端口重建"; MIG_HOP=1; }
+      fi
+      if landing_on && sb_sync; then
+        ok "sing-box 已按新代理端口重建（落地出口生效）"; MIG_HOP=1
+      fi
+    fi
+  fi
+
   write_xray_service
   [[ -s "$TOKEN_FILE" ]] && write_tunnel_service
   write_sub_server
@@ -4078,9 +4141,10 @@ PY
       info "Hy2 未开启，端口变更待下次 direct on hy2 时生效"
     fi
     printf '\n'
-  elif [[ $MIG_RH -eq 1 || $MIG_WS -eq 1 ]]; then
+  elif [[ $MIG_RH -eq 1 || $MIG_WS -eq 1 || $MIG_HOP -eq 1 ]]; then
     if [[ $MIG_RH -eq 1 ]]; then info "AnyTLS-RH 端口已改变，客户端需重连并重导订阅"; fi
     if [[ $MIG_WS -eq 1 ]]; then info "WS 入站已移除；H2 节点不受影响（走同一个回源，只差 ALPN）"; fi
+    if [[ $MIG_HOP -eq 1 ]]; then info "代理端口已修正，落地 / 跳板节点需重连一次"; fi
     info "服务已因配置结构变更重启过"
   else
     info "服务未重启，运行中的连接不受影响"
