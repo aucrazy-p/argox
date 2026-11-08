@@ -15,10 +15,5 @@ _t.json
 # 本地校验用 mihomo 内核（仅测试，不入库）
 mihomo-windows-*
 
-# Windows 优选 IP 测速工具：二进制、IP 段文件、测速结果、FTP 凭据一律不入库
-tools/cfst/cfst.exe
-tools/cfst/*.txt
-tools/cfst/result.csv
-tools/cfst/result-full.csv
-tools/cfst/ftp.cfg
-tools/cfst/*.bak
+# 本地测速工具（与 VPS 脚本无关，只在本机用，不入库）
+tools/cfst/
