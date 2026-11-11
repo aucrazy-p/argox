@@ -2,14 +2,13 @@
 # ==============================================================================
 #  argox — Cloudflare Argo 隧道 + Xray (XHTTP) + sing-box 双核部署管理脚本
 #
-#  目标：用 Cloudflare Anycast 就近接入，绕开「移动 CMI → 美国 PCCW → 大阪」
-#        的绕美路由（250ms）与晚高峰丢包（24%）。
+#  目标：通过 Cloudflare Anycast 就近接入 + QUIC 隧道改善跨境链路的绕路与丢包。
 #
-#  链路：客户端 -(H3/QUIC 443, SNI=隧道域名, 入口=优选IP)-> CF 边缘
+#  链路：客户端 -(H3/QUIC 443, SNI=隧道域名, 入口=域名或优选IP)-> CF 边缘
 #        -> (QUIC 隧道 / CF 内网) -> cloudflared -> Xray -> 目标
 #
-#  适用：Ubuntu / Debian，ARM64 (Oracle A1) 与 AMD64
-#  不碰 443（留给 1panel），不覆盖已有 xray.service，全部独立命名。
+#  适用：Ubuntu / Debian，ARM64 与 AMD64
+#  不占用 443，不覆盖已有 xray.service，全部独立命名。
 # ==============================================================================
 
 set -uo pipefail
@@ -113,6 +112,24 @@ hr() { printf '%s\n' "───────────────────�
 die() { err "$*"; exit 1; }
 
 # ==============================================================================
+#  交互输入
+#  TTY 下启用 readline：方向键 / Home / End / Ctrl+A/E/W/U/K 都能用，
+#  粘贴域名、长 URL、带账号密码的 FTP 地址时改错不用整行重敲。
+#  非 TTY（管道 / CI / 重定向）退回普通 read，避免 readline 控制序列混进值里。
+#  提示语保持纯文本：若以后往提示语里加 ANSI 颜色，必须用 \001 \002 把颜色
+#  序列包起来，否则 readline 会把不可打印字符算进提示符宽度、光标位置会错。
+#  静默输入（read -rs，Tunnel Token）故意不加 -e：看不见的行编辑没有意义，
+#  且 readline 与 -s 组合有回显风险，保持原样。
+#  另：bash 只在 stdin 是真 TTY 时才让 -e 生效（管道下自动忽略），所以
+#  「从 Excel 粘贴含 Tab 的整张表格」那几处仍走 while IFS= read -r 循环，
+#  没有改成 reading —— TTY 下 Tab 是 readline 的补全键，会被吞掉。
+# ==============================================================================
+reading() { # $1=提示语  $2=变量名
+  if [[ -t 0 ]]; then read -er -p "$1" "$2"
+  else                read -rp "$1" "$2"; fi
+}
+
+# ==============================================================================
 #  工具函数
 # ==============================================================================
 require_root() {
@@ -180,24 +197,92 @@ port_in_use() { # $1=port  $2=proto(tcp/udp)
   fi
 }
 
-# 多源下载：GitHub 直连 + 两个常用镜像
-fetch() { # $1=目标文件  $2=github 原始 URL
-  local out="$1" url="$2"
-  local -a mirrors=(
-    "$url"
-    "https://ghfast.top/${url}"
-    "https://gh-proxy.com/${url}"
-    "https://ghproxy.net/${url}"
-  )
-  local m
-  for m in "${mirrors[@]}"; do
-    [[ -z "$m" ]] && continue
-    if curl -fsSL --connect-timeout 10 --max-time 300 --retry 1 -o "$out" "$m" 2>/dev/null; then
-      if [[ -s "$out" ]]; then
-        return 0
-      fi
+# ==============================================================================
+#  GitHub 下载源：并发探测 + 持久化缓存
+#  以前是「直连 → ghfast → gh-proxy → ghproxy」串行硬试，前一个源挂掉时
+#  每次都要白等一轮超时，镜像地址写死、失效只能改脚本。
+#  现在首次并行 HEAD 探测全部候选，取优先级最高的可用源写进缓存；之后直接
+#  用缓存，缓存源失败才回退并顺手改写缓存。删掉缓存文件即可强制重新探测。
+#  缓存内容为空 = 直连；文件本身不含任何凭据。
+# ==============================================================================
+GH_PROXY_CACHE="${BASE}/gh_proxy"
+GH_PROXY_LIST=(
+  ""                          # 直连优先：能直连就别绕第三方
+  "https://ghfast.top/"
+  "https://gh-proxy.com/"
+  "https://ghproxy.net/"
+)
+
+gh_proxy_read() { # 输出缓存的前缀；无缓存返回 1（空内容表示直连）
+  [[ -f "$GH_PROXY_CACHE" ]] || return 1
+  head -1 "$GH_PROXY_CACHE" 2>/dev/null || true
+}
+
+gh_proxy_save() { # $1=前缀（可为空）
+  mkdir -p "$(dirname "$GH_PROXY_CACHE")" 2>/dev/null || return 0
+  printf '%s\n' "$1" > "$GH_PROXY_CACHE" 2>/dev/null || true
+}
+
+gh_proxy_drop() { rm -f "$GH_PROXY_CACHE" 2>/dev/null || true; }
+
+gh_proxy_probe() { # $1=URL；并发探测，按 GH_PROXY_LIST 的优先级取第一个可用源
+  local url="$1" tmp i m
+  tmp="$(mktemp -d)" || { printf ''; return 0; }
+  local -a pids=()
+  i=0
+  for m in "${GH_PROXY_LIST[@]}"; do
+    (
+      code="$(curl -sIL --connect-timeout 4 --max-time 8 -o /dev/null \
+              -w '%{http_code}' "${m}${url}" 2>/dev/null || true)"
+      case "$code" in 2*|3*) printf '%s' "$m" > "${tmp}/${i}" ;; esac
+    ) >/dev/null 2>&1 &
+    pids+=("$!")
+    i=$((i+1))
+  done
+  wait "${pids[@]}" 2>/dev/null || true
+  i=0
+  for m in "${GH_PROXY_LIST[@]}"; do
+    if [[ -f "${tmp}/${i}" ]]; then
+      cat "${tmp}/${i}"
+      rm -rf "$tmp"
+      return 0
+    fi
+    i=$((i+1))
+  done
+  rm -rf "$tmp"
+  printf ''
+}
+
+fetch() { # $1=目标文件  $2=URL  [$3=单次下载超时秒]
+  local out="$1" url="$2" tmo="${3:-300}"
+  local is_gh=0 cached="" m
+  local -a order=()
+  [[ "$url" == https://github.com/* || "$url" == https://raw.githubusercontent.com/* ]] && is_gh=1
+
+  if (( is_gh )); then
+    # 命中缓存就跳过探测（空串 = 直连），否则探测一次并落盘
+    if ! cached="$(gh_proxy_read)"; then
+      cached="$(gh_proxy_probe "$url")"
+      gh_proxy_save "$cached"
+    fi
+    order+=("$cached")
+    for m in "${GH_PROXY_LIST[@]}"; do
+      [[ "$m" == "$cached" ]] || order+=("$m")
+    done
+  else
+    order+=("")
+  fi
+
+  for m in "${order[@]}"; do
+    if curl -fsSL --connect-timeout 10 --max-time "$tmo" --retry 1 \
+            -o "$out" "${m}${url}" 2>/dev/null && [[ -s "$out" ]]; then
+      # 缓存的源失效、被别的源救回来 → 更新缓存，下次不再白试一轮
+      (( is_gh )) && [[ "$m" != "$cached" ]] && gh_proxy_save "$m"
+      return 0
     fi
   done
+  # 全部失败：清缓存，下次强制重新探测
+  (( is_gh )) && gh_proxy_drop
   return 1
 }
 
@@ -846,11 +931,12 @@ install_cloudflared() {
   ok "cloudflared 已安装：$("$CFD_BIN" --version 2>/dev/null | head -1)"
 }
 
-install_singbox() {
+install_singbox() { # $1=update：菜单 7 用（忽略已存在；失败只告警，不终止整轮更新）
   local arch; arch="$(detect_arch)"
   [[ "$arch" == "unknown" ]] && die "不支持的架构：$(uname -m)"
+  local mode="${1:-}"
 
-  if [[ -x "$SB_BIN" ]]; then
+  if [[ -x "$SB_BIN" && "$mode" != "update" ]]; then
     info "已安装 sing-box $("$SB_BIN" version 2>/dev/null | head -1 | awk '{print $3}')，跳过下载"
     return 0
   fi
@@ -861,16 +947,27 @@ install_singbox() {
 
   step "下载 sing-box v${ver}（${arch}）"
   local tmp; tmp="$(mktemp -d)"
-  fetch "${tmp}/sb.tar.gz" "$url" || die "sing-box 下载失败（版本 ${ver} 可能不适用于 ${arch}）"
-  tar -xzf "${tmp}/sb.tar.gz" -C "$tmp" 2>/dev/null || die "sing-box 解压失败"
-
-  local bin; bin="$(find "$tmp" -type f -name sing-box -perm -u+x 2>/dev/null | head -1)"
-  [[ -n "$bin" ]] || bin="$(find "$tmp" -type f -name sing-box 2>/dev/null | head -1)"
-  [[ -n "$bin" ]] || die "压缩包内未找到 sing-box 二进制"
+  local bad=""
+  fetch "${tmp}/sb.tar.gz" "$url" || bad="sing-box 下载失败（版本 ${ver} 可能不适用于 ${arch}）"
+  if [[ -z "$bad" ]]; then
+    tar -xzf "${tmp}/sb.tar.gz" -C "$tmp" 2>/dev/null || bad="sing-box 解压失败"
+  fi
+  local bin=""
+  if [[ -z "$bad" ]]; then
+    bin="$(find "$tmp" -type f -name sing-box -perm -u+x 2>/dev/null | head -1)"
+    [[ -n "$bin" ]] || bin="$(find "$tmp" -type f -name sing-box 2>/dev/null | head -1)"
+    [[ -n "$bin" ]] || bad="压缩包内未找到 sing-box 二进制"
+  fi
+  if [[ -n "$bad" ]]; then
+    rm -rf "$tmp"
+    if [[ "$mode" == "update" ]]; then warn "${bad}（保持原版本）"; return 1; fi
+    die "$bad"
+  fi
 
   install -m 0755 "$bin" "$SB_BIN"
   rm -rf "$tmp"
-  ok "sing-box 已安装：$("$SB_BIN" version 2>/dev/null | head -1)"
+  # update 模式下由调用方统一汇报「更新为」，避免同一行打印两遍
+  [[ "$mode" == "update" ]] || ok "sing-box 已安装：$("$SB_BIN" version 2>/dev/null | head -1)"
 }
 
 # ==============================================================================
@@ -1079,7 +1176,7 @@ EOF
   fi
 }
 
-# 放行本机防火墙：Oracle 的 Ubuntu 镜像默认在 INPUT 末尾挂 REJECT，
+# 放行本机防火墙：部分云镜像默认在 INPUT 末尾挂 REJECT，
 # 云安全组放行了、实例内还是不通，是这个原因。
 # 注意端口范围写法三家不同：ufw/iptables 用冒号（23000:27000），firewalld 用短横线（23000-27000）
 fw_open() { # $1=tcp|udp  $2=端口 或 起-止
@@ -1420,7 +1517,7 @@ tunnel_since() {
   local ts dt
   ts="$(systemctl show -p ActiveEnterTimestamp --value "$SVC_TUN" 2>/dev/null \
         | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-  # 形如 "Fri 2026-11-06 21:05:03 CST"：只取日期与时间，时区交给 journalctl 按本机时区解释
+  # journalctl 的时间戳：只取日期与时间，时区按本机时区解释
   dt="$(printf '%s' "$ts" | awk 'NF>=3 {print $2, $3}')"
   if [[ "$dt" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
     printf '%s' "$dt"; return
@@ -1479,7 +1576,7 @@ tunnel_hints() {
   if [[ "$tcp" -eq 1 ]]; then
     err "出站 TCP 7844 也不通 → 云厂商安全组 / 出站防火墙拦了 cloudflared"
     info "Cloudflare 要求 VPS 能出站访问 7844（UDP 与 TCP）"
-    info "Oracle 云检查安全列表出站规则，或 iptables -L OUTPUT"
+    info "检查云平台安全组的出站规则，或 iptables -L OUTPUT"
   else
     info "TCP 7844 通但没注册成功，两种可能："
     info "  a) UDP 7844 被拦（QUIC 出不去）→ bash ${0##*/} diag http2"
@@ -1617,7 +1714,7 @@ MAX_IPS=3           # 只留前 3 个当备选池（导入时列 3 行，不啰�
 MAX_H3_NODES=1      # H3 主力（UDP/QUIC，抗丢包）
 MAX_H2_NODES=1      # H2 兜底（TCP，H3 被 QoS 时手动切过去）
 MAX_WS_NODES=2      # WS 兼容兜底
-ISP_PREF_DEFAULT="mobile"   # mobile | unicom | telecom | multi | auto
+ISP_PREF_DEFAULT="auto"     # auto（不指定）| mobile | unicom | telecom | multi
 
 # 节点地址模式：domain = 直接用隧道域名（客户端自己解析，走得最近）
 #               ip     = 展开优选 IP（手动筛过才用）
@@ -1683,11 +1780,11 @@ is_cf_ip() {
 
 # 解析任意格式列表，输出 "ip<TAB>备注"
 #
-# 支持的输入形态（实测都要能吃下，否则用户从 Excel / cfst 复制过来会 0 条）：
+# 支持的输入形态：
 #   1. 纯 IP                    104.16.132.229
-#   2. IP#备注                  104.16.1.1#移动
+#   2. IP#备注                  104.16.1.1#备注
 #   3. IP:443 / IP:443#备注
-#   4. 逗号 CSV（cfst 原样）    104.17.154.227,4,4,0,186.54,5.89,SJC
+#   4. 逗号 CSV（测速结果原样） 104.17.154.227,4,4,0,186.54,5.89,SJC
 #   5. Tab 分隔（Excel 复制）   104.17.154.227<TAB>4<TAB>…<TAB>SJC
 #   6. 空格分隔                 104.16.1.1 移动 12ms 3.2mb/s
 #
@@ -1707,7 +1804,7 @@ parse_ipfile() {
     note=""
     [[ "$line" == *"#"* ]] && note="${line#*#}"
 
-    # cfst / Excel 表格（≥7 列）最后一列是地区码，拿来当备注，节点名更好认
+    # 测速 CSV / Excel 表格（≥7 列）最后一列是地区码，拿来当备注，节点名更好认
     if [[ -z "$note" && "$line" == *,*,*,*,*,*,* ]]; then
       note="${line##*,}"
       note="${note//[[:space:]]/}"
@@ -1837,7 +1934,7 @@ isp_label() {
 # 排序候选：运营商匹配优先，组内按下载速度降序，速度相同按延迟升序
 # 输入 stdin: "ip<TAB>note"   输出: "ip<TAB>isp"（已排序）
 sort_cand() {
-  local want="${1:-mobile}"
+  local want="${1:-auto}"
   awk -F'\t' -v want="$want" '
   function ispof(n,  t) {
     t = n
@@ -1875,7 +1972,7 @@ manual_ips() {
   直接粘贴，空行结束。以下三种都认：
     · 纯 IP 一行一个
     · 从 Excel / WPS 复制的整张表格（含表头，Tab 分隔，地区码会保留成节点后缀）
-    · IP#移动 这种带备注的
+    · IP#备注 这类带分组标记的
 EOF
   printf '  > '
   local tmpd; tmpd="$(mktemp -d)"
@@ -1912,7 +2009,7 @@ EOF
     gen_sub >/dev/null 2>&1 || true
     ok "订阅已重建（当前已是 ip 模式）"
   else
-    read -rp "  切换为 ip 模式并重建订阅？(Y/n) " yn2
+    reading "  切换为 ip 模式并重建订阅？(Y/n) " yn2
     if [[ "${yn2,,}" != "n" ]]; then
       node_set node_mode ip
       gen_sub >/dev/null 2>&1 || true
@@ -1932,7 +2029,7 @@ update_ips() {
 
 # 备注文字 → 节点名后缀
 #   带运营商关键词 → 移动 / 联通 / 电信 / 多线
-#   三字母机场码（cfst 的「地区码」列）→ 原样保留，如 SJC / NRT / HKG
+#   三字母机场码（CSV 的地区码列）→ 原样保留，如 SJC / NRT / HKG
 #   其余 → 本机
 note_isp_label() {
   case "${1:-}" in
@@ -1950,17 +2047,9 @@ mask_url() {
   printf '%s' "$1" | sed -E 's#(://[^:/@]+:)[^@]*@#\1***@#'
 }
 
-# 从「你本机测速结果」导入 IP：地址可以是 http(s) / ftp(s) 直链，也可以是本地文件路径
-#
-# 与 import_ips 的本质区别：
-#   import_ips       在 VPS 上探测 + 按源备注里的 ms/MB·s⁻¹ 重排 —— 但那是别人网络的数据
-#   import_ips_url   完全不重排，严格保留你上传时的顺序 —— 因为快慢只有你的网络说了算
-#
-# 这样分工才正确：VPS 只负责「这个 IP 能不能到达本隧道」（anycast 全局一致），
-# 「哪个 IP 对你的移动宽带快」由你本机测速决定，脚本不越权猜测。
-#
-# 地址可以存进 node.json 的 ips_url：Windows 测速 → 传到自己的 FTP / 网站 → 这里填直链，
-# 之后 ips 无参就直接从它拉，不用每次贴地址。见 do_ips_url。
+# 从直链导入已排好序的 IP 列表：http(s) / ftp(s) 直链或本地文件路径。
+# 与 import_ips 的区别：这里完全不重排，严格保留来源顺序。
+# 地址可存进 node.json 的 ips_url，之后 ips 无参即直接拉取。见 do_ips_url。
 import_ips_url() {
   require_root
   local src="${1:-}"
@@ -1970,7 +2059,7 @@ import_ips_url() {
       info "使用自动更新地址：$(mask_url "$src")"
     else
       printf '\n  粘贴测速结果地址（http(s) 直链 / ftp(s) / 本机路径），回车确认：\n  > '
-      read -r src
+      reading "" src
     fi
   fi
   src="${src//[[:space:]]/}"
@@ -1996,7 +2085,7 @@ import_ips_url() {
     rm -rf "$tmpd"; return 1
   fi
 
-  # 解析：兼容 cfst 的 CSV（IP,已发送,已接收,丢包率,平均延迟,下载速度,…）、
+  # 解析：兼容测速 CSV（IP,已发送,已接收,丢包率,平均延迟,下载速度,…）、
   #       纯 IP 一行一个、IP:443、IP#备注 —— 一律只取第一列，保持原顺序
   local dropped=0 ip1 note1
   while IFS=$'\t' read -r ip1 note1; do
@@ -2020,7 +2109,7 @@ import_ips_url() {
   local verify=0
   if [[ -n "$host" ]]; then
     printf '\n  用 VPS 再验一次「能否路由到本隧道」？(%s个，约 %s 秒)\n' "$total" "$(( total * 2 ))"
-    read -rp "  [y/N，默认跳过，直接信任你的结果] " yn
+    reading "  [y/N，默认跳过，直接信任你的结果] " yn
     [[ "${yn,,}" == "y" ]] && verify=1
   fi
 
@@ -2052,7 +2141,7 @@ import_ips_url() {
   rm -rf "$tmpd"
 
   local got; got="$(wc -l < "$IPSF" | tr -d ' ')"
-  ok "已导入 ${got} 个 IP（严格保持你上传的顺序，未重排）"
+  ok "已导入 ${got} 个 IP（严格保持来源顺序，未重排）"
   awk -F'\t' '{printf "    %-16s %s\n", $1, $2}' "$IPMETA"
 
   printf '\n'
@@ -2060,7 +2149,7 @@ import_ips_url() {
     gen_sub >/dev/null 2>&1 || true
     ok "订阅已重建（当前已是 ip 模式）"
   else
-    read -rp "  切换为 ip 模式并重建订阅？(Y/n) " yn2
+    reading "  切换为 ip 模式并重建订阅？(Y/n) " yn2
     if [[ "${yn2,,}" != "n" ]]; then
       node_set node_mode ip
       gen_sub >/dev/null 2>&1 || true
@@ -2073,7 +2162,7 @@ import_ips_url() {
   # 一次成功后把地址存下来，之后 ips 无参就直接拉它（闭环的最后一步）
   if [[ "$src" =~ ^(https?|ftps?):// && -z "$(node_get ips_url 2>/dev/null || true)" ]]; then
     printf '\n'
-    read -rp "  设为自动更新地址？以后 $(cmd_prefix) ips 直接用它 (Y/n) " ynu
+    reading "  设为自动更新地址？以后 $(cmd_prefix) ips 直接用它 (Y/n) " ynu
     if [[ "${ynu,,}" != "n" ]]; then
       node_set ips_url "$src" && ok "已保存自动更新地址"
     fi
@@ -2081,7 +2170,7 @@ import_ips_url() {
   info "回退：$(cmd_prefix) tunnel → 6) 节点地址模式 → domain"
 }
 
-# 自动更新地址：把「Windows 测速结果上传到 FTP / 网站」的直链存进 node.json，
+# 自动更新地址：把 IP 列表直链存进 node.json，
 # 之后 ips 无参直接从它拉。凭据只落在 node.json（600），不进脚本、不进仓库。
 do_ips_url() {
   require_root
@@ -2103,11 +2192,11 @@ do_ips_url() {
   4) 清除
   0) 返回
 EOF
-    read -rp "  选择: " act
+    reading "  选择: " act
     case "${act:-}" in
       1)
         printf '\n  粘贴地址，回车确认\n  例：ftp://用户:密码@主机:端口/文件名\n  > '
-        local u k; read -r u; u="${u//[[:space:]]/}"
+        local u k; reading "" u; u="${u//[[:space:]]/}"
         if [[ -z "$u" ]]; then warn "已取消"; continue; fi
         if [[ ! "$u" =~ ^(https?|ftps?):// ]]; then err "只认 http(s) / ftp(s) 开头的地址"; continue; fi
         info "验证：$(mask_url "$u")"
@@ -2115,7 +2204,7 @@ EOF
           ok "地址可读"
         else
           warn "暂时读不到（账号错 / 文件名错 / 还没上传）"
-          read -rp "  仍然保存？(y/N) " k
+          reading "  仍然保存？(y/N) " k
           [[ "${k,,}" != "y" ]] && { info "未保存"; continue; }
         fi
         node_set ips_url "$u" && ok "已保存（只写入 ${NODEF}，权限 600）"
@@ -2157,11 +2246,11 @@ menu_ips() {
   3) 立即拉取并校验
   4) 手动粘贴 IP
   5) 运营商偏好（换网络时改这里）
-  6) 从链接导入（本机测速结果，保序不重排）← 推荐
+  6) 从链接导入（保序，不重排）← 推荐
   7) 自动更新地址（测速结果传 FTP/网站，以后 ips 无参直接拉）
   0) 返回
 EOF
-    read -rp "  选择: " c
+    reading "  选择: " c
     case "${c:-}" in
       1) if [[ -s "$IPSF" ]]; then
            if [[ -s "$IPMETA" ]]; then awk -F'\t' '{printf "    %-16s %s\n",$1,$2}' "$IPMETA"
@@ -2196,7 +2285,7 @@ do_set_isp() {
   5) 不指定（全部按速度排序）
   0) 返回
 EOF
-  local c; read -rp "  选择: " c
+  local c; reading "  选择: " c
   local v=""
   case "${c:-}" in
     1) v="mobile" ;;
@@ -2210,7 +2299,7 @@ EOF
   node_set isp_pref "$v"
   ok "已设为「$(isp_label "$v")」"
   printf '\n'
-  read -rp "  立即重新拉取并按新偏好排序？（Y/n）: " yn
+  reading "  立即重新拉取并按新偏好排序？（Y/n）: " yn
   if [[ "${yn,,}" != "n" ]]; then
     import_ips && gen_sub >/dev/null 2>&1 || true
   else
@@ -2860,10 +2949,21 @@ do_start() {
     warn "未配置 Tunnel Token，隧道未启动（菜单 11 可填写）"
   fi
   [[ -f "$PYSRV" ]] && systemctl start "$SVC_SUB" 2>/dev/null
-  ok "已启动"
+  # sing-box 是后来加的第四个服务：不在这里拉起，菜单 2「启动」后直连协议仍是死的
+  if proto_on hy2 || proto_on tuic || proto_on anytls; then
+    systemctl start "$SVC_SB" 2>/dev/null
+    sleep 1
+    if svc_active "$SVC_SB"; then
+      ok "sing-box 已启动（$(proto_label_sb)）"
+    else
+      warn "sing-box 启动失败，查看日志：journalctl -u ${SVC_SB} -n 50"
+    fi
+  fi
+  if svc_active "$SVC_XRAY"; then ok "已启动"; else warn "Xray 未起来，逐条看上面的提示"; fi
 }
 
 do_stop() {
+  systemctl stop "$SVC_SB" 2>/dev/null
   systemctl stop "$SVC_SUB" 2>/dev/null
   systemctl stop "$SVC_TUN" 2>/dev/null
   systemctl stop "$SVC_XRAY" 2>/dev/null
@@ -2874,6 +2974,10 @@ do_restart() {
   systemctl restart "$SVC_XRAY" 2>/dev/null
   [[ -s "$TOKEN_FILE" ]] && systemctl restart "$SVC_TUN" 2>/dev/null
   [[ -f "$PYSRV" ]] && systemctl restart "$SVC_SUB" 2>/dev/null
+  # 协议已开或服务原本在跑才重启；全关时别把一个故意停掉的服务拉起来
+  if proto_on hy2 || proto_on tuic || proto_on anytls || svc_active "$SVC_SB"; then
+    systemctl restart "$SVC_SB" 2>/dev/null
+  fi
   sleep 1
   ok "已重启"
 }
@@ -2888,7 +2992,14 @@ do_status() {
   if svc_active "$SVC_XRAY"; then st_x="${C_GRN}● 运行中${C_R}"; else st_x="${C_RED}○ 已停止${C_R}"; fi
   if svc_active "$SVC_TUN";  then st_t="${C_GRN}● 运行中${C_R}"; else st_t="${C_RED}○ 已停止${C_R}"; fi
   if svc_active "$SVC_SUB";  then st_s="${C_GRN}● 运行中${C_R}"; else st_s="${C_RED}○ 已停止${C_R}"; fi
-  if svc_active "$SVC_SB";   then st_b="${C_GRN}● 运行中${C_R}"; else st_b="${C_DIM}○ 未启用${C_R}"; fi
+  # 区分「没开直连」和「开了但 sing-box 挂了」：后者一律显示灰色「未启用」会误导排查
+  if svc_active "$SVC_SB"; then
+    st_b="${C_GRN}● 运行中${C_R}"
+  elif proto_on hy2 || proto_on tuic || proto_on anytls; then
+    st_b="${C_RED}○ 已停止（直连协议已开启，服务异常）${C_R}"
+  else
+    st_b="${C_DIM}○ 未启用${C_R}"
+  fi
 
   printf '  Xray       : %s\n' "$st_x"
   printf '  Tunnel     : %s\n' "$st_t"
@@ -2941,7 +3052,7 @@ do_status() {
 
 do_logs() {
   printf '\n  1) Xray 日志\n  2) 隧道日志\n  3) 订阅服务日志\n  4) sing-box 日志\n  5) 实时跟踪 Xray\n  6) 实时跟踪隧道\n  7) 实时跟踪 sing-box\n  0) 返回\n'
-  read -rp "  选择: " c
+  reading "  选择: " c
   case "$c" in
     1) journalctl -u "$SVC_XRAY" -n 80 --no-pager ;;
     2) journalctl -u "$SVC_TUN"  -n 80 --no-pager ;;
@@ -3001,7 +3112,7 @@ do_install() {
   local host token cur_host
   host=""
   cur_host="$(node_get tunnel_host 2>/dev/null || true)"
-  read -rp "  隧道域名（如 argo.example.com，留空=保持不变）: " host
+  reading "  隧道域名（如 argo.example.com，留空=保持不变）: " host
   host="${host// /}"
   [[ -z "$host" && -n "$cur_host" ]] && host="$cur_host"
   if [[ -n "$host" ]]; then
@@ -3012,7 +3123,7 @@ do_install() {
 
   token=""
   printf '\n'
-  read -rp "  现在粘贴 Tunnel Token？（y/N）: " yn
+  reading "  现在粘贴 Tunnel Token？（y/N）: " yn
   if [[ "${yn,,}" == "y" ]]; then
     printf '  粘贴 Token 后回车（输入不回显）: '
     read -rs token
@@ -3244,7 +3355,7 @@ PY
     if [[ -s "$IPSF" ]]; then
       info "已有 $(wc -l < "$IPSF") 个 IP，跳过（菜单 12 可更新）"
     else
-      read -rp "  现在导入优选 IP 并校验？约需 1-3 分钟（Y/n）: " yn2
+      reading "  现在导入优选 IP 并校验？约需 1-3 分钟（Y/n）: " yn2
       if [[ "${yn2,,}" != "n" ]]; then
         import_ips || printf '%s\n' "$DEFAULT_IPS" > "$IPSF"
       else
@@ -3295,39 +3406,125 @@ PY
 # ==============================================================================
 #  菜单动作
 # ==============================================================================
+# 菜单 7：只更新三个二进制内核，不碰 Linux 内核、脚本自身、配置与订阅服务。
+# sing-box 的 release 资产名带版本号，没法像 Xray / cloudflared 那样拼 latest，
+# 所以以脚本内置的 SB_VER_DEFAULT 为权威版本（可用 SB_VER 覆盖）：换了新脚本后
+# 跑一次菜单 7，sing-box 就会对齐到新脚本预期的版本，不需要查 API 拿 tag。
 do_update() {
   require_root
   installed || { err "尚未安装"; return 1; }
-  step "更新 Xray / cloudflared"
+  step "更新内核程序：Xray / cloudflared / sing-box"
+  info "本项只换二进制；更新脚本自身请用菜单 10 / $(cmd_prefix) selfupdate"
 
   local arch; arch="$(detect_arch)"
+  [[ "$arch" == "unknown" ]] && die "不支持的架构：$(uname -m)"
   local pkg
   case "$arch" in
     arm64) pkg="Xray-linux-arm64-v8a.zip" ;;
     amd64) pkg="Xray-linux-64.zip" ;;
   esac
-  local tmp; tmp="$(mktemp -d)"
-  if fetch "${tmp}/${pkg}" "https://github.com/XTLS/Xray-core/releases/latest/download/${pkg}"; then
-    unzip -oq "${tmp}/${pkg}" -d "$tmp" && install -m 0755 "${tmp}/xray" "$XRAY_BIN"
+  if ! has unzip; then pkg_install unzip || warn "缺 unzip，Xray 可能更新失败"; fi
+  local tmp up_x=0 up_c=0 up_s=0
+
+  # ---- Xray ----
+  # 原来只判 fetch 成功，unzip / install 失败也照样打「更新为」：改成整串 &&，
+  # 任何一环失败都不误报成功，也不覆盖出半个二进制。
+  tmp="$(mktemp -d)"
+  if fetch "${tmp}/${pkg}" "https://github.com/XTLS/Xray-core/releases/latest/download/${pkg}" \
+     && unzip -oq "${tmp}/${pkg}" -d "$tmp" 2>/dev/null \
+     && [[ -f "${tmp}/xray" ]] \
+     && install -m 0755 "${tmp}/xray" "$XRAY_BIN"; then
     ok "Xray 更新为：$("$XRAY_BIN" version 2>/dev/null | head -1)"
+    up_x=1
   else
     warn "Xray 更新失败（保持原版本）"
   fi
   rm -rf "$tmp"
 
+  # ---- cloudflared ----
   tmp="$(mktemp)"
-  if fetch "$tmp" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}"; then
-    install -m 0755 "$tmp" "$CFD_BIN"
+  if fetch "$tmp" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" \
+     && install -m 0755 "$tmp" "$CFD_BIN"; then
     ok "cloudflared 更新为：$("$CFD_BIN" --version 2>/dev/null | head -1)"
+    up_c=1
   else
     warn "cloudflared 更新失败（保持原版本）"
   fi
   rm -f "$tmp"
 
-  systemctl restart "$SVC_XRAY" 2>/dev/null
-  [[ -s "$TOKEN_FILE" ]] && systemctl restart "$SVC_TUN" 2>/dev/null
-  sleep 1
-  ok "服务已按新版本重启"
+  # ---- sing-box（原来完全没有更新入口，版本锁死在 SB_VER_DEFAULT）----
+  local want="${SB_VER:-$SB_VER_DEFAULT}"
+  if [[ -x "$SB_BIN" ]]; then
+    local cur; cur="$("$SB_BIN" version 2>/dev/null | head -1 | awk '{print $3}')"
+    if [[ "$cur" == "$want" ]]; then
+      info "sing-box 已是 v${want}（脚本内置版本），跳过"
+    elif install_singbox update; then
+      ok "sing-box 更新为：$("$SB_BIN" version 2>/dev/null | head -1)"
+      up_s=1
+    fi
+  else
+    info "sing-box 未安装，跳过（菜单 14 开直连协议时会自动安装）"
+  fi
+
+  # 只重启真正换过二进制的服务；全失败时一次都不重启，也别谎报「已按新版本重启」
+  if (( up_x || up_c || up_s )); then
+    (( up_x )) && systemctl restart "$SVC_XRAY" 2>/dev/null
+    if (( up_c )) && [[ -s "$TOKEN_FILE" ]]; then systemctl restart "$SVC_TUN" 2>/dev/null; fi
+    if (( up_s )); then
+      if svc_active "$SVC_SB"; then
+        systemctl restart "$SVC_SB" 2>/dev/null
+      else
+        info "sing-box 当前未运行，新版本下次启动时生效"
+      fi
+    fi
+    sleep 1
+    ok "已重启受影响的服务"
+  else
+    warn "三个内核都未更新，服务保持原状"
+  fi
+}
+
+# 脚本自身更新：GitHub 上改了 argox.sh 时走这里（菜单 10，联网）。
+# 落盘后自动跑 do_upgrade 同步配置，所以菜单不再单列「升级配置」一项。
+# 命令入口 /usr/local/bin/argox 是写死 exec bash $SELF_PATH 的壳，所以必须覆盖
+# 同一个路径，curl 到别的文件名不会生效。先下到临时文件、校验通过才 install，
+# 失败全程不碰现有脚本；不比较版本号（改动未必 bump VERSION），按内容覆盖。
+do_selfupdate() {
+  require_root
+  local dst="${ARGOX_DST:-$SELF_PATH}" tmp new
+  tmp="$(mktemp)" || { err "临时文件创建失败"; return 1; }
+
+  step "更新脚本自身（当前 v${VERSION}）"
+  if ! fetch "$tmp" "$RAW_URL" 60; then
+    rm -f "$tmp"
+    err "下载失败，现有脚本保持原样；下载源缓存：${GH_PROXY_CACHE}"
+    return 1
+  fi
+  if ! grep -q '^APP="argox"' "$tmp" 2>/dev/null || ! bash -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    err "下载内容不是有效的 argox.sh，现有脚本保持原样"
+    return 1
+  fi
+  new="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$tmp" 2>/dev/null | head -1)"
+  [[ -n "$new" ]] || { rm -f "$tmp"; err "新脚本里读不到版本号，现有脚本保持原样"; return 1; }
+
+  if ! install -m 0755 "$tmp" "$dst"; then
+    rm -f "$tmp"; err "写入 ${dst} 失败，现有脚本保持原样"; return 1
+  fi
+  rm -f "$tmp"
+  install_cmd "$dst" >/dev/null 2>&1 || true   # src == tgt，只重写 /usr/local/bin/argox 壳
+  ok "脚本已更新：v${VERSION} → v${new}（${dst}）"
+  [[ "$new" == "$VERSION" ]] && info "版本号未变，仍按 GitHub 内容覆盖（改动可能没 bump VERSION）"
+
+  # 只换脚本不够：sub_server.py / subs_gen.py / systemd 单元 / node.json 字段都嵌在
+  # 脚本里，要跑 upgrade 才会同步到 /opt/argox，否则新代码永远不生效。
+  if installed; then
+    info "同步配置 / 订阅服务到新脚本…"
+    do_upgrade
+  else
+    info "尚未安装，跳过配置升级；直接敲 argox 进菜单开始安装"
+  fi
+  info "若新版本改了 Xray 配置或 systemd 单元，再跑一次 $(cmd_prefix) restart"
 }
 
 do_change_uuid() {
@@ -3335,7 +3532,7 @@ do_change_uuid() {
   installed || { err "尚未安装"; return 1; }
   printf '\n  当前 UUID：%s\n' "$(node_get uuid)"
   printf '  %s更换后所有客户端都需要重新导入，旧链接立即失效。%s\n\n' "$C_YEL" "$C_R"
-  local yn; read -rp "  确认更换？(y/N): " yn
+  local yn; reading "  确认更换？(y/N): " yn
   [[ "${yn,,}" != "y" ]] && return 0
 
   local uuid; uuid="$(gen_uuid)"
@@ -3358,7 +3555,7 @@ do_sysopt() {
   printf '  4) 开机自启（Xray / 隧道 / 订阅 / sing-box）\n'
   printf '  5) 日志轮转（限制 xray/cloudflared 日志体积）\n'
   printf '  0) 返回\n'
-  local c; read -rp "  选择: " c
+  local c; reading "  选择: " c
   case "$c" in
     1) apply_sysctl ;;
     2)
@@ -3411,7 +3608,7 @@ do_clean() {
   printf '  · journal 中超过 3 天的 argox 日志\n'
   printf '  · 旧的订阅/二维码文件\n'
   printf '  · 下载临时文件\n\n'
-  local yn; read -rp "  确认清理？(y/N): " yn
+  local yn; reading "  确认清理？(y/N): " yn
   [[ "${yn,,}" != "y" ]] && return 0
 
   local before after
@@ -3440,8 +3637,8 @@ do_uninstall() {
   printf '  · /etc/argox/token.env\n'
   printf '  · /usr/local/bin/argox（命令入口）\n'
   printf '  · /etc/sysctl.d/99-argox.conf\n\n'
-  printf '  %s不会动的：%s1panel、已有 xray.service、443 端口、cdnx 相关文件\n\n' "$C_GRN" "$C_R"
-  local yn; read -rp "  确认卸载？(输入 yes 继续): " yn
+  printf '  %s不会动的：%s已有 xray.service、443 端口及其他非 argox 文件\n\n' "$C_GRN" "$C_R"
+  local yn; reading "  确认卸载？(输入 yes 继续): " yn
   [[ "$yn" != "yes" ]] && { info "已取消"; return 0; }
 
   step "卸载"
@@ -4099,7 +4296,7 @@ if str(rv.get("sni")) == "www.microsoft.com" and str(rv.get("port")) == "8443" \
     mig_sni = rsni
 
 # 落地默认入口迁移：纯默认态 ["h3","h2"] → ["h3","anytls"]。
-# H2 与 H3 同走 CF，落地版重复度高；AnyTLS 是 TCP 兜底，更值得有家宽出口。
+# H2 与 H3 同走 CF，落地版重复度高；AnyTLS 是 TCP 兜底，优先保留。
 # 只认精确的默认数组，用户自己勾过的一律不动。
 mig_land = "-"
 ld = d.get("landing") or {}
@@ -4243,7 +4440,7 @@ PY
     if proto_on hy2; then
       sb_sync && ok "sing-box 已按新监听口重启（Hy2 UDP $(hy2_port)）"
     fi
-    warn "Oracle 安全组：请删除旧的 UDP 20000-30000 规则，改为 UDP $(hy2_hop)"
+    warn "云安全组：请删除旧的 UDP 20000-30000 规则，改为 UDP $(hy2_hop)"
     warn "本机 iptables 可能残留旧段放行规则，用 iptables -L INPUT -n 自查"
     if ! proto_on hy2; then
       info "Hy2 未开启，端口变更待下次 direct on hy2 时生效"
@@ -4296,9 +4493,9 @@ hop_show() {
 hop_edit_addr() {
   local a p
   a="$(node_hop_addr)"; p="$(node_hop_port)"
-  read -rp "  代理地址（当前 ${a}）: " a
+  reading "  代理地址（当前 ${a}）: " a
   [[ -n "$a" ]] && node_set hop_addr "$a"
-  read -rp "  代理端口（当前 ${p}）: " p
+  reading "  代理端口（当前 ${p}）: " p
   if [[ "$p" =~ ^[0-9]+$ ]]; then node_set hop_port "$p"; fi
   ok "代理已设为 $(node_hop_addr):$(node_hop_port)"
 }
@@ -4367,7 +4564,7 @@ do_hop() {
     printf '  2) 全部走跳板（目标站只看到代理的出口 IP）\n'
     printf '  3) 改代理地址 / 端口\n'
     printf '  0) 返回\n'
-    local c; read -rp "  选择: " c
+    local c; reading "  选择: " c
     case "$c" in
       1) hop_set off ;;
       2) hop_set all ;;
@@ -4376,7 +4573,7 @@ do_hop() {
       *) warn "无效选项：${c:-<空>}" ;;
     esac
     printf '\n'
-    read -rp "  按回车继续…" _ || true
+    reading "  按回车继续…" _ || true
   done
 }
 
@@ -4560,7 +4757,7 @@ landing_pick_target() {
       anytls)  proto_on anytls  || printf '  %s（AnyTLS 未开启，选了暂不生效）%s\n' "$C_YEL" "$C_R" ;;
       reality) proto_on reality || printf '  %s（Reality 未开启，选了暂不生效）%s\n' "$C_YEL" "$C_R" ;;
     esac
-    read -rp "  $(printf '%-7s' "$(printf '%s' "$t" | tr '[:lower:]' '[:upper:]')") 落地？（当前 ${cur}，y/n/回车）: " ans
+    reading "  $(printf '%-7s' "$(printf '%s' "$t" | tr '[:lower:]' '[:upper:]')") 落地？（当前 ${cur}，y/n/回车）: " ans
     case "${ans,,}" in
       y) a+=("$t") ;;
       n) : ;;
@@ -4599,18 +4796,18 @@ do_landing() {
     printf '  4) 出口协议（socks / http，当前 %s）\n' "$(landing_proto)"
     printf '  5) 改代理地址 / 端口（当前 %s:%s）\n' "$(node_hop_addr)" "$(node_hop_port)"
     printf '  0) 返回\n'
-    local c; read -rp "  选择: " c
+    local c; reading "  选择: " c
     case "$c" in
       1) landing_set on ;;
       2) landing_set off ;;
       3) landing_pick_target ;;
-      4) read -rp "  协议（socks/http）: " lp; landing_set_proto "$lp" ;;
+      4) reading "  协议（socks/http）: " lp; landing_set_proto "$lp" ;;
       5) hop_edit_addr ;;
       0|"") return 0 ;;
       *) warn "无效选项：${c:-<空>}" ;;
     esac
     printf '\n'
-    read -rp "  按回车继续…" _ || true
+    reading "  按回车继续…" _ || true
   done
 }
 
@@ -4672,7 +4869,7 @@ do_tunnel_setup() {
   printf '  4) 节点地址模式（当前：%s）\n' "$mode_v"
   printf '  5) cloudflared 出站诊断（7844 通不通）\n'
   printf '  0) 返回\n'
-  local c; read -rp "  选择: " c
+  local c; reading "  选择: " c
   case "$c" in
     1)
       printf '\n  粘贴 Token 后回车（不回显）: '
@@ -4697,7 +4894,7 @@ do_tunnel_setup() {
       ;;
     2)
       local h; h="$(node_get tunnel_host)"
-      read -rp "  隧道域名（当前：${h:-未设置}）: " h
+      reading "  隧道域名（当前：${h:-未设置}）: " h
       [[ -z "$h" ]] && return 0
       if [[ ! "$h" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]]; then
         err "域名格式不合法"; return 1
@@ -4737,7 +4934,7 @@ do_tunnel_setup() {
       printf '\n  当前：%s\n' "$(node_mode)"
       printf '  1) domain  域名直连（推荐：客户端自行解析到最近的 CF 节点）\n'
       printf '  2) ip      展开优选 IP（需自己测速筛选，否则多半更慢）\n'
-      local m; read -rp "  选择（回车不改）: " m
+      local m; reading "  选择（回车不改）: " m
       case "$m" in
         1) node_set node_mode domain ;;
         2) node_set node_mode ip ;;
@@ -4965,7 +5162,7 @@ direct_menu() {
   9) Reality 伪装目标体检 / 换目标
   0) 返回
 EOF
-    read -rp "  选择: " c
+    reading "  选择: " c
     case "${c:-}" in
       1) direct_switch on all ;;
       2) if proto_on hy2; then direct_switch off hy2; else direct_switch on hy2; fi ;;
@@ -4973,13 +5170,13 @@ EOF
       4) if proto_on anytls; then direct_switch off anytls; else direct_switch on anytls; fi ;;
       5) if proto_on reality; then direct_switch off reality; else direct_switch on reality; fi ;;
       6) printf '\n  当前跳跃段：%s（监听 %s）\n' "$(hy2_hop)" "$(hy2_port)"
-         read -rp "  新的跳跃段（回车保持不变）: " r
+         reading "  新的跳跃段（回车保持不变）: " r
          if [[ -n "${r// /}" ]]; then
            hy2_hop_set "${r// /}"
          fi ;;
       7) cert_show; printf '\n'
          if [[ -f "${CERTD}/cert.pem" ]]; then
-           read -rp "  重新生成证书？（y/N）: " yn
+           reading "  重新生成证书？（y/N）: " yn
            if [[ "${yn,,}" == "y" ]]; then
              cert_gen --force && { if proto_on hy2 || proto_on tuic || proto_on anytls; then sb_sync; fi; }
            fi
@@ -4988,7 +5185,7 @@ EOF
          fi ;;
       8) if proto_on hy2 || proto_on tuic || proto_on anytls; then sb_sync; else warn "sing-box 侧协议都未开启"; fi ;;
       9) reality_probe; printf '\n'
-         read -rp "  换成哪个？（留空则不改）: " rh
+         reading "  换成哪个？（留空则不改）: " rh
          if [[ -n "${rh// /}" ]]; then
            reality_sni_set "${rh// /}"
          fi ;;
@@ -4996,7 +5193,7 @@ EOF
       *) warn "无效选项" ;;
     esac
     printf '\n'
-    read -rp "  按回车继续…" _ || true
+    reading "  按回车继续…" _ || true
   done
 }
 
@@ -5014,7 +5211,7 @@ do_direct() {
 #  端口管理（v2.7.0）
 #
 #  所有端口都持久化在 node.json，改完要重建对应服务 + 重建订阅（客户端得重导）。
-#  Oracle 安全组脚本改不了，只能提示。安装时也可用环境变量预指定：
+#  云安全组需手动放行，脚本改不了。安装时也可用环境变量预指定：
 #    SUB_PORT=9000 ANYTLS_PORT=9443 bash argox.sh install
 # ==============================================================================
 PORT_ITEMS="sub hy2 tuic anytls reality"
@@ -5154,16 +5351,16 @@ port_menu() {
   1) 改订阅端口     2) 改 Hy2      3) 改 TUIC
   4) 改 AnyTLS      5) 改 Reality  0) 返回
 EOF
-    read -rp "  选择: " c
+    reading "  选择: " c
     case "${c:-}" in
       1) it="sub" ;; 2) it="hy2" ;; 3) it="tuic" ;; 4) it="anytls" ;; 5) it="reality" ;;
       0|"") return 0 ;;
       *) warn "无效选项"; printf '\n'; continue ;;
     esac
-    read -rp "  $(port_label "$it") 新端口（当前 $(port_cur "$it")）: " p
+    reading "  $(port_label "$it") 新端口（当前 $(port_cur "$it")）: " p
     [[ -z "${p// /}" ]] || port_set "$it" "${p// /}"
     printf '\n'
-    read -rp "  按回车继续…" _ || true
+    reading "  按回车继续…" _ || true
   done
 }
 
@@ -5181,7 +5378,7 @@ do_port() {
 port_firewall_hint() {
   local any=0
   printf '\n'
-  step "云安全组（Oracle 控制台）需要放行"
+  step "云安全组需要在控制台放行"
   printf '  端口             协议 用途\n'
   if proto_on hy2; then
     printf '  %-16s %-4s %s\n' "$(hy2_hop)" "UDP" "Hy2 含端口跳跃（必须整段，不能只开 $(hy2_port)）"
@@ -5262,12 +5459,19 @@ do_cert() {
 }
 
 menu_header() {
-  local st_x st_t host hop_l land_l
-  if svc_active "$SVC_XRAY"; then st_x="${C_GRN}●运行${C_R}"; else st_x="${C_DIM}○停止${C_R}"; fi
+  local st_x st_t st_b host hop_l land_l sb_line=""
+  if svc_active "$SVC_XRAY"; then st_x="${C_GRN}●运行${C_R}"; else st_x="${C_RED}○停止${C_R}"; fi
   if [[ -s "$TOKEN_FILE" ]]; then
     if svc_active "$SVC_TUN"; then st_t="${C_GRN}●在线${C_R}"; else st_t="${C_YEL}○未运行${C_R}"; fi
   else
     st_t="${C_DIM}未配置${C_R}"
+  fi
+  # 「直连 Hy2/TUIC/AnyTLS」来自 proto_label_short()，只是 node.json 里的开关：
+  # sing-box 挂了它照样显示正常。把服务状态单独挂在这行前面，异常才看得见。
+  # 只在装了 / 开了 sing-box 时显示，纯 Argo 用户不看到多余字段。
+  if proto_on hy2 || proto_on tuic || proto_on anytls || [[ -x "$SB_BIN" ]]; then
+    if svc_active "$SVC_SB"; then st_b="${C_GRN}●运行${C_R}"; else st_b="${C_RED}○停止${C_R}"; fi
+    sb_line="sbox ${st_b}   "
   fi
   host="$(node_get tunnel_host 2>/dev/null)"
   if [[ "$(node_hop_mode)" == "all" ]]; then hop_l="${C_YEL}全部${C_R}"; else hop_l="${C_DIM}关闭${C_R}"; fi
@@ -5281,7 +5485,7 @@ menu_header() {
   printf '%s║%s  argox  ·  Argo 隧道 + Xray(XHTTP) + sing-box  %s%-8s%s%s║%s\n' "$C_B$C_BLU" "$C_R$C_B" "$C_DIM" "v${VERSION}" "$C_R" "$C_B$C_BLU" "$C_R"
   printf '%s╚══════════════════════════════════════════════════╝%s\n' "$C_B$C_BLU" "$C_R"
   printf '  Xray %s   Tunnel %s   域名 %s\n' "$st_x" "$st_t" "${host:-${C_DIM}未设置${C_R}}"
-  printf '  直连 %s   跳板 %s   落地 %s\n' "$(proto_label_short)" "$hop_l" "$land_l"
+  printf '  %s直连 %s   跳板 %s   落地 %s\n' "$sb_line" "$(proto_label_short)" "$hop_l" "$land_l"
   printf '%s\n' "──────────────────────────────────────────────────"
 }
 
@@ -5290,12 +5494,12 @@ menu_main() {
     menu_header
     cat <<'EOF'
    1) 安装 / 重新部署           9) 更换 UUID
-   2) 启动                     10) 升级配置（补字段）
+   2) 启动                     10) 更新脚本自身（联网）
    3) 停止                     11) 隧道设置（Token / 域名 / 测试）
    4) 重启                     12) 优选 IP（导入测速结果）
    5) 查看状态                 13) 出口跳板
    6) 查看日志                 14) 直连协议（Hy2/TUIC/AnyTLS/Reality）
-   7) 更新到最新版             15) 住宅落地
+   7) 更新内核程序             15) 住宅落地
    8) 自检 check               16) 订阅地址 / 二维码
    17) 端口管理                18) 系统优化
    19) 清理缓存                20) 卸载
@@ -5303,7 +5507,8 @@ EOF
     printf '\n    0) 退出\n'
     printf '%s\n' "──────────────────────────────────────────────────"
     printf '  %s左列＝常用动作，右列＝配置项%s\n' "$C_DIM" "$C_R"
-    read -rp "  请选择: " choice
+    printf '  %s更新：7=内核程序  10=脚本自身（联网，自动同步配置）%s\n' "$C_DIM" "$C_R"
+    reading "  请选择: " choice
     case "${choice:-}" in
       1)  do_install ;;
       2)  do_start ;;
@@ -5314,7 +5519,7 @@ EOF
       7)  do_update ;;
       8)  do_check ;;
       9)  do_change_uuid ;;
-      10) do_upgrade ;;
+      10) do_selfupdate ;;
       11) do_tunnel_setup ;;
       12) menu_ips ;;
       13) do_hop ;;
@@ -5329,7 +5534,7 @@ EOF
       *) warn "无效选项：${choice:-<空>}" ;;
     esac
     printf '\n'
-    read -rp "  按回车返回菜单…" _ || true
+    reading "  按回车返回菜单…" _ || true
   done
 }
 
@@ -5346,6 +5551,7 @@ main() {
     status)    do_status ;;
     logs)      do_logs ;;
     update)    do_update ;;
+    selfupdate) do_selfupdate ;;
     ips)       if [[ -n "${2:-}" ]]; then import_ips_url "${2:-}"
                elif [[ -n "$(node_get ips_url 2>/dev/null || true)" ]]; then import_ips_url
                else update_ips; fi ;;
@@ -5375,6 +5581,9 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   ${B}              进入交互菜单（推荐）
   ${B} install      直接部署
   ${B} status       查看状态
+  ${B} start|stop|restart  启停全部服务（含 sing-box）
+  ${B} logs         查看各服务日志
+  ${B} update       更新 Xray / cloudflared / sing-box 二进制（菜单 7）
   ${B} nodes        打印订阅地址 + 二维码
   ${B} links        打印单节点链接
   ${B} sub          输出 Base64 订阅内容
@@ -5414,10 +5623,21 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   ${B} diag auto    恢复自动选择（默认）
   ${B} check        自检：配置 / 端口 / 订阅 / 链接 / 隧道（只读）
   ${B} check -q     静默自检，只返回退出码（0=全通过）
-  ${B} upgrade      补齐配置字段 + 对齐单元 + 重建订阅（不重启服务）
+  ${B} selfupdate   更新脚本自身（菜单 10）：拉取最新 argox.sh 覆盖 ${SELF_PATH}，
+                    校验通过后自动跑 upgrade 同步 node.json / 单元 / 订阅服务
+  ${B} upgrade      只同步配置（不联网，通常 selfupdate 已自动执行；手工覆盖脚本后用）
   ${B} uninstall    卸载
 
+两种更新互不替代：
+  菜单 10 / ${B} selfupdate  更新脚本自身（联网，顺带同步配置）
+  菜单 7  / ${B} update      只换 Xray / cloudflared / sing-box 三个二进制
+等价手工两步：curl -fsSL -o ${SELF_PATH} <raw 地址> && ${B} upgrade
+命令入口写死指向 ${SELF_PATH}，curl 到别的文件名不会生效。
+
   curl -fsSL <地址> | bash     ← 不推荐，请先 curl -o 下来看一眼
+
+  GitHub 下载源会自动探测并缓存在 ${GH_PROXY_CACHE}；删掉该文件即重新选源。
+  sing-box 版本跟随脚本内置 ${SB_VER_DEFAULT}；可用 SB_VER=x.y.z ${B} update 指定。
 EOF
       ;;
     *) err "未知命令：$1（用 --help 查看）"; exit 1 ;;
