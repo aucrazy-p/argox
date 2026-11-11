@@ -3484,7 +3484,7 @@ do_update() {
   fi
 }
 
-# 脚本自身更新：GitHub 上改了 argox.sh 时走这里（菜单 10，联网）。
+# 脚本自身更新：GitHub 上改了 argox.sh 时走这里（菜单 10）。
 # 落盘后自动跑 do_upgrade 同步配置，所以菜单不再单列「升级配置」一项。
 # 命令入口 /usr/local/bin/argox 是写死 exec bash $SELF_PATH 的壳，所以必须覆盖
 # 同一个路径，curl 到别的文件名不会生效。先下到临时文件、校验通过才 install，
@@ -5458,8 +5458,17 @@ do_cert() {
   esac
 }
 
+# 顶栏纯 ASCII 标题；宽度跟着版本号走，框线不再写死 50 列
+#（中文占 2 列而 printf 按字符数补空格，混排必然把右边框和版本号挤出去）。
+# 内层宽度 = 标题长 + 间隔(3) + 渲染版号长("v"+版本, 即版本长+1) + 右内边距(2)
+# = 标题长 + 版本长 + 6，与下方 title_line 严格相等，保证三行同宽、右边框对齐。
+BOX_TITLE='  argox  |  Argo Tunnel + Xray(XHTTP) + sing-box'
+box_width() { printf '%s' "$(( ${#BOX_TITLE} + 3 + ${#VERSION} + 3 ))"; }
+# 生成与顶栏等宽的分隔线
+box_rule() { local n; n="$(box_width)"; printf -v n '%*s' "$n" ''; printf '%s' "${n// /─}"; }
+
 menu_header() {
-  local st_x st_t st_b host hop_l land_l sb_line=""
+  local st_x st_t st_b sb_field="" hop_l land_l
   if svc_active "$SVC_XRAY"; then st_x="${C_GRN}●运行${C_R}"; else st_x="${C_RED}○停止${C_R}"; fi
   if [[ -s "$TOKEN_FILE" ]]; then
     if svc_active "$SVC_TUN"; then st_t="${C_GRN}●在线${C_R}"; else st_t="${C_YEL}○未运行${C_R}"; fi
@@ -5467,26 +5476,37 @@ menu_header() {
     st_t="${C_DIM}未配置${C_R}"
   fi
   # 「直连 Hy2/TUIC/AnyTLS」来自 proto_label_short()，只是 node.json 里的开关：
-  # sing-box 挂了它照样显示正常。把服务状态单独挂在这行前面，异常才看得见。
-  # 只在装了 / 开了 sing-box 时显示，纯 Argo 用户不看到多余字段。
+  # sing-box 挂了它照样显示正常。三个服务的真实状态集中放第一行才看得见异常。
+  # sbox 只在装了 / 开了 sing-box 时显示，纯 Argo 用户不看到多余字段。
   if proto_on hy2 || proto_on tuic || proto_on anytls || [[ -x "$SB_BIN" ]]; then
     if svc_active "$SVC_SB"; then st_b="${C_GRN}●运行${C_R}"; else st_b="${C_RED}○停止${C_R}"; fi
-    sb_line="sbox ${st_b}   "
+    sb_field="   sbox ${st_b}"
   fi
-  host="$(node_get tunnel_host 2>/dev/null)"
   if [[ "$(node_hop_mode)" == "all" ]]; then hop_l="${C_YEL}全部${C_R}"; else hop_l="${C_DIM}关闭${C_R}"; fi
   if landing_on && [[ -n "$(landing_names)" ]]; then
     land_l="${C_GRN}$(landing_names)${C_R}"
   else
     land_l="${C_DIM}关闭${C_R}"
   fi
+
+  local left="$BOX_TITLE" right="v${VERSION}" gap=3 edge=2
+  local inner bar fill edge_pad title_line
+  inner="$(box_width)"
+  printf -v bar      '%*s' "$inner" ''; bar="${bar// /═}"
+  printf -v fill     '%*s' "$gap" ''
+  printf -v edge_pad '%*s' "$edge" ''
+  printf -v title_line '%s%s%s%s' "$left" "$fill" "$right" "$edge_pad"
+
   printf '\n'
-  printf '%s╔══════════════════════════════════════════════════╗%s\n' "$C_B$C_BLU" "$C_R"
-  printf '%s║%s  argox  ·  Argo 隧道 + Xray(XHTTP) + sing-box  %s%-8s%s%s║%s\n' "$C_B$C_BLU" "$C_R$C_B" "$C_DIM" "v${VERSION}" "$C_R" "$C_B$C_BLU" "$C_R"
-  printf '%s╚══════════════════════════════════════════════════╝%s\n' "$C_B$C_BLU" "$C_R"
-  printf '  Xray %s   Tunnel %s   域名 %s\n' "$st_x" "$st_t" "${host:-${C_DIM}未设置${C_R}}"
-  printf '  %s直连 %s   跳板 %s   落地 %s\n' "$sb_line" "$(proto_label_short)" "$hop_l" "$land_l"
-  printf '%s\n' "──────────────────────────────────────────────────"
+  printf '%s╔%s╗%s\n' "$C_B$C_BLU" "$bar" "$C_R"
+  printf '%s║%s%s%s║%s\n' "$C_B$C_BLU" "$C_R$C_B" "$title_line" "$C_B$C_BLU" "$C_R"
+  printf '%s╚%s╝%s\n' "$C_B$C_BLU" "$bar" "$C_R"
+  # 三排摆放：服务状态 + 跳板一行、直连一行、落地一行。
+  # 每行都短，不会因某个配置项变长（如 Reality 打开、落地全开）而冲出框外。
+  printf '  Xray %s   Tunnel %s%s   跳板 %s\n' "$st_x" "$st_t" "$sb_field" "$hop_l"
+  printf '  直连 %s\n' "$(proto_label_short)"
+  printf '  落地 %s\n' "$land_l"
+  printf '%s\n' "$(box_rule)"
 }
 
 menu_main() {
@@ -5494,7 +5514,7 @@ menu_main() {
     menu_header
     cat <<'EOF'
    1) 安装 / 重新部署           9) 更换 UUID
-   2) 启动                     10) 更新脚本自身（联网）
+   2) 启动                     10) 更新脚本自身
    3) 停止                     11) 隧道设置（Token / 域名 / 测试）
    4) 重启                     12) 优选 IP（导入测速结果）
    5) 查看状态                 13) 出口跳板
@@ -5505,9 +5525,9 @@ menu_main() {
    19) 清理缓存                20) 卸载
 EOF
     printf '\n    0) 退出\n'
-    printf '%s\n' "──────────────────────────────────────────────────"
+    printf '%s\n' "$(box_rule)"
     printf '  %s左列＝常用动作，右列＝配置项%s\n' "$C_DIM" "$C_R"
-    printf '  %s更新：7=内核程序  10=脚本自身（联网，自动同步配置）%s\n' "$C_DIM" "$C_R"
+    printf '  %s更新：7=内核程序  10=脚本自身%s\n' "$C_DIM" "$C_R"
     reading "  请选择: " choice
     case "${choice:-}" in
       1)  do_install ;;
@@ -5629,7 +5649,7 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   ${B} uninstall    卸载
 
 两种更新互不替代：
-  菜单 10 / ${B} selfupdate  更新脚本自身（联网，顺带同步配置）
+  菜单 10 / ${B} selfupdate  更新脚本自身并同步配置
   菜单 7  / ${B} update      只换 Xray / cloudflared / sing-box 三个二进制
 等价手工两步：curl -fsSL -o ${SELF_PATH} <raw 地址> && ${B} upgrade
 命令入口写死指向 ${SELF_PATH}，curl 到别的文件名不会生效。
