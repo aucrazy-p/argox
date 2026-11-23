@@ -1,5 +1,7 @@
 # 本地项目数据
 .workbuddy/
+memory/
+out/
 
 # 临时测试文件
 .tmp_*

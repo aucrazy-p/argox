@@ -13,8 +13,12 @@
 
 set -uo pipefail
 
-VERSION="2.11.0"
+VERSION="2.12.0"
 APP="argox"
+
+# VLESS Encryption：enc 始终作用于 argo-xhttp 入站（无开关）；WS 入站自 v2.7.0 已下线。
+# 生成密钥需要 Xray ≥ 25.9.5（首个 stable）；版本不足时只提示升级，脚本不代做。
+ENC_MIN_XRAY="25.9.5"
 
 # 脚本自身地址：从 /dev/fd/* 运行（bash <(curl ...)）且本地还没有副本时，用它把自己落地
 RAW_URL="https://raw.githubusercontent.com/aucrazy-p/argox/main/argox.sh"
@@ -581,6 +585,182 @@ reality_keys() {
     node_jset reality.short_id "\"$sid\"" >/dev/null 2>&1 || true
   fi
   return 0
+}
+
+# ---- VLESS Encryption -------------------------------------------------------
+# 版本比较：取 xray version 首行号，与 ENC_MIN_XRAY 用 sort -V 比；取不到按不合格。
+enc_version_ge() {
+  local want="${1:-$ENC_MIN_XRAY}" v
+  [[ -x "$XRAY_BIN" ]] || return 1
+  v="$("$XRAY_BIN" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  [[ -n "$v" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$want" "$v" | sort -V | head -1)" == "$want" ]]
+}
+
+# 生成 / 复用 VLESS Encryption 密钥对（mlkem768x25519plus）。
+# 成功返回 0；新生成时置全局 ENC_CHANGED=1，复用时置 0。密钥只写 node.json。
+enc_keys() {
+  ENC_CHANGED=0
+  local dec enc
+  dec="$(node_jget enc.decryption 2>/dev/null)"
+  enc="$(node_jget enc.encryption 2>/dev/null)"
+  if [[ -n "$dec" && -n "$enc" ]]; then
+    [[ "$dec" == mlkem768x25519plus.* && "$enc" == mlkem768x25519plus.* ]] || {
+      err "enc 密钥格式异常，请执行 $(cmd_prefix) enc regen 重新生成"
+      return 1
+    }
+    return 0
+  fi
+
+  enc_version_ge || {
+    err "VPS 上的 Xray 版本过低（需 ≥ ${ENC_MIN_XRAY}），先执行 argox update 升级后重试"
+    return 1
+  }
+
+  local out
+  out="$("$XRAY_BIN" vlessenc 2>/dev/null)"
+  [[ -n "$out" ]] || { err "xray vlessenc 无输出，无法生成 enc 密钥"; return 1; }
+
+  # 输出格式未固定：先按标签取（行首 Decryption/Encryption 后一段），
+  # 再退化为按出现顺序取两条 mlkem768x25519plus.* 串。
+  # 注意：bash 的 [ \t] 在部分 grep/sed 实现里会把 \t 当字面 t，
+  # 导致密钥串在 .native 的 t 处被截断——统一用 [[:space:]] POSIX 类。
+  local d_label e_label
+  d_label="$(printf '%s\n' "$out" | sed -n 's/^[Dd]ecryption[^:]*:[[:space:]]*\(mlkem768x25519plus\.[^[:space:]]*\).*/\1/p' | head -1)"
+  e_label="$(printf '%s\n' "$out" | sed -n 's/^[Ee]ncryption[^:]*:[[:space:]]*\(mlkem768x25519plus\.[^[:space:]]*\).*/\1/p' | head -1)"
+  if [[ -n "$d_label" && -n "$e_label" ]]; then
+    dec="$d_label"; enc="$e_label"
+  else
+    local -a toks=()
+    while IFS= read -r ln; do
+      local tok
+      tok="$(printf '%s' "$ln" | grep -oE 'mlkem768x25519plus\.[^[:space:]]+' | head -1)"
+      [[ -n "$tok" ]] && toks+=("$tok")
+    done <<< "$out"
+    # bash 4.x + set -u 下空数组 ${#toks[@]} 可能触发 unbound，用 [0]/[1] 是否存在判断
+    [[ -n "${toks[0]:-}" && -n "${toks[1]:-}" ]] || { err "xray vlessenc 输出解析失败（未找到成对的 enc 密钥串）"; return 1; }
+    dec="${toks[0]}"; enc="${toks[1]}"
+  fi
+  # 两串必须不同：相同串会让服务端/客户端参数错配，全盘连不上
+  [[ "$dec" != "$enc" ]] || { err "xray vlessenc 输出异常（解密串与加密串相同），未写入"; return 1; }
+
+  # 严格校验：前缀 + 最小长度；任一不过绝不落盘半成品
+  if [[ "$dec" != mlkem768x25519plus.* || "$enc" != mlkem768x25519plus.* \
+     || ${#dec} -lt 60 || ${#enc} -lt 60 ]]; then
+    err "xray vlessenc 输出校验失败（密钥格式或长度异常），未写入任何字段"
+    return 1
+  fi
+
+  node_jset enc.decryption "\"$dec\"" >/dev/null 2>&1 || { err "写入 enc.decryption 失败"; return 1; }
+  node_jset enc.encryption "\"$enc\"" >/dev/null 2>&1 || { err "写入 enc.encryption 失败"; return 1; }
+  chmod 600 "$NODEF" 2>/dev/null || true
+  ENC_CHANGED=1
+  ok "VLESS Encryption 密钥已生成（指纹 ${dec:0:24}…）"
+  return 0
+}
+
+# 读取客户端加密串（节点链接用）；缺失或格式异常时报错并返回空。
+# 调用方必须检查返回，不得静默拼出 encryption=none 的明文链接。
+enc_pub() {
+  local e; e="$(node_jget enc.encryption 2>/dev/null)"
+  if [[ "$e" != mlkem768x25519plus.* ]]; then
+    err "enc 加密串缺失或格式异常，先执行 $(cmd_prefix) upgrade 生成密钥"
+    printf ''
+    return 1
+  fi
+  printf '%s' "$e"
+}
+
+# 只读状态：Xray 版本是否达标、密钥是否已生成、短指纹（不显示完整串）
+enc_show() {
+  local ver dec enc
+  ver="$([[ -x "$XRAY_BIN" ]] && "$XRAY_BIN" version 2>/dev/null | head -1 || printf '未安装')"
+  dec="$(node_jget enc.decryption 2>/dev/null)"
+  enc="$(node_jget enc.encryption 2>/dev/null)"
+  printf '\n  VLESS Encryption（enc 始终开启，作用于 Argo-H3/H2）\n'
+  printf '  Xray 版本    : %s（要求 ≥ %s：%s）\n' "$ver" "$ENC_MIN_XRAY" \
+    "$(enc_version_ge && printf '达标' || printf '不达标，先 argox update')"
+  if [[ -n "$dec" && -n "$enc" && "$dec" == mlkem768x25519plus.* && "$enc" == mlkem768x25519plus.* ]]; then
+    printf '  密钥状态    : 已生成，成对一致（指纹 %s…）\n' "${dec:0:24}"
+  else
+    printf '  密钥状态    : %s\n' "${C_YEL}缺失（执行 argox upgrade 生成）${C_R}"
+  fi
+  printf '  客户端要求  : Xray 内核 / mihomo ≥1.19.13（建议 1.19.14+）；sing-box 官方内核不支持\n'
+  printf '  轮换命令    : %s enc regen（会让所有客户端订阅立即失效）\n\n' "$(cmd_prefix)"
+}
+
+# 应急轮换：重新生成密钥 → 重写配置 → 重启 Xray → 重建订阅（二次确认）
+enc_regen() {
+  require_root
+  installed || { err "尚未安装"; return 1; }
+  printf '\n  %s警告：轮换 enc 密钥会让所有客户端的旧订阅立即失效，必须重新拉取。%s\n' "$C_YEL" "$C_R"
+  local yn; read -rp "  确认轮换？(y/N): " yn
+  [[ "${yn,,}" != "y" ]] && { info "已取消"; return 0; }
+
+  # 先备份旧密钥：生成失败时原样恢复，避免留下"清空了一半"的坏状态。
+  local old_d old_e
+  old_d="$(node_jget enc.decryption 2>/dev/null)"
+  old_e="$(node_jget enc.encryption 2>/dev/null)"
+  node_jset enc.decryption '""' >/dev/null 2>&1 || { err "清空旧密钥失败，旧配置未改动"; return 1; }
+  node_jset enc.encryption '""' >/dev/null 2>&1 || {
+    node_jset enc.decryption "\"$old_d\"" >/dev/null 2>&1
+    err "清空旧密钥失败，已恢复旧配置"; return 1;
+  }
+  if ! enc_keys; then
+    node_jset enc.decryption "\"$old_d\"" >/dev/null 2>&1
+    node_jset enc.encryption "\"$old_e\"" >/dev/null 2>&1
+    err "新密钥生成失败，已恢复旧密钥，旧配置未改动"; return 1
+  fi
+  local u px pw
+  u="$(node_get uuid)"; px="$(node_get path_xhttp)"; pw="$(node_get path_ws)"
+  write_xray_config "$u" "$px" "$pw" || { err "配置重写失败"; return 1; }
+  systemctl restart "$SVC_XRAY" 2>/dev/null; sleep 1
+  gen_sub >/dev/null 2>&1 || warn "订阅重建失败，手动跑 $(cmd_prefix) sub"
+  ok "enc 密钥已轮换；所有客户端需重新拉取订阅"
+  return 0
+}
+
+# 自检：Xray 版本 / node 密钥非空 / config 的 decryption 与 node 一致
+enc_check() {
+  enc_version_ge || ck_err "Xray 版本低于 ${ENC_MIN_XRAY}，enc 不可用（先 argox update）"
+  local dec enc
+  dec="$(node_jget enc.decryption 2>/dev/null)"
+  enc="$(node_jget enc.encryption 2>/dev/null)"
+  if [[ "$dec" != mlkem768x25519plus.* || "$enc" != mlkem768x25519plus.* ]]; then
+    ck_err "enc 密钥缺失或格式异常（执行 argox upgrade 生成）"
+    return 0
+  fi
+  ck_ok "enc 密钥已生成，成对一致（指纹 ${dec:0:24}…）"
+  local conf_dec
+  conf_dec="$(python3 - "$CONF" 2>/dev/null <<'PY'
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    for i in d.get('inbounds',[]):
+        if i.get('tag')=='argo-xhttp':
+            print(i.get('settings',{}).get('decryption',''));break
+except Exception:
+    pass
+PY
+)"
+  if [[ "$conf_dec" != "$dec" ]]; then
+    ck_err "config.json 的 argo-xhttp decryption 与 node.json 的 enc.decryption 不一致（运行 argox upgrade 重建）"
+  else
+    ck_ok "config decryption 与密钥一致"
+  fi
+  ck_warn "VLESS Encryption 客户端要求：Xray 内核 / mihomo ≥1.19.13（建议 1.19.14+）；sing-box 官方内核不支持"
+}
+
+# 自检：单条 XHTTP 链接的 encryption 是否等于 node 的 enc.encryption
+enc_link_check() {
+  local line="$1"
+  [[ "$line" == *"type=xhttp"* ]] || return 0   # Reality 等 (encryption=none) 不管
+  local enc got
+  enc="$(node_jget enc.encryption 2>/dev/null)"
+  got="$(printf '%s' "$line" | sed -n 's/.*[?&]encryption=\([^&#]*\).*/\1/p')"
+  if [[ "$got" != "$enc" ]]; then
+    ck_err "链接 encryption 与密钥不一致：${got:-空}（客户端连不上，运行 argox upgrade 重建订阅）"
+  fi
 }
 
 # Reality 改动后的落地动作：重写 Xray 配置 → 重启 → 放行端口 → 重建订阅
@@ -1308,6 +1488,15 @@ proto_label_short() {
 write_xray_config() {
   local uuid="$1" px="$2" pw="$3"
 
+  # VLESS Encryption：argo-xhttp 入站无条件使用持久化密钥，绝不退回 none。
+  # 只影响 XHTTP 入站；Reality 入站仍保持 decryption: none + Vision flow。
+  local enc_dec
+  enc_dec="$(node_jget enc.decryption 2>/dev/null)"
+  if [[ "$enc_dec" != mlkem768x25519plus.* ]]; then
+    err "enc 密钥缺失或格式异常，先执行 $(cmd_prefix) upgrade 生成密钥"
+    return 1
+  fi
+
   # ---- 住宅落地：各入站按 target 决定是否挂第二个 UUID ----
   # v2.7.0 起 WS 入站已彻底移除（订阅里 H2 走的是 XHTTP + ALPN，不占 8002），
   # 所以落地只剩 H3/H2 共用入站、Reality 两种挂法。
@@ -1405,7 +1594,7 @@ ${rt_json}"
       "listen": "127.0.0.1",
       "port": ${DEF_PORT_XHTTP},
       "protocol": "vless",
-      "settings": { "clients": ${xclients}, "decryption": "none" },
+      "settings": { "clients": ${xclients}, "decryption": "${enc_dec}" },
       "streamSettings": {
         "network": "xhttp",
         "security": "none",
@@ -2371,14 +2560,15 @@ emit_landing_links() { # $1=host $2=ex
   landing_on || return 0
   local lu; lu="$(landing_uuid)"
   [[ -z "$lu" ]] && return 0
+  local epub; epub="$(enc_pub)" || return 1
   local t
   for t in h3 h2 anytls reality; do
     landing_wants "$t" || continue
     case "$t" in
-      h3) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s%s\n' \
-            "$lu" "$host" "$host" "$ex" "$host" "$NAME_H3" "$NAME_RH" ;;
-      h2) printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s%s\n' \
-            "$lu" "$host" "$host" "$ex" "$host" "$NAME_H2" "$NAME_RH" ;;
+      h3) printf 'vless://%s@%s:443?encryption=%s&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s%s\n' \
+            "$lu" "$host" "$epub" "$host" "$ex" "$host" "$NAME_H3" "$NAME_RH" ;;
+      h2) printf 'vless://%s@%s:443?encryption=%s&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s%s\n' \
+            "$lu" "$host" "$epub" "$host" "$ex" "$host" "$NAME_H2" "$NAME_RH" ;;
       anytls)
         # AnyTLS 落地：走 VPS 公网 IP 的独立端口，直连协议没开就没有这条
         proto_on anytls || continue
@@ -2401,9 +2591,10 @@ build_links() {
   px="$(node_get path_xhttp)"
   [[ -z "$uuid" || -z "$host" ]] && return 1
 
-  local ex mode
+  local ex mode epub
   ex="$(urlenc "$px")"
   mode="$(node_mode)"
+  epub="$(enc_pub)" || return 1
 
   # ⚠ 节点顺序约定（客户端按订阅里的先后显示，不要随意打乱）：
   #    1) Argo 两条：H3 → H2（同一入站，只差 ALPN；UDP 挂时靠 H2 兜底）
@@ -2415,10 +2606,10 @@ build_links() {
 
   # ---------- 域名模式：地址写域名，由客户端解析到最近的 CF 节点 ----------
   if [[ "$mode" != "ip" ]]; then
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s\n' \
-      "$uuid" "$host" "$host" "$ex" "$host" "$NAME_H3"
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s\n' \
-      "$uuid" "$host" "$host" "$ex" "$host" "$NAME_H2"
+    printf 'vless://%s@%s:443?encryption=%s&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s\n' \
+      "$uuid" "$host" "$epub" "$host" "$ex" "$host" "$NAME_H3"
+    printf 'vless://%s@%s:443?encryption=%s&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s\n' \
+      "$uuid" "$host" "$epub" "$host" "$ex" "$host" "$NAME_H2"
     # 直连 UDP（Hy2 / TUIC）
     emit_direct_links
     # 落地家宽垫底
@@ -2451,14 +2642,14 @@ build_links() {
   # H3 主力：UDP/QUIC，抗丢包
   for (( i=0; i<${#ips[@]} && i<MAX_H3_NODES; i++ )); do
     n=$((i+1))
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s-%02d-%s\n' \
-      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$NAME_H3" "$n" "${tags[$i]}"
+    printf 'vless://%s@%s:443?encryption=%s&security=tls&sni=%s&fp=chrome&alpn=h3&type=xhttp&path=%s&host=%s&mode=auto#%s-%02d-%s\n' \
+      "$uuid" "${ips[$i]}" "$epub" "$host" "$ex" "$host" "$NAME_H3" "$n" "${tags[$i]}"
   done
   # H2 对照：同一批 IP 走 TCP，用于 A/B 判断 H3 是否真的更抗丢包
   for (( i=0; i<${#ips[@]} && i<MAX_H2_NODES; i++ )); do
     n=$((i+1))
-    printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s-%02d-%s\n' \
-      "$uuid" "${ips[$i]}" "$host" "$ex" "$host" "$NAME_H2" "$n" "${tags[$i]}"
+    printf 'vless://%s@%s:443?encryption=%s&security=tls&sni=%s&fp=chrome&alpn=h2%%2Chttp%%2F1.1&type=xhttp&path=%s&host=%s&mode=auto#%s-%02d-%s\n' \
+      "$uuid" "${ips[$i]}" "$epub" "$host" "$ex" "$host" "$NAME_H2" "$n" "${tags[$i]}"
   done
   # WS 已下线（与 H2 路径重叠），IP 模式下同样不再展开
 
@@ -2538,6 +2729,11 @@ def to_clash(link):
                 p["alpn"] = alpn
         if get("flow"):
             p["flow"] = get("flow")
+        # VLESS Encryption：链接里的 encryption 串直接落到 Clash YAML 同名字段。
+        # encryption=none 是老链接/Reality，不写字段（避免老内核误读）。
+        enc = get("encryption")
+        if enc and enc != "none":
+            p["encryption"] = enc
         if security == "reality":
             p["reality-opts"] = {"public-key": get("pbk", ""), "short-id": get("sid", "")}
         p["network"] = net
@@ -3216,6 +3412,7 @@ PY
   "anytls":  { "port": ${DEF_PORT_ANYTLS}, "password": "" },
   "sub":     { "port": ${DEF_PORT_SUB} },
   "cert":    { "sni": "${host}", "path": "${BASE}/cert" },
+  "enc":     { "decryption": "", "encryption": "" },
   "installed_at": "$(date -Iseconds)",
   "version": "${VERSION}"
 }
@@ -3242,6 +3439,7 @@ PY
 
   # ---------- 安装二进制 ----------
   install_xray || die "Xray 安装失败"
+  enc_keys || die "VLESS Encryption 密钥生成失败（检查 Xray 版本是否 ≥ ${ENC_MIN_XRAY}）"
   install_cloudflared || die "cloudflared 安装失败"
 
   # ---------- 写配置 ----------
@@ -3842,6 +4040,9 @@ do_check() {
     ck_warn "缺 jq / python3，跳过 node.json 校验"
   fi
 
+  # VLESS Encryption 一致性
+  enc_check
+
   # 首尾空白污染（最隐蔽的坑：链接看着正常，节点全不通）
   local dirty=""
   if has python3; then
@@ -3999,6 +4200,7 @@ PY
       [[ "$sni"     == "$exp_sni"  ]] || { ck_err "sni 不一致：${sni} ≠ ${exp_sni}";  bad=1; }
       [[ "$hostarg" == "$exp_host" ]] || { ck_err "Host 不一致：${hostarg} ≠ ${exp_host}"; bad=1; }
       [[ "$pth"     == "$exp_path" ]] || { ck_err "path 不一致：${pth} ≠ ${exp_path}"; bad=1; }
+      enc_link_check "$line"
     done <<< "$links"
     [[ $bad -eq 0 ]] && ck_ok "链接参数与服务端一致（sni / Host / path / 直连地址）"
 
@@ -4233,7 +4435,7 @@ do_upgrade() {
   mkdir -p "$BACKD"
   cp -a "$NODEF" "$bak" && ok "已备份：${bak}"
 
-  local MIG_HY2=0 MIG_RH=0 MIG_WS=0 MIG_HOP=0
+  local MIG_HY2=0 MIG_RH=0 MIG_WS=0 MIG_HOP=0 MIG_ENC=0
 
   # 补齐新字段：已存在的绝不覆盖
   local added="-"
@@ -4260,6 +4462,7 @@ defaults = {
     "anytls":  {"port": 8445, "password": ""},
     "sub":     {"port": sp},
     "cert":    {"sni": d.get("tunnel_host", ""), "path": "/opt/argox/cert"},
+    "enc":     {"decryption": "", "encryption": ""},
 }
 added = [k for k in defaults if k not in d]
 for k in added:
@@ -4344,6 +4547,27 @@ PY
     warn "缺 python3，跳过字段补齐"
   fi
 
+  # VLESS Encryption：补字段后生成/复用密钥。首次生成必须重写配置并重启一次 Xray，
+  # 否则运行中的实例仍用旧的 none 解密，客户端带加密串会连不上。第二次升级幂等不重启。
+  ENC_CHANGED=0
+  enc_keys || die "VLESS Encryption 密钥生成失败（检查 Xray 版本是否 ≥ ${ENC_MIN_XRAY}）"
+  ENC_RESTART_FAIL=0
+  if [[ $ENC_CHANGED -eq 1 ]]; then
+    local ue pe we
+    ue="$(node_get uuid)"; pe="$(node_get path_xhttp)"; we="$(node_get path_ws)"
+    write_xray_config "$ue" "$pe" "$we" || die "enc 配置重写失败"
+    systemctl restart "$SVC_XRAY" 2>/dev/null; sleep 1
+    if svc_active "$SVC_XRAY"; then
+      ok "VLESS Encryption 已生效（Xray 已重启一次）"
+      MIG_ENC=1
+    else
+      # 配置已切成加密、服务却没起来：此时绝不能重建订阅（客户端会拿到新加密串连不上）。
+      err "Xray 重启失败，配置已切换但服务未生效；跳过订阅重建，先排障"
+      info "排障：journalctl -u ${SVC_XRAY} -n 20；恢复后手动跑 $(cmd_prefix) upgrade"
+      ENC_RESTART_FAIL=1
+    fi
+  fi
+
   # hop_port 缺失：早期 node.json 没有这个字段，一直靠默认值兜底。
   # 默认值换过一次，缺字段的机器就突然报「代理连不上」——实际是探测端口错了，
   # 代理本身好好的。这里探测本机真实监听端口补上，探不到才写默认值。
@@ -4423,7 +4647,9 @@ PY
     fi
   fi
 
-  if gen_sub >/dev/null 2>&1; then
+  if [[ $ENC_RESTART_FAIL -eq 1 ]]; then
+    err "enc 配置切换后 Xray 未起来，已跳过订阅重建（拉新订阅会连不上）"
+  elif gen_sub >/dev/null 2>&1; then
     local names="${NAME_H3} / ${NAME_H2}"
     proto_on hy2    && names="${names} / ${NAME_HY2}"
     proto_on tuic   && names="${names} / ${NAME_TUIC}"
@@ -4453,6 +4679,15 @@ PY
     info "服务已因配置结构变更重启过"
   else
     info "服务未重启，运行中的连接不受影响"
+  fi
+  # enc 的订阅失效提示独立输出：即使同时命中 Hy2 迁移也不会被 elif 吞掉。
+  if [[ $MIG_ENC -eq 1 ]]; then
+    printf '\n'
+    warn "VLESS Encryption 密钥已生成并生效 —— 所有客户端需重新拉取订阅，旧订阅已失效"
+    info "客户端要求：Xray 内核 / mihomo ≥1.19.13（建议 1.19.14+）；sing-box 官方内核不支持"
+  fi
+  if [[ $ENC_RESTART_FAIL -eq 1 ]]; then
+    warn "enc 已切换但 Xray 未重启成功，本次未重建订阅；请勿拉取新订阅，先排障"
   fi
   if ! proto_on hy2 && ! proto_on tuic && ! proto_on anytls; then
     warn "直连协议全部关闭：Argo 走 CF，线路差时会全挂"
@@ -5589,6 +5824,7 @@ main() {
     diag)      do_diag "${2:-}" ;;
     check)     do_check "${2:-}" ;;
     upgrade)   do_upgrade ;;
+    enc)       shift; if [[ "${1:-}" == "regen" ]]; then enc_regen; else enc_show; fi ;;
     sub)       gen_sub && cat "${SUBD}/argox.b64" ;;
     uninstall) do_uninstall ;;
     ""|menu)   require_root; menu_main ;;
@@ -5646,6 +5882,8 @@ argox v${VERSION} — Cloudflare Argo 隧道 + Xray 一键部署
   ${B} selfupdate   更新脚本自身（菜单 10）：拉取最新 argox.sh 覆盖 ${SELF_PATH}，
                     校验通过后自动跑 upgrade 同步 node.json / 单元 / 订阅服务
   ${B} upgrade      只同步配置（不联网，通常 selfupdate 已自动执行；手工覆盖脚本后用）
+  ${B} enc          VLESS Encryption 状态（版本 / 密钥指纹，只读）
+  ${B} enc regen    轮换 enc 密钥（二次确认；所有客户端订阅立即失效）
   ${B} uninstall    卸载
 
 两种更新互不替代：
