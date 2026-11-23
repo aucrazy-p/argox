@@ -1391,6 +1391,17 @@ EOF
   fi
 }
 
+# 开机/重启时只重建 nft 跳跃表，供 argox-sb.service 的 ExecStartPre 调用。
+# 刻意不碰 service/订阅/端口：sing-box 正要起来，这里只补一张运行时会丢的表。
+# 失败一律吞掉返回 0 —— 带 - 前缀的 ExecStartPre 失败不会阻塞服务，
+# 这里再兜一层，保证日志干净且不因 nft 缺失拖垮协议本身。
+hop_restore() {
+  proto_on hy2 || return 0
+  has nft || return 0
+  sb_hop_apply >/dev/null 2>&1 || true
+  return 0
+}
+
 # 放行本机防火墙：部分云镜像默认在 INPUT 末尾挂 REJECT，
 # 云安全组放行了、实例内还是不通，是这个原因。
 # 注意端口范围写法三家不同：ufw/iptables 用冒号（23000:27000），firewalld 用短横线（23000-27000）
@@ -1447,6 +1458,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
+# 开机/崩溃重启时重建 nft 跳跃表：nftables 规则是运行时状态，重启必丢，
+# 而本 service 只拉起 sing-box 进程、不会调 sb_hop_apply。带 - 前缀：即使
+# nft 没装或规则写失败也不阻塞 sing-box 启动（跳跃只影响抗限速，不影响连通）。
+ExecStartPre=-/bin/bash ${SELF_PATH} hop-restore
 ExecStart=${SB_BIN} run -c ${SBCONF}
 Restart=always
 RestartSec=3
@@ -3753,7 +3768,9 @@ do_selfupdate() {
   # 脚本里，要跑 upgrade 才会同步到 /opt/argox，否则新代码永远不生效。
   if installed; then
     info "同步配置 / 订阅服务到新脚本…"
-    do_upgrade
+    # 必须用新落地的脚本跑 upgrade：当前进程内存里还是旧版函数，
+    # 直接调 do_upgrade 会用旧代码重写 systemd 单元，新加的 ExecStartPre 永远进不去。
+    bash "$dst" upgrade
   else
     info "尚未安装，跳过配置升级；直接敲 argox 进菜单开始安装"
   fi
@@ -4724,6 +4741,13 @@ PY
   if [[ $ENC_RESTART_FAIL -eq 1 ]]; then
     warn "enc 已切换但 Xray 未重启成功，本次未重建订阅；请勿拉取新订阅，先排障"
   fi
+  # systemd 单元嵌在脚本里，脚本更新后必须重写一次才能带上新增的 ExecStartPre
+  # （nft 跳跃表开机恢复）。只重写单元 + daemon-reload，不重启服务、不中断连接；
+  # ExecStartPre 会在下次 sing-box 启动（开机 / 崩溃拉起）时生效。
+  if svc_exists "$SVC_SB"; then
+    write_sb_service && info "sing-box 单元已刷新（下次启动自动重建 nft 跳跃表）"
+  fi
+
   if ! proto_on hy2 && ! proto_on tuic && ! proto_on anytls; then
     warn "直连协议全部关闭：Argo 走 CF，线路差时会全挂"
     info "开一条 TCP 兜底：$(cmd_prefix) direct on all（菜单 14）"
@@ -5858,6 +5882,7 @@ main() {
     cert)      do_cert "${2:-}" "${3:-}" ;;
     diag)      do_diag "${2:-}" ;;
     check)     do_check "${2:-}" ;;
+    hop-restore) hop_restore ;;   # systemd ExecStartPre 内部命令：只重建 nft 跳跃表
     upgrade)   do_upgrade ;;
     enc)       shift; if [[ "${1:-}" == "regen" ]]; then enc_regen; else enc_show; fi ;;
     sub)       gen_sub && cat "${SUBD}/argox.b64" ;;
