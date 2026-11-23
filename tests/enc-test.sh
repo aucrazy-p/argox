@@ -65,6 +65,12 @@ case "${1:-}" in
     elif [[ "${STUB_ENC_FORMAT}" == "inline" ]]; then
       echo "Decryption: mlkem768x25519plus.native.600s.100-111-1111.75-0-111.50-0-3333.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
       echo "Encryption: mlkem768x25519plus.native.0rtt.100-111-1111.75-0-111.50-0-3333.CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC.DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+    elif [[ "${STUB_ENC_FORMAT}" == "json" ]]; then
+      # 真实 xray vlessenc 可能的 JSON 输出：串后紧跟 ",  —— 曾导致写入失败
+      echo '{'
+      echo '  "decryption": "mlkem768x25519plus.native.600s.100-111-1111.75-0-111.50-0-3333.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",'
+      echo '  "encryption": "mlkem768x25519plus.native.0rtt.100-111-1111.75-0-111.50-0-3333.CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC.DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"'
+      echo '}'
     else
       echo "mlkem768x25519plus.native.600s.100-111-1111.75-0-111.50-0-3333.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
       echo "mlkem768x25519plus.native.0rtt.100-111-1111.75-0-111.50-0-3333.CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC.DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
@@ -119,6 +125,21 @@ case_enc_keys_plain() {
   eq 'inline-format enc_keys returns 0' 0 "$rc"
   truth 'inline-format decryption correct (A key)' '[[ "$(node_jget enc.decryption)" == *AAAAAAAA* ]]'
   truth 'inline-format encryption correct (C key)' '[[ "$(node_jget enc.encryption)" == *CCCCCCCC* ]]'
+}
+
+case_enc_keys_json() {
+  printf '[enc_keys_json]\n'
+  # JSON 输出：串尾带 ", 不能污染密钥，必须剥掉后再落盘
+  setup_env
+  export STUB_ENC_FORMAT=json
+  ENC_CHANGED=0
+  enc_keys; local rc=$?
+  eq 'json-format enc_keys returns 0' 0 "$rc"
+  local d e
+  d="$(node_jget enc.decryption)"; e="$(node_jget enc.encryption)"
+  truth 'json-format decryption is clean A' '[[ "$d" == *AAAAAAAA* && "$d" != *\"* && "$d" != *,* ]]'
+  truth 'json-format encryption is clean C' '[[ "$e" == *CCCCCCCC* && "$e" != *\"* && "$e" != *,* ]]'
+  truth 'json-format dec!=enc' '[[ "$(node_jget enc.decryption)" != "$(node_jget enc.encryption)" ]]'
 }
 
 case_enc_keys_fail() {
@@ -316,7 +337,7 @@ case_check_consistency() {
 case_all() {
   # 每个用例在独立子进程跑，避免 setup_env 的全局状态（BASE/NODEF/TEST_TMP/CK_*）互相污染。
   local total_p=0 total_f=0 c line raw rc p f
-  for c in version enc_keys_labeled enc_keys_plain enc_keys_fail xhttp_decryption links_encryption clash_encryption cmd_surface migration_wiring migration_idempotent check_consistency; do
+  for c in version enc_keys_labeled enc_keys_plain enc_keys_json enc_keys_fail xhttp_decryption links_encryption clash_encryption cmd_surface migration_wiring migration_idempotent check_consistency; do
     raw="$(bash "$0" "$c" 2>&1)"; rc=$?
     line="$(printf '%s\n' "$raw" | grep -v 'safe-delete' | tail -1)"
     if [[ $rc -ne 0 ]] || [[ ! "$line" =~ ^===\ [0-9]+\ passed,\ [0-9]+\ failed\ ===$ ]]; then
@@ -345,6 +366,7 @@ case "$main_case" in
   check_consistency) case_check_consistency ;;
   enc_keys_labeled) case_enc_keys_labeled ;;
   enc_keys_plain) case_enc_keys_plain ;;
+  enc_keys_json) case_enc_keys_json ;;
   enc_keys_fail) case_enc_keys_fail ;;
   *) echo "unknown case: $main_case" >&2; exit 2 ;;
 esac

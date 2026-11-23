@@ -599,6 +599,29 @@ enc_version_ge() {
 
 # 生成 / 复用 VLESS Encryption 密钥对（mlkem768x25519plus）。
 # 成功返回 0；新生成时置全局 ENC_CHANGED=1，复用时置 0。密钥只写 node.json。
+# enc 专用字符串写入：值走 argv + python json.dumps，不手工拼 JSON 字面量，
+# 免疫密钥串里的任何引号/逗号/控制字符。点分路径，空串也写。
+enc_jset() { # $1=点分路径  $2=字符串值
+  [[ -r "$NODEF" ]] || return 1
+  has python3 || return 1
+  python3 - "$NODEF" "$1" "$2" 2>/dev/null <<'PY'
+import json, sys
+p, path, val = sys.argv[1], sys.argv[2].split('.'), sys.argv[3]
+try:
+    d = json.load(open(p))
+except Exception:
+    d = {}
+cur = d
+for k in path[:-1]:
+    if not isinstance(cur.get(k), dict):
+        cur[k] = {}
+    cur = cur[k]
+cur[path[-1]] = val
+with open(p, "w") as f:
+    json.dump(d, f, indent=2, ensure_ascii=False)
+PY
+}
+
 enc_keys() {
   ENC_CHANGED=0
   local dec enc
@@ -625,11 +648,23 @@ enc_keys() {
   # 再退化为按出现顺序取两条 mlkem768x25519plus.* 串。
   # 注意：bash 的 [ \t] 在部分 grep/sed 实现里会把 \t 当字面 t，
   # 导致密钥串在 .native 的 t 处被截断——统一用 [[:space:]] POSIX 类。
+  # 密钥串合法字符仅 [A-Za-z0-9._-]；结尾的 " , } ANSI 控制符等一律剥掉。
+  # 真实 xray vlessenc 输出可能是 JSON（"mlkem...xxxx",）——若把尾随的 ", 带进
+  # 密钥串，json.loads("\"$dec\"") 会报 Extra data 导致写入失败（线上实测踩过）。
+  local _enc_sanitize
+  _enc_sanitize() { # $1=候选串 → 打印从 mlkem768x25519plus. 起的干净串
+    local s="${1##*mlkem768x25519plus.}"
+    [[ "$1" == *mlkem768x25519plus.* ]] || { printf ''; return 1; }
+    s="mlkem768x25519plus.${s}"
+    s="${s//[^A-Za-z0-9._-]/}"   # 删除所有非法字符（引号/逗号/控制符/空格）
+    printf '%s' "$s"
+  }
+
   local d_label e_label
   d_label="$(printf '%s\n' "$out" | sed -n 's/^[Dd]ecryption[^:]*:[[:space:]]*\(mlkem768x25519plus\.[^[:space:]]*\).*/\1/p' | head -1)"
   e_label="$(printf '%s\n' "$out" | sed -n 's/^[Ee]ncryption[^:]*:[[:space:]]*\(mlkem768x25519plus\.[^[:space:]]*\).*/\1/p' | head -1)"
   if [[ -n "$d_label" && -n "$e_label" ]]; then
-    dec="$d_label"; enc="$e_label"
+    dec="$(_enc_sanitize "$d_label")"; enc="$(_enc_sanitize "$e_label")"
   else
     local -a toks=()
     while IFS= read -r ln; do
@@ -639,7 +674,7 @@ enc_keys() {
     done <<< "$out"
     # bash 4.x + set -u 下空数组 ${#toks[@]} 可能触发 unbound，用 [0]/[1] 是否存在判断
     [[ -n "${toks[0]:-}" && -n "${toks[1]:-}" ]] || { err "xray vlessenc 输出解析失败（未找到成对的 enc 密钥串）"; return 1; }
-    dec="${toks[0]}"; enc="${toks[1]}"
+    dec="$(_enc_sanitize "${toks[0]}")"; enc="$(_enc_sanitize "${toks[1]}")"
   fi
   # 两串必须不同：相同串会让服务端/客户端参数错配，全盘连不上
   [[ "$dec" != "$enc" ]] || { err "xray vlessenc 输出异常（解密串与加密串相同），未写入"; return 1; }
@@ -651,8 +686,8 @@ enc_keys() {
     return 1
   fi
 
-  node_jset enc.decryption "\"$dec\"" >/dev/null 2>&1 || { err "写入 enc.decryption 失败"; return 1; }
-  node_jset enc.encryption "\"$enc\"" >/dev/null 2>&1 || { err "写入 enc.encryption 失败"; return 1; }
+  enc_jset enc.decryption "$dec" || { err "写入 enc.decryption 失败"; return 1; }
+  enc_jset enc.encryption "$enc" || { err "写入 enc.encryption 失败"; return 1; }
   chmod 600 "$NODEF" 2>/dev/null || true
   ENC_CHANGED=1
   ok "VLESS Encryption 密钥已生成（指纹 ${dec:0:24}…）"
@@ -701,14 +736,14 @@ enc_regen() {
   local old_d old_e
   old_d="$(node_jget enc.decryption 2>/dev/null)"
   old_e="$(node_jget enc.encryption 2>/dev/null)"
-  node_jset enc.decryption '""' >/dev/null 2>&1 || { err "清空旧密钥失败，旧配置未改动"; return 1; }
-  node_jset enc.encryption '""' >/dev/null 2>&1 || {
-    node_jset enc.decryption "\"$old_d\"" >/dev/null 2>&1
+  enc_jset enc.decryption '' || { err "清空旧密钥失败，旧配置未改动"; return 1; }
+  enc_jset enc.encryption '' || {
+    enc_jset enc.decryption "$old_d" || true
     err "清空旧密钥失败，已恢复旧配置"; return 1;
   }
   if ! enc_keys; then
-    node_jset enc.decryption "\"$old_d\"" >/dev/null 2>&1
-    node_jset enc.encryption "\"$old_e\"" >/dev/null 2>&1
+    enc_jset enc.decryption "$old_d" || true
+    enc_jset enc.encryption "$old_e" || true
     err "新密钥生成失败，已恢复旧密钥，旧配置未改动"; return 1
   fi
   local u px pw
